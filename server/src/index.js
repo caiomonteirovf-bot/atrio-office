@@ -352,6 +352,7 @@ export function broadcast(data) {
 import * as whatsapp from './services/whatsapp.js';
 import * as telegram from './services/telegram.js';
 import { scheduleDailyReport, generateDailyReport } from './services/daily-report.js';
+import * as scheduler from './services/scheduler.js';
 
 app.get('/api/whatsapp/status', (req, res) => {
   res.json(whatsapp.getStatus());
@@ -401,6 +402,24 @@ app.get('*', (req, res, next) => {
 // ============================================
 // ORCHESTRATOR — Processa tasks pendentes
 // ============================================
+app.get('/api/scheduler/prazos', async (req, res) => {
+  try {
+    const alertas = await scheduler.checkPrazosFiscais();
+    res.json({ total: alertas.length, alertas });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/scheduler/inadimplencia', async (req, res) => {
+  try {
+    await scheduler.checkInadimplencia();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/orchestrator/run', async (req, res) => {
   try {
     const count = await processPendingTasks();
@@ -427,6 +446,9 @@ server.listen(PORT, () => {
 
   // Agenda relatório diário do Rodrigo (18h)
   scheduleDailyReport();
+
+  // Inicia scheduler (verificações automáticas às 8h)
+  scheduler.start();
 
   console.log(`\n⬡ Átrio Office Server rodando na porta ${PORT}`);
   console.log(`  API: http://localhost:${PORT}/api`);

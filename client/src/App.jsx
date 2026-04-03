@@ -7,6 +7,7 @@ import ChatPanel from './components/ChatPanel'
 import ActivityFeed from './components/ActivityFeed'
 import StatsBar from './components/StatsBar'
 import WhatsAppStatus from './components/WhatsAppStatus'
+import AttendanceQueue from './components/AttendanceQueue'
 import PortalLogin from './portal/PortalLogin'
 import PortalDashboard from './portal/PortalDashboard'
 
@@ -47,7 +48,7 @@ function AdminDashboard() {
                 ))}
               </div>
             </section>
-            <WhatsAppStatus />
+            <AttendanceQueue />
             <ActivityFeed agents={agents} />
           </div>
         </div>

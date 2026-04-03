@@ -351,6 +351,7 @@ export function broadcast(data) {
 // ============================================
 import * as whatsapp from './services/whatsapp.js';
 import * as telegram from './services/telegram.js';
+import { scheduleDailyReport, generateDailyReport } from './services/daily-report.js';
 
 app.get('/api/whatsapp/status', (req, res) => {
   res.json(whatsapp.getStatus());
@@ -374,6 +375,12 @@ app.post('/api/whatsapp/send', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.get('/api/whatsapp/conversations', (req, res) => {
+  const list = [];
+  const convs = whatsapp.getPendingMessages();
+  res.json(convs);
 });
 
 app.post('/api/whatsapp/mark-replied/:phone', (req, res) => {
@@ -415,8 +422,11 @@ server.listen(PORT, () => {
   whatsapp.setBroadcast(broadcast);
   whatsapp.initialize().catch(err => console.error('[WhatsApp] Falha:', err.message));
 
-  // Inicializa Telegram Bot
-  telegram.initialize(process.env.TELEGRAM_BOT_TOKEN).catch(err => console.error('[Telegram] Falha:', err.message));
+  // Telegram Bot — desativado por enquanto (ativar se necessário)
+  // telegram.initialize(process.env.TELEGRAM_BOT_TOKEN).catch(err => console.error('[Telegram] Falha:', err.message));
+
+  // Agenda relatório diário do Rodrigo (18h)
+  scheduleDailyReport();
 
   console.log(`\n⬡ Átrio Office Server rodando na porta ${PORT}`);
   console.log(`  API: http://localhost:${PORT}/api`);

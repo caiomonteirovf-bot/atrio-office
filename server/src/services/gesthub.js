@@ -118,6 +118,13 @@ export async function getNpsDashboard(filters = {}) {
   return request(`/nps/dashboard${params ? `?${params}` : ''}`);
 }
 
+export async function createNPS(payload) {
+  return request('/nps', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 // ============================================
 // AUDIT
 // ============================================

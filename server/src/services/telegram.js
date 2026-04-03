@@ -1,25 +1,44 @@
 import TelegramBot from 'node-telegram-bot-api';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { chatWithAgent } from './claude.js';
 import { executeToolCall } from '../tools/registry.js';
 import { query } from '../db/pool.js';
 import * as whatsapp from './whatsapp.js';
+import { generateDailyReport } from './daily-report.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let bot = null;
-let authorizedUsers = new Set(); // chat IDs autorizados
 
-const LUNA_AGENT_ID = 'a0000001-0000-0000-0000-000000000004';
-const RODRIGO_AGENT_ID = 'a0000001-0000-0000-0000-000000000001';
+// Persiste chat IDs autorizados em arquivo para sobreviver restarts
+const AUTH_FILE = path.join(__dirname, '../../telegram-users.json');
+let authorizedUsers = new Set();
 
-// Mapa de agentes por comando
+function loadAuthorizedUsers() {
+  try {
+    if (fs.existsSync(AUTH_FILE)) {
+      const data = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+      authorizedUsers = new Set(data);
+      console.log(`[Telegram] ${authorizedUsers.size} usuário(s) autorizados carregados`);
+    }
+  } catch {}
+}
+
+function saveAuthorizedUsers() {
+  try {
+    fs.writeFileSync(AUTH_FILE, JSON.stringify([...authorizedUsers]));
+  } catch {}
+}
+
 const AGENT_MAP = {
-  luna: LUNA_AGENT_ID,
-  rodrigo: RODRIGO_AGENT_ID,
+  luna: 'a0000001-0000-0000-0000-000000000004',
+  rodrigo: 'a0000001-0000-0000-0000-000000000001',
   campelo: 'a0000001-0000-0000-0000-000000000002',
   sneijder: 'a0000001-0000-0000-0000-000000000003',
   sofia: 'a0000001-0000-0000-0000-000000000005',
 };
-
-export function getBot() { return bot; }
 
 export async function initialize(token) {
   if (!token) {
@@ -27,150 +46,138 @@ export async function initialize(token) {
     return;
   }
 
+  loadAuthorizedUsers();
   bot = new TelegramBot(token, { polling: true });
   console.log('[Telegram] Bot inicializado');
 
-  // /start — autoriza e apresenta
+  // /start
   bot.onText(/\/start/, async (msg) => {
-    const chatId = msg.chat.id;
-    authorizedUsers.add(chatId);
-    await bot.sendMessage(chatId,
-      `👋 Olá! Sou a *Luna*, assistente do Átrio Office.\n\n` +
-      `Comandos disponíveis:\n` +
-      `/luna [mensagem] — Falar com Luna\n` +
-      `/rodrigo [mensagem] — Falar com Rodrigo\n` +
-      `/campelo [mensagem] — Falar com Campelo\n` +
-      `/sneijder [mensagem] — Falar com Sneijder\n` +
-      `/sofia [mensagem] — Falar com Sofia\n` +
-      `/status — Status da equipe e WhatsApp\n` +
-      `/pendentes — Mensagens WhatsApp pendentes\n` +
-      `/enviar [telefone] [mensagem] — Enviar WhatsApp\n`,
-      { parse_mode: 'Markdown' }
-    );
-  });
-
-  // /status — status geral
-  bot.onText(/\/status/, async (msg) => {
-    const wsStatus = whatsapp.getStatus();
-    const { rows: tasks } = await query(
-      `SELECT status, COUNT(*) as c FROM tasks GROUP BY status`
-    );
-    const taskStr = tasks.map(t => `${t.status}: ${t.c}`).join(', ');
-
+    authorizedUsers.add(msg.chat.id);
+    saveAuthorizedUsers();
     await bot.sendMessage(msg.chat.id,
-      `📊 *Status Átrio Office*\n\n` +
-      `WhatsApp: ${wsStatus.connected ? '✅ Conectado' : '❌ Desconectado'}\n` +
-      `Conversas ativas: ${wsStatus.activeConversations}\n` +
-      `Tasks: ${taskStr || 'nenhuma'}`,
+      `👋 Olá! Sou a assistente do escritório.\n\n` +
+      `*Comandos:*\n` +
+      `/luna [msg] — Falar com Luna\n` +
+      `/rodrigo [msg] — Falar com Rodrigo\n` +
+      `/campelo [msg] — Falar com Campelo\n` +
+      `/sneijder [msg] — Falar com Sneijder\n` +
+      `/sofia [msg] — Falar com Sofia\n` +
+      `/status — Status geral\n` +
+      `/pendentes — WhatsApp pendentes\n` +
+      `/relatorio — Gerar relatório\n` +
+      `/enviar [tel] [msg] — Enviar WhatsApp`,
       { parse_mode: 'Markdown' }
     );
   });
 
-  // /pendentes — mensagens WhatsApp sem resposta
+  // /status
+  bot.onText(/\/status/, async (msg) => {
+    try {
+      const wsStatus = whatsapp.getStatus();
+      const { rows: tasks } = await query('SELECT status, COUNT(*) as c FROM tasks GROUP BY status');
+      const taskStr = tasks.map(t => `${t.status}: ${t.c}`).join(', ') || 'nenhuma';
+      await bot.sendMessage(msg.chat.id,
+        `📊 *Status*\n\nWhatsApp: ${wsStatus.connected ? '✅ Conectado' : '❌ Off'}\nConversas: ${wsStatus.activeConversations}\nTasks: ${taskStr}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      await bot.sendMessage(msg.chat.id, `❌ ${err.message}`);
+    }
+  });
+
+  // /relatorio
+  bot.onText(/\/relatorio/, async (msg) => {
+    await bot.sendMessage(msg.chat.id, '📋 Gerando...');
+    try {
+      const report = await generateDailyReport();
+      if (!report) await bot.sendMessage(msg.chat.id, '❌ Sem dados para relatório');
+    } catch (err) {
+      await bot.sendMessage(msg.chat.id, `❌ ${err.message}`);
+    }
+  });
+
+  // /pendentes
   bot.onText(/\/pendentes/, async (msg) => {
     const pending = whatsapp.getPendingMessages();
-    if (pending.length === 0) {
+    if (!pending.length) {
       await bot.sendMessage(msg.chat.id, '✅ Nenhuma mensagem pendente.');
       return;
     }
-
-    let text = `⏳ *${pending.length} mensagem(ns) pendente(s):*\n\n`;
+    let text = `⏳ *${pending.length} pendente(s):*\n\n`;
     pending.forEach(p => {
-      text += `${p.severity === 'critico' || p.severity === 'urgente' ? '🔴' : '🟡'} *${p.name}* (${p.phone})\n`;
-      text += `_${p.lastMessage.substring(0, 80)}_\n`;
-      text += `Há ${timeSince(p.receivedAt)} — ${p.humanReplied ? 'Respondido, mas insistiu' : 'Sem resposta'}\n\n`;
+      const icon = ['critico','urgente'].includes(p.severity) ? '🔴' : '🟡';
+      text += `${icon} *${p.name}* (${p.phone})\n_${p.lastMessage.substring(0, 80)}_\nHá ${timeSince(p.receivedAt)}${p.humanReplied ? ' (respondido, insistiu)' : ''}\n\n`;
     });
-
-    await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+    await safeSend(msg.chat.id, text);
   });
 
-  // /enviar [telefone] [mensagem] — enviar WhatsApp pelo bot
-  bot.onText(/\/enviar\s+(\S+)\s+(.+)/, async (msg, match) => {
-    const phone = match[1];
-    const text = match[2];
+  // /enviar [tel] [msg]
+  bot.onText(/\/enviar\s+(\S+)\s+(.+)/s, async (msg, match) => {
     try {
-      await whatsapp.sendMessage(phone, text);
-      await bot.sendMessage(msg.chat.id, `✅ Mensagem enviada para ${phone}`);
+      await whatsapp.sendMessage(match[1], match[2]);
+      await bot.sendMessage(msg.chat.id, `✅ Enviado para ${match[1]}`);
     } catch (err) {
-      await bot.sendMessage(msg.chat.id, `❌ Erro: ${err.message}`);
+      await bot.sendMessage(msg.chat.id, `❌ ${err.message}`);
     }
   });
 
-  // Comandos de agentes: /luna, /rodrigo, /campelo, /sneijder, /sofia
+  // Comandos de agentes
   Object.entries(AGENT_MAP).forEach(([name, agentId]) => {
-    const regex = new RegExp(`\\/${name}\\s+(.+)`, 's');
-    bot.onText(regex, async (msg, match) => {
-      const userMessage = match[1];
-      const chatId = msg.chat.id;
-
-      await bot.sendChatAction(chatId, 'typing');
-
+    bot.onText(new RegExp(`\\/${name}\\s+(.+)`, 's'), async (msg, match) => {
+      await bot.sendChatAction(msg.chat.id, 'typing');
       try {
-        const { rows: agents } = await query('SELECT * FROM agents WHERE id = $1', [agentId]);
-        if (!agents.length) {
-          await bot.sendMessage(chatId, `❌ Agente ${name} não encontrado`);
-          return;
-        }
-
-        const response = await chatWithAgent(agents[0], [
-          { role: 'user', content: userMessage },
-        ], executeToolCall);
-
+        const { rows } = await query('SELECT * FROM agents WHERE id = $1', [agentId]);
+        if (!rows.length) return await bot.sendMessage(msg.chat.id, `❌ Agente não encontrado`);
+        const response = await chatWithAgent(rows[0], [{ role: 'user', content: match[1] }], executeToolCall);
         if (response.success && response.text) {
-          // Telegram tem limite de 4096 chars
-          const text = response.text.substring(0, 4000);
-          await bot.sendMessage(chatId, `*${agents[0].name}:*\n\n${text}`, { parse_mode: 'Markdown' }).catch(() =>
-            bot.sendMessage(chatId, `${agents[0].name}:\n\n${text}`)
-          );
+          await safeSend(msg.chat.id, `*${rows[0].name}:*\n\n${response.text.substring(0, 4000)}`);
         } else {
-          await bot.sendMessage(chatId, `❌ Erro: ${response.error || 'Sem resposta'}`);
+          await bot.sendMessage(msg.chat.id, `❌ ${response.error || 'Sem resposta'}`);
         }
       } catch (err) {
-        await bot.sendMessage(chatId, `❌ Erro: ${err.message}`);
+        await bot.sendMessage(msg.chat.id, `❌ ${err.message}`);
       }
     });
   });
 
-  // Mensagem livre (sem comando) — fala com Luna por padrão
+  // Mensagem livre → Luna
   bot.on('message', async (msg) => {
-    if (msg.text?.startsWith('/')) return; // ignora comandos
-    const chatId = msg.chat.id;
-
-    await bot.sendChatAction(chatId, 'typing');
-
+    if (!msg.text || msg.text.startsWith('/')) return;
+    await bot.sendChatAction(msg.chat.id, 'typing');
     try {
-      const { rows: agents } = await query('SELECT * FROM agents WHERE id = $1', [LUNA_AGENT_ID]);
-      if (!agents.length) return;
-
-      const response = await chatWithAgent(agents[0], [
-        { role: 'user', content: msg.text },
-      ], executeToolCall);
-
+      const { rows } = await query('SELECT * FROM agents WHERE id = $1', [AGENT_MAP.luna]);
+      if (!rows.length) return;
+      const response = await chatWithAgent(rows[0], [{ role: 'user', content: msg.text }], executeToolCall);
       if (response.success && response.text) {
-        await bot.sendMessage(chatId, `*Luna:*\n\n${response.text.substring(0, 4000)}`, { parse_mode: 'Markdown' }).catch(() =>
-          bot.sendMessage(chatId, `Luna:\n\n${response.text.substring(0, 4000)}`)
-        );
+        await safeSend(msg.chat.id, `*Luna:*\n\n${response.text.substring(0, 4000)}`);
       }
     } catch (err) {
-      await bot.sendMessage(chatId, `❌ ${err.message}`);
+      await bot.sendMessage(msg.chat.id, `❌ ${err.message}`);
     }
   });
 }
 
-// Enviar alerta no Telegram (usado pelo WhatsApp escalation)
+// Envia com Markdown, fallback para texto puro se falhar
+async function safeSend(chatId, text) {
+  try {
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+  } catch {
+    await bot.sendMessage(chatId, text.replace(/[*_`]/g, '')).catch(() => {});
+  }
+}
+
+// Alerta para TODOS os usuários autorizados
 export async function sendAlert(message) {
-  if (!bot) return;
+  if (!bot || !authorizedUsers.size) return;
   for (const chatId of authorizedUsers) {
-    try {
-      await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-    } catch {}
+    await safeSend(chatId, message);
   }
 }
 
 function timeSince(dateStr) {
-  const seconds = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
-  if (seconds < 60) return 'agora';
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}min`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}d`;
+  const s = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
+  if (s < 60) return 'agora';
+  if (s < 3600) return `${Math.floor(s / 60)}min`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
 }

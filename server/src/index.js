@@ -5,14 +5,15 @@ import http from 'http';
 import dotenv from 'dotenv';
 import { query } from './db/pool.js';
 import { chatWithAgent, extractText } from './services/claude.js';
-import { executeToolCall } from './tools/registry.js';
+import { executeToolCall, setOnTaskCreated } from './tools/registry.js';
+import { processTask, processPendingTasks, setBroadcast } from './services/orchestrator.js';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3010;
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173' }));
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
 
 // ============================================
@@ -235,8 +236,33 @@ export function broadcast(data) {
   });
 }
 
+// ============================================
+// ORCHESTRATOR — Processa tasks pendentes
+// ============================================
+app.post('/api/orchestrator/run', async (req, res) => {
+  try {
+    const count = await processPendingTasks();
+    res.json({ processed: count });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// STARTUP
+// ============================================
 server.listen(PORT, () => {
+  // Conecta orchestrator ao broadcast e ao registry
+  setBroadcast(broadcast);
+  setOnTaskCreated((taskId) => processTask(taskId));
+
   console.log(`\n⬡ Átrio Office Server rodando na porta ${PORT}`);
   console.log(`  API: http://localhost:${PORT}/api`);
-  console.log(`  WS:  ws://localhost:${PORT}/ws\n`);
+  console.log(`  WS:  ws://localhost:${PORT}/ws`);
+  console.log(`  Orchestrator: ativo\n`);
+
+  // Processa tasks pendentes ao iniciar
+  processPendingTasks().then(count => {
+    if (count > 0) console.log(`[Orchestrator] ${count} tasks pendentes processadas no startup`);
+  }).catch(() => {});
 });

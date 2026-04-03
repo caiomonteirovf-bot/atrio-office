@@ -13,11 +13,17 @@ const registry = {
   ...sofiaTools,
 };
 
+// Tools que criam tasks para agentes IA — disparam orquestração
+const TASK_CREATING_TOOLS = new Set(['delegar_tarefa', 'rotear_demanda', 'rotear_para_rodrigo']);
+
+// Callback para orquestração (setado pelo index.js)
+let onTaskCreated = null;
+export function setOnTaskCreated(fn) { onTaskCreated = fn; }
+
 console.log(`[Tools] ${Object.keys(registry).length} tools registradas:`, Object.keys(registry).join(', '));
 
 /**
  * Executor de tools — mapeia nome para implementação
- * Assinatura compatível com chatWithAgent(agent, messages, toolExecutor)
  */
 export async function executeToolCall(toolName, args) {
   const handler = registry[toolName];
@@ -35,6 +41,17 @@ export async function executeToolCall(toolName, args) {
   try {
     const result = await handler(args || {});
     console.log(`[Tools] ${toolName} → sucesso`);
+
+    // Se a tool criou uma task, dispara orquestração assíncrona
+    if (TASK_CREATING_TOOLS.has(toolName) && result?.sucesso && result?.tarefa?.id) {
+      console.log(`[Tools] Task criada → disparando orquestração para ${result.tarefa.id}`);
+      setTimeout(() => onTaskCreated?.(result.tarefa.id), 100);
+    }
+    if (TASK_CREATING_TOOLS.has(toolName) && result?.sucesso && result?.task_id) {
+      console.log(`[Tools] Task criada → disparando orquestração para ${result.task_id}`);
+      setTimeout(() => onTaskCreated?.(result.task_id), 100);
+    }
+
     return result;
   } catch (err) {
     console.error(`[Tools] ${toolName} → erro:`, err.message);

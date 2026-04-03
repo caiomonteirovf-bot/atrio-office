@@ -30,22 +30,15 @@ services:
       GESTHUB_API_URL: ${GESTHUB_API_URL:-https://gesthub-xlvb.onrender.com}
       PORT: 3010
       NODE_ENV: production
-      CORS_ORIGIN: https://atrio.${DOMAIN:-srv1383891.hstgr.cloud}
-    ports:
-      - "3010:3010"
+      CORS_ORIGIN: "*"
 
-  caddy:
-    image: caddy:2-alpine
+  client:
+    build: ./client
     restart: unless-stopped
+    depends_on:
+      - server
     ports:
       - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
 
 volumes:
   pgdata:
-  caddy_data:
-  caddy_config:

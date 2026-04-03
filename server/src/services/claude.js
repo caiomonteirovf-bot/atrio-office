@@ -90,7 +90,7 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
   const agentForRequest = toolExecutor ? agent : { ...agent, tools: [] };
 
   let iterations = 0;
-  const maxIterations = 5;
+  const maxIterations = 10;
 
   while (iterations < maxIterations) {
     const response = await sendToAgent(agentForRequest, currentMessages);

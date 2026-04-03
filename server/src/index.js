@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import http from 'http';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { query } from './db/pool.js';
 import { chatWithAgent, extractText } from './services/claude.js';
@@ -10,11 +12,17 @@ import { processTask, processPendingTasks, setBroadcast } from './services/orche
 
 dotenv.config();
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3010;
 
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
+
+// Serve frontend estático em produção
+// Em dev: ../../client/dist, em Docker: ../client/dist
+const clientDist = path.join(__dirname, '../../client/dist');
+app.use(express.static(clientDist));
 
 // ============================================
 // HEALTH CHECK
@@ -235,6 +243,16 @@ export function broadcast(data) {
     }
   });
 }
+
+// ============================================
+// SPA FALLBACK — Serve index.html para rotas do frontend
+// ============================================
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/ws')) return next();
+  res.sendFile(path.join(clientDist, 'index.html'), (err) => {
+    if (err) res.status(404).json({ error: 'Not found' });
+  });
+});
 
 // ============================================
 // ORCHESTRATOR — Processa tasks pendentes

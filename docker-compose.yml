@@ -18,11 +18,15 @@ services:
       retries: 5
 
   server:
-    build: ./server
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+    ports:
+      - "3010:3010"
     environment:
       DATABASE_URL: postgresql://atrio:${DB_PASSWORD:-AtrioDB2026!}@db:5432/atrio_office
       MINIMAX_API_KEY: ${MINIMAX_API_KEY}
@@ -31,14 +35,6 @@ services:
       PORT: 3010
       NODE_ENV: production
       CORS_ORIGIN: "*"
-
-  client:
-    build: ./client
-    restart: unless-stopped
-    depends_on:
-      - server
-    ports:
-      - "80:80"
 
 volumes:
   pgdata:

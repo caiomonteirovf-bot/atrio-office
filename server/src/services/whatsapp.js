@@ -26,14 +26,20 @@ const ESCALATION_LEVELS = [
   { minutes: 30, severity: 'atencao', emoji: '🟠', label: 'Atenção — 30min sem retorno' },
   { minutes: 60, severity: 'critico', emoji: '🔴', label: 'CRÍTICO — 1h sem retorno' },
   { minutes: 120, severity: 'urgente', emoji: '🚨', label: 'URGENTE — 2h sem retorno' },
+  { minutes: 360, severity: 'grave', emoji: '🚨', label: 'GRAVE — 6h sem retorno' },
+  { minutes: 720, severity: 'grave', emoji: '🚨', label: 'GRAVE — 12h sem retorno' },
+  { minutes: 1440, severity: 'grave', emoji: '🚨', label: 'GRAVE — 24h sem retorno' },
 ];
 
 // Mensagens da Luna ao cliente por nível (null = não envia)
 const CLIENT_MESSAGES = {
-  0: null, // 10min: não envia ao cliente, só notifica equipe
+  0: null, // 10min: só notifica equipe
   1: (name) => `${name}, nossos atendentes estão finalizando outros atendimentos no momento. Já já alguém da equipe vai te atender, tá? Obrigada pela paciência! 🙏`,
   2: (name) => `${name}, peço desculpas pela demora! Estamos com um volume alto de atendimentos hoje. Sua solicitação é prioridade e um atendente entrará em contato em breve. 💙`,
-  3: null, // 120min: não envia ao cliente, só alerta urgente equipe
+  3: null, // 2h: só equipe
+  4: (name) => `${name}, pedimos sinceras desculpas. Sua solicitação está sendo tratada internamente e um responsável entrará em contato com você. Agradecemos a compreensão. 🙏`,
+  5: null, // 12h: só equipe
+  6: (name) => `${name}, sabemos que está aguardando e lamentamos a demora. Sua solicitação é prioridade máxima. Um responsável entrará em contato hoje. Se preferir, ligue para ${CONTACT_PHONE}. 🔔`,
 };
 
 const NOTIFY_NUMBERS = ['5581997166091'];

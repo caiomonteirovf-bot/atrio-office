@@ -1,0 +1,24 @@
+{
+  "name": "atrio-office-server",
+  "version": "1.0.0",
+  "description": "Átrio Office — Backend do escritório contábil virtual",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "db:create": "psql -U postgres -c 'CREATE DATABASE atrio_office;'",
+    "db:schema": "psql -U postgres -d atrio_office -f src/db/schema.sql",
+    "db:seed": "psql -U postgres -d atrio_office -f src/db/seed.sql",
+    "db:setup": "npm run db:create && npm run db:schema && npm run db:seed"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "openai": "^6.33.0",
+    "pg": "^8.13.1",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.0"
+  }
+}

@@ -6,8 +6,11 @@ import AgentCard from './components/AgentCard'
 import ChatPanel from './components/ChatPanel'
 import ActivityFeed from './components/ActivityFeed'
 import StatsBar from './components/StatsBar'
+import WhatsAppStatus from './components/WhatsAppStatus'
+import PortalLogin from './portal/PortalLogin'
+import PortalDashboard from './portal/PortalDashboard'
 
-export default function App() {
+function AdminDashboard() {
   const { agents } = useAgents()
   const { connected } = useWebSocket()
   const [selectedAgent, setSelectedAgent] = useState(null)
@@ -44,6 +47,7 @@ export default function App() {
                 ))}
               </div>
             </section>
+            <WhatsAppStatus />
             <ActivityFeed agents={agents} />
           </div>
         </div>
@@ -55,4 +59,19 @@ export default function App() {
       )}
     </div>
   )
+}
+
+export default function App() {
+  // Roteamento simples: /portal → portal do cliente, / → admin
+  const isPortal = window.location.pathname.startsWith('/portal')
+  const [portalClient, setPortalClient] = useState(null)
+
+  if (isPortal) {
+    if (!portalClient) {
+      return <PortalLogin onLogin={setPortalClient} />
+    }
+    return <PortalDashboard clientBasic={portalClient} onLogout={() => setPortalClient(null)} />
+  }
+
+  return <AdminDashboard />
 }

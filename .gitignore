@@ -2,4 +2,7 @@ node_modules/
 .env
 .env.production
 server/.env
+server/whatsapp-session/
+server/.wwebjs_cache/
+server/.wwebjs_auth/
 *.log

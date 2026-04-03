@@ -206,6 +206,103 @@ app.get('/api/clients', async (req, res) => {
 });
 
 // ============================================
+// PORTAL DO CLIENTE — Acesso por CNPJ
+// ============================================
+import * as gesthub from './services/gesthub.js';
+
+app.get('/api/portal/login/:cnpj', async (req, res) => {
+  try {
+    const cnpj = req.params.cnpj.replace(/\D/g, '');
+    if (cnpj.length < 11) return res.status(400).json({ error: 'CNPJ/CPF inválido' });
+
+    const clients = await gesthub.getClients();
+    const client = clients.find(c => c.document?.replace(/\D/g, '') === cnpj);
+
+    if (!client) return res.status(404).json({ error: 'Cliente não encontrado' });
+
+    res.json({
+      id: client.id,
+      name: client.legalName,
+      tradeName: client.tradeName,
+      document: client.document,
+      regime: client.taxRegime,
+      status: client.status,
+      type: client.type,
+      city: client.city,
+      state: client.state,
+      analyst: client.analyst || client.officeOwner,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/portal/client/:id', async (req, res) => {
+  try {
+    const clientId = parseInt(req.params.id);
+    const [bootstrap, client360] = await Promise.all([
+      gesthub.getBootstrap(),
+      gesthub.getClient360(clientId).catch(() => null),
+    ]);
+
+    const client = bootstrap.clients.find(c => c.id === clientId);
+    if (!client) return res.status(404).json({ error: 'Cliente não encontrado' });
+
+    // Busca legalizações do cliente
+    const legalizations = bootstrap.legalizations.filter(l => l.clientId === clientId);
+
+    // Busca tasks relacionadas ao cliente no Átrio
+    const { rows: tasks } = await query(
+      `SELECT t.title, t.status, t.priority, t.created_at, t.completed_at,
+              tm.name as assigned_name
+       FROM tasks t
+       LEFT JOIN team_members tm ON t.assigned_to = tm.id
+       WHERE t.client_id = $1
+       ORDER BY t.created_at DESC LIMIT 10`,
+      [clientId.toString()]
+    ).catch(() => ({ rows: [] }));
+
+    res.json({
+      profile: {
+        id: client.id,
+        name: client.legalName,
+        tradeName: client.tradeName,
+        document: client.document,
+        regime: client.taxRegime,
+        status: client.status,
+        type: client.type,
+        city: client.city,
+        state: client.state,
+        analyst: client.analyst || client.officeOwner,
+        monthlyFee: client.monthlyFee,
+        startDate: client.startDate,
+        fatorR: client.fatorR,
+      },
+      legalizations: legalizations.map(l => ({
+        id: l.id,
+        processType: l.processType,
+        status: l.status,
+        organ: l.organ,
+        protocol: l.protocol,
+        openDate: l.openDate,
+        expectedDate: l.expectedDate,
+      })),
+      tasks: tasks.map(t => ({
+        title: t.title,
+        status: t.status,
+        priority: t.priority,
+        assigned: t.assigned_name,
+        date: t.created_at,
+        completed: t.completed_at,
+      })),
+      client360: client360 || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // STATS — Dashboard KPIs
 // ============================================
 app.get('/api/stats', async (req, res) => {
@@ -250,6 +347,41 @@ export function broadcast(data) {
 }
 
 // ============================================
+// WHATSAPP — Luna
+// ============================================
+import * as whatsapp from './services/whatsapp.js';
+import * as telegram from './services/telegram.js';
+
+app.get('/api/whatsapp/status', (req, res) => {
+  res.json(whatsapp.getStatus());
+});
+
+app.get('/api/whatsapp/qr', (req, res) => {
+  const qr = whatsapp.getQRCode();
+  if (!qr) return res.json({ hasQR: false, message: 'Nenhum QR disponível. WhatsApp pode já estar conectado.' });
+  res.json({ hasQR: true, qr });
+});
+
+app.get('/api/whatsapp/pending', (req, res) => {
+  res.json(whatsapp.getPendingMessages());
+});
+
+app.post('/api/whatsapp/send', async (req, res) => {
+  const { phone, message } = req.body;
+  try {
+    await whatsapp.sendMessage(phone, message);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/whatsapp/mark-replied/:phone', (req, res) => {
+  const ok = whatsapp.markAsReplied(req.params.phone);
+  res.json({ success: ok });
+});
+
+// ============================================
 // SPA FALLBACK — Serve index.html para rotas do frontend
 // ============================================
 app.get('*', (req, res, next) => {
@@ -279,10 +411,18 @@ server.listen(PORT, () => {
   setBroadcast(broadcast);
   setOnTaskCreated((taskId) => processTask(taskId));
 
+  // Inicializa WhatsApp (Luna)
+  whatsapp.setBroadcast(broadcast);
+  whatsapp.initialize().catch(err => console.error('[WhatsApp] Falha:', err.message));
+
+  // Inicializa Telegram Bot
+  telegram.initialize(process.env.TELEGRAM_BOT_TOKEN).catch(err => console.error('[Telegram] Falha:', err.message));
+
   console.log(`\n⬡ Átrio Office Server rodando na porta ${PORT}`);
   console.log(`  API: http://localhost:${PORT}/api`);
   console.log(`  WS:  ws://localhost:${PORT}/ws`);
-  console.log(`  Orchestrator: ativo\n`);
+  console.log(`  Orchestrator: ativo`);
+  console.log(`  WhatsApp: inicializando...\n`);
 
   // Processa tasks pendentes ao iniciar
   processPendingTasks().then(count => {

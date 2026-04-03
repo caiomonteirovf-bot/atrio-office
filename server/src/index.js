@@ -21,7 +21,12 @@ app.use(express.json());
 
 // Serve frontend estático em produção
 // Em dev: ../../client/dist, em Docker: ../client/dist
-const clientDist = path.join(__dirname, '../../client/dist');
+const clientDistOptions = [
+  path.join(__dirname, '../../client/dist'),   // dev local
+  path.join(__dirname, '../client/dist'),       // Docker
+];
+import fs from 'fs';
+const clientDist = clientDistOptions.find(p => fs.existsSync(p)) || clientDistOptions[0];
 app.use(express.static(clientDist));
 
 // ============================================

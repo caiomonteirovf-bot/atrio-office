@@ -469,10 +469,12 @@ MENSAGEM DO CEO CAIO: ${text.trim()}
 
 Responda de forma direta e útil. Se ele perguntou sobre uma tarefa ou resultado, explique com clareza. Seja conciso (2-3 frases).`;
 
-    const { sendToAgent: sendToAgentFn } = await import('./services/claude.js');
-    const response = await sendToAgentFn(agent, [{ role: 'user', content: prompt }], { maxTokens: 1024, temperature: 0.6 });
+    const { chatWithAgent: chatWithAgentFn } = await import('./services/claude.js');
+    const response = await chatWithAgentFn(agent, [{ role: 'user', content: prompt }], executeToolCall);
 
-    const agentText = response?.choices?.[0]?.message?.content || response?.text || 'Desculpe, não consegui processar no momento.';
+    const agentText = response.success
+      ? (response.text || 'Processado.')
+      : 'Desculpe, não consegui processar no momento.';
 
     logAgentChat({ from: agent.name, to: 'Caio', text: agentText });
 

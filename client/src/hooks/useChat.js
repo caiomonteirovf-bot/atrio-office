@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import { api } from '../lib/api'
 
 export function useChat(agentId) {
@@ -6,6 +6,13 @@ export function useChat(agentId) {
   const [conversationId, setConversationId] = useState(null)
   const [loading, setLoading] = useState(false)
   const loadingRef = useRef(false)
+
+  // Reset conversation when switching agents
+  useEffect(() => {
+    setMessages([])
+    setConversationId(null)
+    loadingRef.current = false
+  }, [agentId])
 
   const sendMessage = useCallback(async (text) => {
     if (!text.trim() || loadingRef.current) return

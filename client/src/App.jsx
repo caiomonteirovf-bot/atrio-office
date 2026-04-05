@@ -37,25 +37,27 @@ function AdminDashboard() {
   }, [lastMessage, refresh])
   const [selectedAgent, setSelectedAgent] = useState(null)
   const [reportLoading, setReportLoading] = useState(false)
+  const [reportData, setReportData] = useState(null)
+  const [reportError, setReportError] = useState('')
 
   async function handleAction(actionId) {
     if (actionId === 'relatorio') {
       setReportLoading(true)
+      setReportError('')
+      setReportData(null)
       try {
         const res = await fetch('/api/daily-report', { method: 'POST' })
         const data = await res.json()
         if (data.report) {
-          alert('Relatorio gerado e enviado no Telegram!')
+          setReportData(data.report)
         } else {
-          alert(data.error || 'Erro ao gerar relatorio')
+          setReportError(data.error || 'Erro ao gerar relatorio')
         }
       } catch {
-        alert('Erro de conexao ao gerar relatorio')
+        setReportError('Erro de conexao ao gerar relatorio')
       } finally {
         setReportLoading(false)
       }
-    } else if (actionId === 'notas') {
-      alert('Painel de notas em desenvolvimento')
     }
   }
 
@@ -111,6 +113,79 @@ function AdminDashboard() {
       {selectedAgent && (
         <div className="w-[420px] shrink-0 h-full" style={{ borderLeft: `1px solid var(--ao-border)` }}>
           <ChatPanel agent={selectedAgent} onClose={() => setSelectedAgent(null)} />
+        </div>
+      )}
+
+      {/* Report Modal */}
+      {(reportData || reportError || reportLoading) && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)' }}>
+          <div className="relative w-full max-w-[560px] max-h-[80vh] flex flex-col rounded-2xl overflow-hidden" style={{
+            background: 'var(--ao-card)',
+            border: '1px solid var(--ao-border)',
+            boxShadow: '0 24px 48px rgba(0,0,0,0.4)',
+          }}>
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4 shrink-0" style={{ borderBottom: '1px solid var(--ao-border)' }}>
+              <div className="flex items-center gap-3">
+                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{
+                  background: 'linear-gradient(135deg, #C4956A 0%, #A67B52 100%)',
+                }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10,9 9,9 8,9"/>
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="text-[14px] font-semibold" style={{ color: 'var(--ao-text)' }}>Relatorio Diario</h3>
+                  <span className="text-[11px]" style={{ color: 'var(--ao-text-dim)' }}>
+                    {new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })}
+                  </span>
+                </div>
+              </div>
+              <button
+                onClick={() => { setReportData(null); setReportError(''); }}
+                className="w-7 h-7 rounded-lg flex items-center justify-center transition-colors cursor-pointer"
+                style={{ background: 'var(--ao-input-bg)', color: 'var(--ao-text-muted)' }}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="flex-1 overflow-y-auto px-5 py-4">
+              {reportLoading && (
+                <div className="flex flex-col items-center justify-center py-12 gap-3">
+                  <div className="w-8 h-8 rounded-full border-2 border-t-transparent animate-spin" style={{ borderColor: 'var(--ao-border)', borderTopColor: 'transparent' }} />
+                  <span className="text-[12px]" style={{ color: 'var(--ao-text-dim)' }}>Gerando relatorio...</span>
+                </div>
+              )}
+              {reportError && (
+                <div className="rounded-xl p-4" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)' }}>
+                  <p className="text-[13px]" style={{ color: '#ef4444' }}>{reportError}</p>
+                </div>
+              )}
+              {reportData && (
+                <div className="text-[13px] leading-relaxed whitespace-pre-wrap" style={{ color: 'var(--ao-text-secondary)', fontFamily: 'Space Grotesk, system-ui' }}>
+                  {reportData}
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            {reportData && (
+              <div className="flex items-center justify-between px-5 py-3 shrink-0" style={{ borderTop: '1px solid var(--ao-border)' }}>
+                <span className="text-[10px]" style={{ color: 'var(--ao-text-xs)' }}>Enviado via Telegram</span>
+                <button
+                  onClick={() => { navigator.clipboard.writeText(reportData); }}
+                  className="text-[11px] font-medium px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+                  style={{ background: 'var(--ao-input-bg)', color: 'var(--ao-text-muted)', border: '1px solid var(--ao-border)' }}
+                >
+                  Copiar
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

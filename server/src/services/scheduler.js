@@ -405,7 +405,7 @@ export function start() {
       await checkInadimplencia();
       await checkContasPagar();
       await checkSemHonorario();
-      await checkAlertasFiscais();
+      // await checkAlertasFiscais(); // Standby — foco em atendimento e emissão
       await checkDadosIncompletos();
     }
   }, 60 * 60 * 1000);
@@ -418,7 +418,7 @@ export function start() {
     checkInadimplencia();
     checkContasPagar();
     checkSemHonorario();
-    checkAlertasFiscais();
+    // checkAlertasFiscais(); // Standby — foco em atendimento e emissão
     checkDadosIncompletos();
   }
 }

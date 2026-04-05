@@ -240,6 +240,55 @@ export const tools = {
     };
   },
 
+  async consultar_tomador({ cpf_cnpj, nome }) {
+    const NFSE_SYSTEM_URL = process.env.NFSE_SYSTEM_URL || 'http://localhost:3020';
+    try {
+      // Busca por documento específico
+      if (cpf_cnpj) {
+        const docLimpo = cpf_cnpj.replace(/\D/g, '');
+        const res = await fetch(`${NFSE_SYSTEM_URL}/api/tomadores/por-documento/${docLimpo}`);
+        const data = await res.json();
+        if (data.ok && data.data) {
+          const t = data.data;
+          return {
+            sucesso: true,
+            encontrado: true,
+            tomador: {
+              id: t.id,
+              cpf_cnpj: t.cpfCnpj,
+              razao_social: t.razaoSocial,
+              nome_fantasia: t.nomeFantasia,
+              email: t.email,
+              telefone: t.telefone,
+              cidade: t.cidade,
+              uf: t.uf,
+              codigo_municipio: t.codigoMunicipio,
+            },
+          };
+        }
+        return { sucesso: true, encontrado: false, mensagem: `Tomador com CPF/CNPJ ${cpf_cnpj} não encontrado no sistema de NFS-e. Pode ser cadastrado manualmente ou emitir com dados avulsos.` };
+      }
+
+      // Busca por nome
+      const params = nome ? `?search=${encodeURIComponent(nome)}` : '';
+      const res = await fetch(`${NFSE_SYSTEM_URL}/api/tomadores${params}`);
+      const data = await res.json();
+      const tomadores = (data.data || []).slice(0, 10);
+      return {
+        sucesso: true,
+        total: tomadores.length,
+        tomadores: tomadores.map(t => ({
+          id: t.id,
+          cpf_cnpj: t.cpfCnpj,
+          razao_social: t.razaoSocial,
+          cidade: t.cidade ? `${t.cidade}/${t.uf}` : '--',
+        })),
+      };
+    } catch (err) {
+      return { sucesso: false, erro: `Falha ao conectar com NFS-e System: ${err.message}` };
+    }
+  },
+
   async emitir_nfse({ prestador_cnpj, tomador_cpf_cnpj, tomador_nome, valor, descricao, codigo_servico, aliquota_iss, task_id }) {
     // Validação de dados obrigatórios
     if (!prestador_cnpj) return { sucesso: false, erro: 'CNPJ do prestador não informado.' };

@@ -4,8 +4,8 @@ import { ThemeContext } from '../App'
 const LINKS = [
   { label: 'Escritorio', type: 'internal', id: 'home' },
   { label: 'Gesthub', type: 'external', url: 'https://gesthub-xlvb.onrender.com' },
-  { label: 'Banking', type: 'external', url: 'http://localhost:5175' },
-  { label: 'NFS-e System', type: 'external', url: 'http://localhost:5176' },
+  // { label: 'Banking', type: 'external', url: '' }, // Não deployado na VPS ainda
+  { label: 'NFS-e System', type: 'external', url: 'http://31.97.175.200:3020' },
   { label: 'Relatorio', type: 'action', id: 'relatorio' },
 ]
 

@@ -33,6 +33,111 @@ function ClientAvatar({ name }) {
   )
 }
 
+function WhatsAppConnect({ wsStatus, onConnected }) {
+  const [qrData, setQrData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [polling, setPolling] = useState(false)
+  const pollRef = useRef(null)
+  const { lastMessage } = useWebSocket()
+
+  // Listen for WebSocket events: QR generated or connected
+  useEffect(() => {
+    if (lastMessage?.type === 'whatsapp_qr') {
+      // QR was generated, fetch it
+      fetch('/api/whatsapp/qr').then(r => r.json()).then(data => {
+        if (data.hasQR) setQrData(data.qr)
+      }).catch(() => {})
+    }
+    if (lastMessage?.type === 'whatsapp_ready') {
+      setQrData(null)
+      setPolling(false)
+      clearInterval(pollRef.current)
+      onConnected?.()
+    }
+  }, [lastMessage, onConnected])
+
+  // Poll for QR while waiting
+  useEffect(() => {
+    if (!polling) return
+    pollRef.current = setInterval(async () => {
+      try {
+        const [statusRes, qrRes] = await Promise.all([
+          fetch('/api/whatsapp/status').then(r => r.json()),
+          fetch('/api/whatsapp/qr').then(r => r.json()),
+        ])
+        if (statusRes.connected) {
+          setQrData(null)
+          setPolling(false)
+          clearInterval(pollRef.current)
+          onConnected?.()
+          return
+        }
+        if (qrRes.hasQR) setQrData(qrRes.qr)
+      } catch {}
+    }, 3000)
+    return () => clearInterval(pollRef.current)
+  }, [polling, onConnected])
+
+  async function handleConnect() {
+    setLoading(true)
+    try {
+      // First check if QR is already available
+      const res = await fetch('/api/whatsapp/qr').then(r => r.json())
+      if (res.hasQR) {
+        setQrData(res.qr)
+      }
+      // Start polling for QR / connection
+      setPolling(true)
+    } catch {}
+    setLoading(false)
+  }
+
+  return (
+    <div className="glass-card rounded-xl p-5">
+      <div className="flex items-center gap-3 mb-3">
+        <div className="w-9 h-9 rounded-xl flex items-center justify-center"
+          style={{ background: 'rgba(239, 68, 68, 0.06)', border: '1px solid rgba(239, 68, 68, 0.08)' }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(239, 68, 68, 0.5)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/>
+          </svg>
+        </div>
+        <div className="flex-1">
+          <span className="text-[13px] font-semibold" style={{ fontFamily: 'Outfit', color: 'var(--ao-text-primary)' }}>WhatsApp desconectado</span>
+          <p className="text-[10px] mt-0.5" style={{ color: 'var(--ao-text-xs)' }}>
+            {qrData ? 'Escaneie o QR code no WhatsApp do escritorio' : 'Clique para gerar o QR code e conectar'}
+          </p>
+        </div>
+        {!qrData && (
+          <button
+            onClick={handleConnect}
+            disabled={loading || polling}
+            className="text-[11px] font-medium px-3.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+            style={{ background: 'rgba(52, 211, 153, 0.08)', color: 'rgba(52, 211, 153, 0.8)', border: '1px solid rgba(52, 211, 153, 0.12)' }}>
+            {loading || polling ? 'Aguardando QR...' : 'Conectar'}
+          </button>
+        )}
+      </div>
+
+      {qrData && (
+        <div className="flex flex-col items-center gap-3 pt-2">
+          <div className="rounded-xl p-3" style={{ background: '#ffffff' }}>
+            <img src={qrData} alt="WhatsApp QR Code" className="w-48 h-48" />
+          </div>
+          <p className="text-[10px] text-center" style={{ color: 'var(--ao-text-dim)' }}>
+            Abra o WhatsApp no celular &rarr; Aparelhos conectados &rarr; Conectar aparelho
+          </p>
+          {polling && (
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+              <span className="text-[10px]" style={{ color: 'var(--ao-text-xs)' }}>Aguardando leitura do QR...</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function AttendanceQueue() {
   const [queue, setQueue] = useState([])
   const [wsStatus, setWsStatus] = useState(null)
@@ -88,14 +193,7 @@ export default function AttendanceQueue() {
   }
 
   if (!wsStatus?.connected) {
-    return (
-      <div className="glass-card rounded-xl p-4">
-        <div className="flex items-center gap-2.5">
-          <span className="w-2 h-2 rounded-full bg-red-400/60" />
-          <span className="text-[12px]" style={{ color: 'var(--ao-text-dim)' }}>WhatsApp desconectado</span>
-        </div>
-      </div>
-    )
+    return <WhatsAppConnect wsStatus={wsStatus} onConnected={load} />
   }
 
   return (

@@ -469,9 +469,8 @@ MENSAGEM DO CEO CAIO: ${text.trim()}
 
 Responda de forma direta e útil. Se ele perguntou sobre uma tarefa ou resultado, explique com clareza. Seja conciso (2-3 frases).`;
 
-    // Chat da equipe: sem tools (respostas rápidas conversacionais)
-    const agentNoTools = { ...agent, tools: [] };
-    const response = await chatWithAgent(agentNoTools, [{ role: 'user', content: prompt }]);
+    // Chat da equipe: com tools para que o agente possa executar ações reais
+    const response = await chatWithAgent(agent, [{ role: 'user', content: prompt }], executeToolCall);
 
     const agentText = response.success
       ? (response.text || 'Processado.')

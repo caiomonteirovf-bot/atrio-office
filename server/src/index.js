@@ -637,8 +637,9 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
 app.post('/api/whatsapp/reconnect', async (req, res) => {
   try {
     await whatsapp.destroy();
-    await whatsapp.initialize();
-    res.json({ success: true });
+    // Responde imediato — initialize sobe Puppeteer e QR chega via WebSocket
+    res.json({ success: true, message: 'Reconectando... QR Code será enviado via WebSocket.' });
+    whatsapp.initialize().catch(err => console.error('[WhatsApp] Falha ao reconectar:', err.message));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

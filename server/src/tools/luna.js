@@ -1,5 +1,6 @@
 import { query } from '../db/pool.js';
 import * as gesthub from '../services/gesthub.js';
+import { consultarCliente } from './shared.js';
 
 const AGENT_IDS = {
   rodrigo: 'a0000001-0000-0000-0000-000000000001',
@@ -33,6 +34,8 @@ const ONBOARDING_FASES = [
 ];
 
 export const tools = {
+  consultar_cliente: consultarCliente,
+
   async onboarding_cliente({ nome_cliente, cnpj }) {
     if (!nome_cliente) return { erro: 'Parâmetro obrigatório: nome_cliente' };
 

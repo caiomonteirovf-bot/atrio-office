@@ -2,6 +2,89 @@ import * as gesthub from '../services/gesthub.js';
 import { consultarCNPJ } from '../services/receita.js';
 
 /**
+ * Consulta cliente na base interna (Gesthub) por nome, CNPJ ou telefone.
+ * Retorna dados completos: regime, honorário, Fator R, endereço, etc.
+ */
+export async function consultarCliente({ busca }) {
+  if (!busca) return { erro: 'Parâmetro obrigatório: busca (nome, CNPJ ou telefone do cliente)' };
+
+  const termo = busca.trim();
+  const isNumeric = /^\d+$/.test(termo.replace(/\D/g, ''));
+  const isCnpj = termo.replace(/\D/g, '').length >= 11;
+
+  let resultados = [];
+
+  if (isCnpj) {
+    const cliente = await gesthub.searchClientByCnpj(termo);
+    if (cliente) resultados = [cliente];
+  }
+
+  if (resultados.length === 0 && isNumeric) {
+    const cliente = await gesthub.findClientByPhone(termo.replace(/\D/g, ''));
+    if (cliente) resultados = [cliente];
+  }
+
+  if (resultados.length === 0) {
+    resultados = await gesthub.searchClientByName(termo);
+  }
+
+  if (resultados.length === 0) {
+    return {
+      encontrado: false,
+      mensagem: `Nenhum cliente encontrado para "${termo}" na base do Gesthub.`,
+      sugestao: 'Tente buscar pelo CNPJ completo ou nome da razão social.',
+    };
+  }
+
+  const fmt = (v) => v ? Number(v).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : 'Não informado';
+
+  return {
+    encontrado: true,
+    total: resultados.length,
+    clientes: resultados.slice(0, 5).map(c => ({
+      id: c.id,
+      razao_social: c.legalName || '',
+      nome_fantasia: c.tradeName || '',
+      cnpj: c.document || '',
+      regime_tributario: c.taxRegime || 'Não informado',
+      status: c.status || '',
+      honorario_mensal: fmt(c.monthlyFee),
+      fator_r: c.fatorR || 'Não calculado',
+      cnae: c.cnae || '',
+      inscricao_municipal: c.municipalRegistration || '',
+      cidade: c.city || '',
+      uf: c.state || '',
+      telefone: c.phone || '',
+      email: c.email || '',
+      responsavel: c.analyst || c.officeOwner || '',
+    })),
+  };
+}
+
+/**
+ * Lista todos os clientes ativos do escritório (resumo).
+ */
+export async function listarClientes() {
+  const clients = await gesthub.getClients();
+  const ativos = clients.filter(c => c.status === 'ATIVO');
+
+  const fmt = (v) => v ? Number(v).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : '—';
+
+  return {
+    total_ativos: ativos.length,
+    total_geral: clients.length,
+    clientes: ativos.slice(0, 30).map(c => ({
+      razao_social: c.legalName?.substring(0, 50) || '',
+      cnpj: c.document || '',
+      regime: c.taxRegime || '—',
+      honorario: fmt(c.monthlyFee),
+      cidade: c.city || '—',
+    })),
+    nota: ativos.length > 30 ? `Mostrando 30 de ${ativos.length}. Use consultar_cliente para buscar específico.` : undefined,
+  };
+}
+
+/**
  * Consulta CNPJ — primeiro na base interna (Gesthub), depois na Receita Federal
  */
 export async function consultarCnpj({ cnpj }) {

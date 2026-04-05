@@ -1,5 +1,5 @@
 import * as gesthub from '../services/gesthub.js';
-import { consultarCnpj } from './shared.js';
+import { consultarCnpj, consultarCliente, listarClientes } from './shared.js';
 import * as nuvemFiscal from '../services/nuvem-fiscal.js';
 
 // Tabela Simples Nacional 2024 (Anexos I a V) — faixas simplificadas
@@ -55,6 +55,8 @@ const CALENDARIO_FISCAL = [
 
 export const tools = {
   consultar_cnpj: consultarCnpj,
+  consultar_cliente: consultarCliente,
+  listar_clientes: listarClientes,
 
   async calcular_fator_r({ folha_12m, receita_12m }) {
     if (!folha_12m || !receita_12m) {

@@ -1,9 +1,12 @@
 import * as gesthub from '../services/gesthub.js';
 import * as omie from '../services/omie.js';
+import { consultarCliente, listarClientes } from './shared.js';
 
 const fmt = (v) => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 
 export const tools = {
+  consultar_cliente: consultarCliente,
+  listar_clientes: listarClientes,
   async contas_pagar() {
     if (!omie.isConfigured()) {
       return { disponivel: false, erro: 'Omie não configurado. Adicione OMIE_APP_KEY e OMIE_APP_SECRET no .env' };

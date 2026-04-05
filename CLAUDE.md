@@ -34,7 +34,7 @@
 - **Cor:** #BA7517 (Amber) | **Letra:** L
 - **Tools:** whatsapp_enviar, whatsapp_receber, email_enviar, coletar_documento, onboarding_cliente, rotear_para_rodrigo
 - **Personalidade:** Simpática, acolhedora. Traduz contabilês para o cliente.
-- **Canal:** Evolution API (WhatsApp) — já rodando na infra.
+- **Canal:** whatsapp-web.js (sessão local via Puppeteer)
 
 ### Sofia — Analista societário (Societário)
 - **Função:** Contratos sociais, alterações, consolidações, Junta Comercial, estrutura societária.
@@ -56,6 +56,12 @@
 - **Personalidade:** Criativa, estratégica, comunicativa. Transforma contabilidade em conteúdo que engaja.
 - **Integrações:** Luna (execução WhatsApp), Campelo (conteúdo fiscal), Valência (conversão de leads)
 
+### Dara — Secretária executiva (Diretoria)
+- **Função:** Agenda, atas, follow-ups, organização interna, suporte administrativo ao CEO.
+- **Cor:** #8B6F5A (Bronze) | **Letra:** D
+- **Tools:** agendar_reuniao, gerar_ata, follow_up, organizar_pauta, lembrete_interno, consultar_agenda, resumo_dia
+- **Personalidade:** Discreta, eficiente, proativa. Mantém tudo organizado nos bastidores.
+
 ## Colaboradores humanos (7)
 
 - **Caio** — CEO / Comercial / Marketing (diretoria)
@@ -73,7 +79,7 @@
 | Fiscal | Campelo | Deyvison / Diego / Karla |
 | Financeiro | Sneijder | Diogo |
 | Societário | Sofia | Deyvison |
-| Comercial | — | Caio |
+| Comercial | Valência | Caio |
 | Atendimento | Luna | Quésia |
 | Pessoal/Folha | — | Rafaela |
 
@@ -104,9 +110,12 @@
 
 ## Infraestrutura
 
-- **VPS principal:** 89.167.63.141 (PostgreSQL, Gesthub, serviços)
-- **Deploy:** Docker containers com Caddy reverse proxy
+- **VPS Hostinger:** 31.97.175.200 (PostgreSQL, Gesthub, Átrio Office, NFS-e System)
+- **Deploy:** Docker Compose (`/opt/atrio/`) com Caddy reverse proxy
+- **Repo no VPS:** `/opt/atrio/atrio-office/` (git pull + docker compose up -d --build)
+- **CI/CD:** GitHub Actions com appleboy/ssh-action (atualmente quebrado — SSH bloqueado pelo firewall Hostinger)
 - **Portas:** server 3010, frontend 5173 (dev)
+- **VPS expira:** 2026-04-16 (renovar!)
 
 ## Banco de dados — 6 tabelas
 
@@ -166,8 +175,9 @@ atrio-office/
 - [x] Schema do banco com 9 tabelas (6 core + 3 WhatsApp/métricas)
 - [x] Server Express com rotas, WebSocket, orchestrator
 - [x] Frontend React + Vite + Tailwind com 10 componentes
-- [x] Chat funcional com Minimax M2.5 (tool use loop)
-- [x] WhatsApp operacional (whatsapp-web.js) — Luna ativa
+- [x] Chat funcional com Minimax M2.5 (tool use loop + fallback <FunctionCall> XML)
+- [x] Chat privado (1:1 com agente) + Chat da equipe (@menções, todos os agentes com tools)
+- [x] WhatsApp operacional (whatsapp-web.js) — Luna ativa, com controles de desconectar/reconectar no dashboard
 - [x] Fluxo completo: greeting → classificação → roteamento → escalation
 - [x] Coleta de dados NFS-e via WhatsApp
 - [x] Integração Omie (inadimplência, contas a pagar/receber)
@@ -179,12 +189,17 @@ atrio-office/
 - [x] Persistência de conversas WhatsApp no banco
 
 ### Próximos passos:
-- [ ] Escritório virtual 2D com avatares animados (PixiJS)
+- [ ] Emissão NFS-e via Nuvem Fiscal (payload DPS validado, falta credenciais prod)
 - [ ] Scheduler proativo — Campelo alerta prazos fiscais por cliente
+- [ ] Integração Omie API (dados reais de faturamento/inadimplência)
 - [ ] Integração Cliente 360 do Gesthub no contexto da Luna
-- [ ] Comunicação proativa (lembretes, coleta de documentos)
+- [ ] Comunicação proativa (lembretes, coleta de documentos via WhatsApp)
+- [ ] Gesthub como master — sync bidirecional via API externa (PUT + enriquecer-cnpj)
+- [ ] Fila de atendimento no dashboard (SLA, classificação, atribuição)
 - [ ] Dashboard de gestão CEO (NPS, SLA, produtividade)
+- [ ] Escritório virtual 2D com avatares animados (PixiJS)
 - [ ] Portal do cliente
+- [ ] Corrigir CI/CD (SSH bloqueado — considerar webhook-based deploy ou self-hosted runner)
 
 ## Convenções de código
 
@@ -195,12 +210,22 @@ atrio-office/
 - **Erros:** sempre retornar `{ error: "mensagem" }` com status HTTP adequado
 - **IDs:** UUID v4 para todas as entidades
 
+## Particularidades técnicas do Minimax M2.5
+
+- Às vezes gera `<FunctionCall>` XML como texto em vez de usar o mecanismo formal `tool_calls` da API OpenAI
+- `chatWithAgent()` em `claude.js` tem fallback: parseia XML, executa tools, alimenta resultado de volta ao LLM
+- Respostas incluem blocos `<think>` que são removidos por `extractText()`
+- O `tools` no banco é JSONB array com `input_schema` — duplicatas causam rejeição da API
+
 ## Regras importantes
 
 1. O sistema atende qualquer tipo de cliente (não apenas médicos PJ)
 2. Rodrigo NUNCA executa — apenas coordena e delega
 3. Luna é sempre o primeiro contato com o cliente
-4. Toda comunicação inter-agente é via task queue (fica registrada no banco)
-5. Se algo trava 2x ou é urgente, Rodrigo escala para Caio
-6. Colaboradores humanos recebem tasks da mesma forma que agentes IA
-7. Theme: dark mode com identidade visual Átrio (#C4956A + #08080A)
+4. Luna NUNCA notifica cliente sobre resultado — sempre avisa EQUIPE (grupo WhatsApp/Telegram)
+5. Escalation ao cliente SÓ em horário comercial; fora = só equipe interna
+6. Tasks SEMPRE para agentes IA, nunca direto para humanos
+7. Toda comunicação inter-agente é via task queue (fica registrada no banco)
+8. Se algo trava 2x ou é urgente, Rodrigo escala para Caio
+9. Colaboradores humanos recebem tasks da mesma forma que agentes IA
+10. Theme: dark mode com identidade visual Átrio (#C4956A + #08080A)

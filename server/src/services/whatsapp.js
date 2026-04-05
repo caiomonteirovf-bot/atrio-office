@@ -347,7 +347,11 @@ export async function initialize() {
 
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: './whatsapp-session' }),
-    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+    puppeteer: {
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      ...(process.env.PUPPETEER_EXECUTABLE_PATH && { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }),
+    },
   });
 
   client.on('qr', async (qr) => {

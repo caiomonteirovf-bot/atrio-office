@@ -143,8 +143,11 @@ export default function AttendanceQueue() {
   const [wsStatus, setWsStatus] = useState(null)
   const [, setTick] = useState(0)
   const [actionLoading, setActionLoading] = useState(null)
+  const [showWsMenu, setShowWsMenu] = useState(false)
+  const [wsActionLoading, setWsActionLoading] = useState(false)
   const { lastMessage } = useWebSocket()
   const loadRef = useRef(null)
+  const menuRef = useRef(null)
 
   async function load() {
     try {
@@ -168,11 +171,20 @@ export default function AttendanceQueue() {
   // WebSocket: refresh immediately on relevant events
   useEffect(() => {
     if (lastMessage && WS_REFRESH_EVENTS.has(lastMessage.type)) {
-      // Debounce rapid events (e.g. multiple messages in quick succession)
       clearTimeout(loadRef.current)
       loadRef.current = setTimeout(load, 500)
     }
   }, [lastMessage])
+
+  // Close menu on click outside
+  useEffect(() => {
+    if (!showWsMenu) return
+    function handleClick(e) {
+      if (menuRef.current && !menuRef.current.contains(e.target)) setShowWsMenu(false)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [showWsMenu])
 
   async function handleMarkReplied(phone) {
     setActionLoading(phone)
@@ -192,6 +204,37 @@ export default function AttendanceQueue() {
     setActionLoading(null)
   }
 
+  async function handleDisconnect() {
+    setWsActionLoading(true)
+    try {
+      await fetch('/api/whatsapp/disconnect', { method: 'POST' })
+      await load()
+    } catch {}
+    setWsActionLoading(false)
+    setShowWsMenu(false)
+  }
+
+  async function handleReconnect() {
+    setWsActionLoading(true)
+    try {
+      await fetch('/api/whatsapp/reconnect', { method: 'POST' })
+      // Poll for reconnection
+      const poll = setInterval(async () => {
+        const status = await fetch('/api/whatsapp/status').then(r => r.json())
+        if (status.connected) {
+          clearInterval(poll)
+          setWsActionLoading(false)
+          setShowWsMenu(false)
+          await load()
+        }
+      }, 3000)
+      // Timeout after 60s
+      setTimeout(() => { clearInterval(poll); setWsActionLoading(false) }, 60000)
+    } catch {
+      setWsActionLoading(false)
+    }
+  }
+
   if (!wsStatus?.connected) {
     return <WhatsAppConnect wsStatus={wsStatus} onConnected={load} />
   }
@@ -201,9 +244,70 @@ export default function AttendanceQueue() {
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-3">
           <h2 className="section-header">Atendimento WhatsApp</h2>
-          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full" style={{ background: 'rgba(52, 211, 153, 0.06)', border: '1px solid rgba(52, 211, 153, 0.08)' }}>
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" style={{ boxShadow: '0 0 6px rgba(52,211,153,0.4)' }} />
-            <span className="text-[10px] text-emerald-400/70 font-medium">Luna ativa</span>
+          {/* Connection status badge with menu */}
+          <div className="relative" ref={menuRef}>
+            <button
+              onClick={() => setShowWsMenu(v => !v)}
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded-full cursor-pointer transition-all"
+              style={{
+                background: 'rgba(52, 211, 153, 0.06)',
+                border: `1px solid ${showWsMenu ? 'rgba(52, 211, 153, 0.2)' : 'rgba(52, 211, 153, 0.08)'}`,
+              }}
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" style={{ boxShadow: '0 0 6px rgba(52,211,153,0.4)' }} />
+              <span className="text-[10px] text-emerald-400/70 font-medium">
+                Luna ativa{wsStatus?.phone ? ` \u00B7 ${wsStatus.phone}` : ''}
+              </span>
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" className={`transition-transform ${showWsMenu ? 'rotate-180' : ''}`}>
+                <path d="M2.5 3.75L5 6.25L7.5 3.75" stroke="rgba(52,211,153,0.5)" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </button>
+
+            {showWsMenu && (
+              <div className="absolute top-full left-0 mt-1.5 py-1.5 rounded-xl z-20 min-w-[180px]"
+                style={{ background: 'var(--ao-surface)', border: '1px solid var(--ao-border-hover)', boxShadow: '0 8px 24px var(--ao-shadow)' }}>
+                {/* Status info */}
+                <div className="px-3 py-2 mb-1" style={{ borderBottom: '1px solid var(--ao-border-subtle)' }}>
+                  <p className="text-[10px] font-medium" style={{ color: 'var(--ao-text-dim)' }}>Conexao WhatsApp</p>
+                  {wsStatus?.phone && (
+                    <p className="text-[11px] font-semibold mt-0.5" style={{ color: 'var(--ao-text-secondary)' }}>+{wsStatus.phone}</p>
+                  )}
+                  <p className="text-[9px] mt-0.5" style={{ color: 'var(--ao-text-xs)' }}>
+                    {wsStatus?.activeConversations || 0} conversas ativas
+                  </p>
+                </div>
+
+                {/* Reconnect */}
+                <button
+                  onClick={handleReconnect}
+                  disabled={wsActionLoading}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-white/[0.03]"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(52,211,153,0.6)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="23 4 23 10 17 10"/>
+                    <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+                  </svg>
+                  <span className="text-[11px]" style={{ color: 'var(--ao-text-secondary)' }}>
+                    {wsActionLoading ? 'Reconectando...' : 'Reconectar'}
+                  </span>
+                </button>
+
+                {/* Disconnect */}
+                <button
+                  onClick={handleDisconnect}
+                  disabled={wsActionLoading}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-white/[0.03]"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(239,68,68,0.6)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18.36 6.64a9 9 0 11-12.73 0"/>
+                    <line x1="12" y1="2" x2="12" y2="12"/>
+                  </svg>
+                  <span className="text-[11px]" style={{ color: 'rgba(239,68,68,0.7)' }}>
+                    {wsActionLoading ? 'Desconectando...' : 'Desconectar'}
+                  </span>
+                </button>
+              </div>
+            )}
           </div>
         </div>
         {queue.length > 0 && (

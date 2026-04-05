@@ -624,6 +624,26 @@ app.post('/api/whatsapp/conversations/:phone/resolve', (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/whatsapp/disconnect', async (req, res) => {
+  try {
+    await whatsapp.destroy();
+    broadcast({ type: 'whatsapp_disconnected' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/whatsapp/reconnect', async (req, res) => {
+  try {
+    await whatsapp.destroy();
+    await whatsapp.initialize();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ============================================
 // SPA FALLBACK — Serve index.html para rotas do frontend
 // ============================================

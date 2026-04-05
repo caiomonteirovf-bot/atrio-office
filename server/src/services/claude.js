@@ -77,6 +77,40 @@ export function extractText(response) {
 }
 
 /**
+ * Parseia <FunctionCall> XML do Minimax quando ele usa texto em vez de tool_calls formal
+ * Retorna array de { name, args } ou null se não encontrou
+ */
+function parseFunctionCallXml(text) {
+  if (!text || !text.includes('<FunctionCall>')) return null;
+
+  const calls = [];
+  const regex = /<FunctionCall>\s*tool_name:\s*(\w+)([\s\S]*?)<\/FunctionCall>/g;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    const name = match[1];
+    const paramsStr = match[2];
+    const args = {};
+
+    // Parse <param name="key">value</param>
+    const paramRegex = /<param\s+name="(\w+)">([\s\S]*?)<\/param>/g;
+    let paramMatch;
+    while ((paramMatch = paramRegex.exec(paramsStr)) !== null) {
+      const val = paramMatch[2].trim();
+      // Try to parse as number/boolean
+      if (val === 'true') args[paramMatch[1]] = true;
+      else if (val === 'false') args[paramMatch[1]] = false;
+      else if (/^\d+$/.test(val)) args[paramMatch[1]] = parseInt(val);
+      else args[paramMatch[1]] = val;
+    }
+
+    calls.push({ name, args });
+  }
+
+  return calls.length > 0 ? calls : null;
+}
+
+/**
  * Chat completo com agente (com suporte a tool use loop)
  */
 export async function chatWithAgent(agent, messages, toolExecutor = null) {
@@ -97,8 +131,16 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
 
     if (!response.success) return response;
 
-    // Se não tem tool calls ou não tem executor, retorna a resposta final
-    if (!response.toolCalls?.length || !toolExecutor) {
+    // Verifica tool calls formais (API) OU <FunctionCall> XML no texto (fallback Minimax)
+    let toolCalls = response.toolCalls?.length ? response.toolCalls : null;
+    let xmlToolCalls = null;
+
+    if (!toolCalls && toolExecutor && response.content) {
+      xmlToolCalls = parseFunctionCallXml(response.content);
+    }
+
+    // Se não tem tool calls de nenhum tipo, retorna a resposta final
+    if (!toolCalls && !xmlToolCalls) {
       return {
         success: true,
         text: extractText(response.content),
@@ -106,23 +148,66 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
       };
     }
 
-    // Adiciona resposta do assistant ao histórico
-    currentMessages.push({
-      role: 'assistant',
-      content: response.content,
-      tool_calls: response.toolCalls,
-    });
+    if (!toolExecutor) {
+      // Sem executor: limpa XML do texto e retorna
+      const cleanText = response.content
+        .replace(/<FunctionCall>[\s\S]*?<\/FunctionCall>/g, '')
+        .trim();
+      return {
+        success: true,
+        text: extractText(cleanText || 'Processado.'),
+        usage: response.usage,
+      };
+    }
 
-    // Executa cada tool call e adiciona resultado
-    for (const toolCall of response.toolCalls) {
-      const fnName = toolCall.function.name;
-      const fnArgs = JSON.parse(toolCall.function.arguments || '{}');
-      const result = await toolExecutor(fnName, fnArgs);
+    // Executa tool calls formais (API OpenAI)
+    if (toolCalls) {
+      currentMessages.push({
+        role: 'assistant',
+        content: response.content,
+        tool_calls: toolCalls,
+      });
+
+      for (const toolCall of toolCalls) {
+        const fnName = toolCall.function.name;
+        const fnArgs = JSON.parse(toolCall.function.arguments || '{}');
+        const result = await toolExecutor(fnName, fnArgs);
+
+        currentMessages.push({
+          role: 'tool',
+          content: typeof result === 'string' ? result : JSON.stringify(result),
+          tool_call_id: toolCall.id,
+        });
+      }
+    }
+    // Executa tool calls XML (fallback Minimax)
+    else if (xmlToolCalls) {
+      console.log(`[chatWithAgent] Detectado ${xmlToolCalls.length} <FunctionCall> XML — executando como fallback`);
+
+      const results = [];
+      for (const call of xmlToolCalls) {
+        const result = await toolExecutor(call.name, call.args);
+        results.push({ tool: call.name, result });
+      }
+
+      // Limpa o XML do texto original e adiciona ao histórico
+      const cleanContent = response.content
+        .replace(/<FunctionCall>[\s\S]*?<\/FunctionCall>/g, '')
+        .trim();
 
       currentMessages.push({
-        role: 'tool',
-        content: typeof result === 'string' ? result : JSON.stringify(result),
-        tool_call_id: toolCall.id,
+        role: 'assistant',
+        content: cleanContent || `Vou consultar usando ${xmlToolCalls.map(c => c.name).join(', ')}...`,
+      });
+
+      // Adiciona resultados como mensagem do usuário (sem tool_call_id formal)
+      const toolResultsText = results.map(r =>
+        `Resultado de ${r.tool}: ${typeof r.result === 'string' ? r.result : JSON.stringify(r.result)}`
+      ).join('\n\n');
+
+      currentMessages.push({
+        role: 'user',
+        content: `[RESULTADO DAS FERRAMENTAS]\n${toolResultsText}\n\nAgora responda a pergunta original usando esses dados. Responda de forma direta e útil, sem mencionar as ferramentas.`,
       });
     }
 

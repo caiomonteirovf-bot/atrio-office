@@ -81,9 +81,31 @@ app.get('/api/team', async (req, res) => {
 // ============================================
 // CHAT — Conversar com um agente
 // ============================================
+// Sanitiza input do chat — remove tentativas de prompt injection
+function sanitizeMessage(text) {
+  if (!text || typeof text !== 'string') return '';
+  // Remove instruções que tentam alterar comportamento do agente
+  const patterns = [
+    /ignore\s+(all\s+)?previous\s+instructions/gi,
+    /you\s+are\s+now\s+/gi,
+    /forget\s+(all\s+)?your\s+(instructions|rules|prompt)/gi,
+    /system\s*:\s*/gi,
+    /\[SYSTEM\]/gi,
+    /\[INST\]/gi,
+    /<\/?system>/gi,
+  ];
+  let sanitized = text;
+  for (const p of patterns) sanitized = sanitized.replace(p, '[BLOQUEADO] ');
+  // Limita tamanho
+  return sanitized.substring(0, 4000);
+}
+
 app.post('/api/chat/:agentId', async (req, res) => {
   const { agentId } = req.params;
-  const { message, conversationId } = req.body;
+  const { message: rawMessage, conversationId } = req.body;
+  const message = sanitizeMessage(rawMessage);
+
+  if (!message.trim()) return res.status(400).json({ error: 'Mensagem vazia' });
 
   try {
     // Busca agente
@@ -224,9 +246,12 @@ app.patch('/api/tasks/:id', async (req, res) => {
   const { id } = req.params;
   const { status, result } = req.body;
   try {
+    const completedExpr = status === 'done' ? 'NOW()'
+      : (status === 'pending' || status === 'in_progress') ? 'NULL'
+      : 'completed_at';
     const { rows } = await query(
       `UPDATE tasks SET status = $1, result = COALESCE($2, result),
-       completed_at = ${status === 'done' ? 'NOW()' : 'completed_at'},
+       completed_at = ${completedExpr},
        updated_at = NOW()
        WHERE id = $3 RETURNING *`,
       [status, result ? JSON.stringify(result) : null, id]
@@ -236,9 +261,10 @@ app.patch('/api/tasks/:id', async (req, res) => {
 
     const task = rows[0];
 
-    // Hook: Task concluída → broadcast para dashboard (resposta ao cliente é feita pela equipe humana)
-    // Futuramente Luna poderá enviar auto-resposta se habilitado
-    broadcast({ type: 'task_completed', task });
+    // Hook: Task concluída → broadcast para dashboard
+    if (status === 'done') {
+      broadcast({ type: 'task_completed', task });
+    }
 
     broadcast({ type: 'task_updated', task });
     res.json(task);

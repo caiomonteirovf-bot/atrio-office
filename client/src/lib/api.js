@@ -36,6 +36,8 @@ export const api = {
   },
   createTask: (task) =>
     request('/tasks', { method: 'POST', body: JSON.stringify(task) }),
+  updateTask: (id, data) =>
+    request(`/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
 
   // Clients
   getClients: () => request('/clients'),

@@ -336,13 +336,13 @@ export const tools = {
       const emitirRes = await fetch(`${NFSE_SYSTEM_URL}/api/emissao/nuvem-fiscal/emitir`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: [nfseId] }),
+        body: JSON.stringify({ ids: [nfseId], prestador_cnpj: prestador_cnpj.replace(/\D/g, '') }),
       });
 
       const emitirData = await emitirRes.json();
 
       // 3. Verifica resultado
-      const resultado = emitirData?.resultados?.[0] || emitirData;
+      const resultado = emitirData?.data?.[0] || emitirData?.resultados?.[0] || emitirData;
       const sucesso = resultado.ok !== false && !resultado.error;
 
       return {

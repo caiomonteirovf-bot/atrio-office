@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const GESTHUB_URL = process.env.GESTHUB_API_URL || 'https://gesthub-xlvb.onrender.com';
+const GESTHUB_API_KEY = process.env.GESTHUB_API_KEY || '';
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 
 let cache = { data: null, timestamp: 0 };
@@ -111,6 +112,38 @@ export async function getColaboradores() {
 }
 
 // ============================================
+// BUSCAR EMPRESA POR TELEFONE (cruza contatos)
+// ============================================
+export async function findClientByPhone(phone) {
+  const clients = await getClients();
+  const digits = phone.replace(/\D/g, '');
+  // Normaliza: pega os últimos 10-11 dígitos (DDD + número)
+  const shortDigits = digits.length > 11 ? digits.slice(-11) : digits;
+
+  for (const client of clients) {
+    // Verifica campo phone direto
+    if (client.phone) {
+      const clientDigits = client.phone.replace(/\D/g, '');
+      if (clientDigits.endsWith(shortDigits) || shortDigits.endsWith(clientDigits.slice(-10))) {
+        return client;
+      }
+    }
+    // Verifica nos contatos (array com telefone de cada sócio/contato)
+    if (Array.isArray(client.contatos)) {
+      for (const contato of client.contatos) {
+        if (contato.telefone) {
+          const contatoDigits = contato.telefone.replace(/\D/g, '');
+          if (contatoDigits.endsWith(shortDigits.slice(-10)) || shortDigits.endsWith(contatoDigits.slice(-10))) {
+            return { ...client, _contato: contato };
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// ============================================
 // NPS
 // ============================================
 export async function getNpsDashboard(filters = {}) {
@@ -133,4 +166,57 @@ export async function getAuditLog(tabela, registroId) {
   if (tabela) params.set('tabela', tabela);
   if (registroId) params.set('registro_id', registroId);
   return request(`/auditoria?${params}`);
+}
+
+// ============================================
+// ESCRITA — Sincronização bidirecional
+// ============================================
+
+function extHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  if (GESTHUB_API_KEY) headers['X-API-Key'] = GESTHUB_API_KEY;
+  return headers;
+}
+
+function extBase() {
+  return GESTHUB_API_KEY ? '/external' : '';
+}
+
+/**
+ * Atualiza dados de um cliente no Gesthub (parcial — só campos presentes).
+ * Aceita camelCase: { phone, email, logradouro, etc. }
+ */
+export async function updateClient(clientId, data) {
+  invalidateCache();
+  const prefix = extBase();
+  const url = `${GESTHUB_URL}/api${prefix}/clients/${clientId}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: extHeaders(),
+    body: JSON.stringify(data),
+  });
+  const payload = await res.json();
+  if (!res.ok || !payload.ok) {
+    throw new Error(payload.error || `Erro ao atualizar cliente: ${res.status}`);
+  }
+  return payload.data;
+}
+
+/**
+ * Dispara enriquecimento via Receita Federal no Gesthub.
+ * O Gesthub busca na BrasilAPI e atualiza campos + importa sócios.
+ */
+export async function enrichClientCnpj(clientId) {
+  invalidateCache();
+  const prefix = extBase();
+  const url = `${GESTHUB_URL}/api${prefix}/clients/${clientId}/enriquecer-cnpj`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: extHeaders(),
+  });
+  const payload = await res.json();
+  if (!res.ok || !payload.ok) {
+    throw new Error(payload.error || `Erro ao enriquecer CNPJ: ${res.status}`);
+  }
+  return payload;
 }

@@ -1,5 +1,4 @@
 import { chatWithAgent } from './claude.js';
-import { executeToolCall } from '../tools/registry.js';
 import { query } from '../db/pool.js';
 import * as telegram from './telegram.js';
 
@@ -29,20 +28,48 @@ export async function generateDailyReport() {
     const { rows: agents } = await query('SELECT * FROM agents WHERE id = $1', [RODRIGO_AGENT_ID]);
     if (!agents.length) return;
 
-    // Tasks do dia
+    // Tasks do dia (com resultado e tempo de execução)
     const { rows: tasks } = await query(`
-      SELECT t.title, t.status, t.priority, tm.name as assigned_name
+      SELECT t.title, t.status, t.priority, t.result, t.created_at, t.completed_at,
+             tm.name as assigned_name, d.name as delegated_name,
+             EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - t.created_at)) / 60 as minutes_elapsed
       FROM tasks t
       LEFT JOIN team_members tm ON t.assigned_to = tm.id
+      LEFT JOIN team_members d ON t.delegated_by = d.id
       WHERE DATE(t.created_at) = CURRENT_DATE OR DATE(t.updated_at) = CURRENT_DATE
+      ORDER BY t.created_at ASC
     `);
+
+    const done = tasks.filter(t => t.status === 'done');
+    const blocked = tasks.filter(t => t.status === 'blocked');
+    const pending = tasks.filter(t => t.status === 'pending');
+    const inProgress = tasks.filter(t => t.status === 'in_progress');
+    const stalled = [...pending, ...inProgress].filter(t => t.minutes_elapsed > 30);
 
     const analyses = getDailyAnalyses();
 
-    const prompt = `Gere um relatório executivo do dia para o CEO. Seja direto e objetivo.
+    const prompt = `Gere um relatório executivo do dia para o CEO (Caio). Seja direto, objetivo e com tom de diretor de operações.
 
-TASKS DO DIA:
-${tasks.length > 0 ? tasks.map(t => `- [${t.status}] ${t.title} → ${t.assigned_name || '?'}`).join('\n') : 'Nenhuma task hoje'}
+RESUMO NUMÉRICO:
+- Total de tasks: ${tasks.length}
+- Concluídas: ${done.length}
+- Bloqueadas: ${blocked.length}
+- Pendentes: ${pending.length}
+- Em andamento: ${inProgress.length}
+- Paradas há mais de 30min: ${stalled.length}
+
+TASKS CONCLUÍDAS:
+${done.length > 0 ? done.map(t => `- ✅ ${t.title} → ${t.assigned_name} (${Math.round(t.minutes_elapsed)}min)`).join('\n') : 'Nenhuma'}
+
+TASKS BLOQUEADAS (ATENÇÃO):
+${blocked.length > 0 ? blocked.map(t => {
+  const result = typeof t.result === 'string' ? JSON.parse(t.result) : t.result;
+  const erro = result?.error || result?.text?.substring(0, 100) || 'Motivo não registrado';
+  return `- 🚫 ${t.title} → ${t.assigned_name} — Motivo: ${erro}`;
+}).join('\n') : 'Nenhuma'}
+
+TASKS PARADAS (SEM PROGRESSO > 30min):
+${stalled.length > 0 ? stalled.map(t => `- ⚠️ ${t.title} → ${t.assigned_name} — Parada há ${Math.round(t.minutes_elapsed)}min`).join('\n') : 'Nenhuma'}
 
 ANÁLISES DE ATENDIMENTO WHATSAPP (${analyses.length} conversas):
 ${analyses.length > 0 ? analyses.map(a =>
@@ -50,10 +77,11 @@ ${analyses.length > 0 ? analyses.map(a =>
 ).join('\n') : 'Nenhuma conversa analisada hoje'}
 
 Formate o relatório com:
-1. Resumo geral (1-2 frases)
-2. Tasks: concluídas, pendentes, bloqueadas
-3. Atendimento: NPS médio, satisfação, problemas identificados
-4. Alertas e ações recomendadas`;
+1. Resumo executivo (2-3 frases — o que foi bom e o que precisa de atenção)
+2. Produtividade: tasks concluídas por agente, tempo médio
+3. Problemas: tasks bloqueadas/paradas e por quê
+4. Fluxos interrompidos: dados que não chegaram, integrações que falharam
+5. Ações recomendadas para amanhã`;
 
     const response = await chatWithAgent(
       { ...agents[0], tools: [] },

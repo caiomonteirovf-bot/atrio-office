@@ -8,7 +8,7 @@ import dotenv from 'dotenv';
 import { query } from './db/pool.js';
 import { chatWithAgent, extractText } from './services/claude.js';
 import { executeToolCall, setOnTaskCreated } from './tools/registry.js';
-import { processTask, processPendingTasks, setBroadcast } from './services/orchestrator.js';
+import { processTask, processPendingTasks, setBroadcast, setLogChat } from './services/orchestrator.js';
 
 dotenv.config();
 
@@ -156,6 +156,32 @@ app.get('/api/conversations/:id/messages', async (req, res) => {
 });
 
 // ============================================
+// ACTIVITY FEED — Atividades relevantes para o CEO
+// ============================================
+app.get('/api/activity-feed', async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT t.*, tm.name as assigned_name, tm.type as assigned_type,
+             d.name as delegated_name, c.name as client_name
+      FROM tasks t
+      LEFT JOIN team_members tm ON t.assigned_to = tm.id
+      LEFT JOIN team_members d ON t.delegated_by = d.id
+      LEFT JOIN clients c ON t.client_id = c.id
+      WHERE t.status IN ('blocked', 'in_progress')
+         OR (t.status = 'pending' AND t.priority IN ('high', 'urgent'))
+         OR (t.status != 'done' AND t.status != 'cancelled' AND (t.title LIKE '%[NFSE]%' OR t.title LIKE '%[FISCAL]%'))
+      ORDER BY
+        CASE t.status WHEN 'blocked' THEN 0 WHEN 'in_progress' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END,
+        t.created_at DESC
+      LIMIT 10
+    `);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // TASKS — CRUD básico
 // ============================================
 app.get('/api/tasks', async (req, res) => {
@@ -188,6 +214,34 @@ app.post('/api/tasks', async (req, res) => {
       [title, description, assigned_to, delegated_by, client_id, priority || 'medium', due_date]
     );
     res.status(201).json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH task — atualizar status (inclui hook de NFS-e → Luna notifica cliente)
+app.patch('/api/tasks/:id', async (req, res) => {
+  const { id } = req.params;
+  const { status, result } = req.body;
+  try {
+    const { rows } = await query(
+      `UPDATE tasks SET status = $1, result = COALESCE($2, result),
+       completed_at = ${status === 'done' ? 'NOW()' : 'completed_at'},
+       updated_at = NOW()
+       WHERE id = $3 RETURNING *`,
+      [status, result ? JSON.stringify(result) : null, id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Task não encontrada' });
+
+    const task = rows[0];
+
+    // Hook: Task concluída → broadcast para dashboard (resposta ao cliente é feita pela equipe humana)
+    // Futuramente Luna poderá enviar auto-resposta se habilitado
+    broadcast({ type: 'task_completed', task });
+
+    broadcast({ type: 'task_updated', task });
+    res.json(task);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -307,20 +361,111 @@ app.get('/api/portal/client/:id', async (req, res) => {
 // ============================================
 app.get('/api/stats', async (req, res) => {
   try {
-    const [tasks, clients, conversations] = await Promise.all([
-      query(`SELECT status, COUNT(*) as count FROM tasks GROUP BY status`),
-      query(`SELECT status, COUNT(*) as count FROM clients GROUP BY status`),
-      query(`SELECT status, COUNT(*) as count FROM conversations GROUP BY status`),
+    const [pending, blocked, todayConvs, sentiment] = await Promise.all([
+      // Atendimentos pendentes — conversas WhatsApp abertas (não resolvidas)
+      query(`SELECT COUNT(*) as count FROM whatsapp_conversations WHERE resolved = false`),
+      // Alertas — tasks bloqueadas que precisam de ação
+      query(`SELECT COUNT(*) as count FROM tasks WHERE status = 'blocked'`),
+      // Conversas hoje — contatos do dia
+      query(`SELECT COUNT(*) as count FROM whatsapp_conversations WHERE DATE(started_at) = CURRENT_DATE`),
+      // Sentimento — média NPS das análises do dia (analysis JSONB contém nps_estimado)
+      query(`SELECT
+        AVG((analysis->>'nps_estimado')::numeric) as avg_nps,
+        COUNT(*) FILTER (WHERE (analysis->>'sentimento_cliente') IN ('insatisfeito', 'irritado')) as negativos,
+        COUNT(*) FILTER (WHERE analysis IS NOT NULL) as total_analisados
+        FROM whatsapp_conversations
+        WHERE DATE(started_at) >= CURRENT_DATE - INTERVAL '7 days' AND analysis IS NOT NULL`),
     ]);
+
+    const sentData = sentiment.rows[0] || {};
+    const avgNps = sentData.avg_nps ? parseFloat(parseFloat(sentData.avg_nps).toFixed(1)) : null;
+
     res.json({
-      tasks: Object.fromEntries(tasks.rows.map(r => [r.status, parseInt(r.count)])),
-      clients: Object.fromEntries(clients.rows.map(r => [r.status, parseInt(r.count)])),
-      conversations: Object.fromEntries(conversations.rows.map(r => [r.status, parseInt(r.count)])),
+      pendentes: parseInt(pending.rows[0]?.count || 0),
+      alertas: parseInt(blocked.rows[0]?.count || 0),
+      conversas_hoje: parseInt(todayConvs.rows[0]?.count || 0),
+      sentimento: {
+        nps_medio: avgNps,
+        negativos: parseInt(sentData.negativos || 0),
+        total_analisados: parseInt(sentData.total_analisados || 0),
+      },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ============================================
+// AGENT CHAT — Log de interações entre agentes
+// ============================================
+const agentChatLog = []; // In-memory (últimas 100 interações)
+const MAX_CHAT_LOG = 100;
+
+export function logAgentChat(msg) {
+  const entry = { id: Date.now() + '-' + Math.random().toString(36).slice(2, 6), timestamp: new Date().toISOString(), ...msg };
+  agentChatLog.push(entry);
+  if (agentChatLog.length > MAX_CHAT_LOG) agentChatLog.shift();
+  broadcast({ type: 'agent_chat', message: entry });
+}
+
+app.get('/api/agent-chat', (req, res) => {
+  res.json({ messages: agentChatLog });
+});
+
+// CEO envia mensagem no chat da equipe → agente responde via IA
+app.post('/api/agent-chat', async (req, res) => {
+  const { text, to } = req.body;
+  if (!text?.trim()) return res.status(400).json({ error: 'Texto obrigatório' });
+
+  // Loga mensagem do CEO
+  logAgentChat({ from: 'Caio', to: to || null, text: text.trim(), tag: 'ceo' });
+
+  // Encontra agente alvo (mencionado ou Rodrigo por padrão)
+  const targetName = to || detectAgentMention(text) || 'Rodrigo';
+
+  try {
+    const { rows: agents } = await query('SELECT * FROM agents WHERE name ILIKE $1 LIMIT 1', [targetName]);
+    if (!agents.length) {
+      logAgentChat({ from: 'Sistema', text: `Agente "${targetName}" não encontrado.`, tag: 'erro' });
+      return res.json({ ok: true, agentResponse: null });
+    }
+
+    const agent = agents[0];
+
+    // Monta contexto: últimas mensagens do chat + pergunta do CEO
+    const recentChat = agentChatLog.slice(-20).map(m => `${m.from}: ${m.text}`).join('\n');
+    const prompt = `Você está no chat interno da equipe do Átrio Contabilidade. O CEO Caio acabou de enviar uma mensagem para você.
+
+CONTEXTO DAS ÚLTIMAS MENSAGENS:
+${recentChat}
+
+MENSAGEM DO CEO CAIO: ${text.trim()}
+
+Responda de forma direta e útil. Se ele perguntou sobre uma tarefa ou resultado, explique com clareza. Seja conciso (2-3 frases).`;
+
+    const { sendToAgent: sendToAgentFn } = await import('./services/claude.js');
+    const response = await sendToAgentFn(agent, [{ role: 'user', content: prompt }], { maxTokens: 1024, temperature: 0.6 });
+
+    const agentText = response?.choices?.[0]?.message?.content || response?.text || 'Desculpe, não consegui processar no momento.';
+
+    logAgentChat({ from: agent.name, to: 'Caio', text: agentText });
+
+    res.json({ ok: true, agentResponse: agentText });
+  } catch (err) {
+    console.error('[AgentChat] Erro ao responder CEO:', err.message);
+    logAgentChat({ from: 'Sistema', text: `Erro ao processar: ${err.message}`, tag: 'erro' });
+    res.json({ ok: true, agentResponse: null });
+  }
+});
+
+function detectAgentMention(text) {
+  const names = ['Rodrigo', 'Campelo', 'Sneijder', 'Luna', 'Sofia', 'Valência', 'Valencia', 'Maia'];
+  const lower = text.toLowerCase();
+  for (const name of names) {
+    if (lower.includes(name.toLowerCase())) return name === 'Valencia' ? 'Valência' : name;
+  }
+  return null;
+}
 
 // ============================================
 // HTTP + WEBSOCKET SERVER
@@ -364,6 +509,20 @@ app.get('/api/whatsapp/qr', (req, res) => {
   res.json({ hasQR: true, qr });
 });
 
+// Gerar relatório executivo sob demanda
+app.post('/api/daily-report', async (req, res) => {
+  try {
+    const report = await generateDailyReport();
+    if (report) {
+      res.json({ report: report.substring(0, 500) });
+    } else {
+      res.json({ error: 'Não foi possível gerar o relatório — verifique se o agente Rodrigo está configurado.' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/whatsapp/pending', (req, res) => {
   res.json(whatsapp.getPendingMessages());
 });
@@ -378,15 +537,63 @@ app.post('/api/whatsapp/send', async (req, res) => {
   }
 });
 
-app.get('/api/whatsapp/conversations', (req, res) => {
-  const list = [];
-  const convs = whatsapp.getPendingMessages();
-  res.json(convs);
+app.get('/api/whatsapp/conversations', async (req, res) => {
+  // Conversas ativas (memória) ou históricas (banco)
+  const { history } = req.query;
+  if (history === 'true') {
+    try {
+      const { rows } = await query(`
+        SELECT c.*,
+          (SELECT COUNT(*) FROM whatsapp_messages WHERE conversation_id = c.id) as message_count,
+          (SELECT body FROM whatsapp_messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message
+        FROM whatsapp_conversations c
+        ORDER BY started_at DESC LIMIT 50
+      `);
+      return res.json(rows);
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+  res.json(whatsapp.getPendingMessages());
+});
+
+// Histórico de mensagens de uma conversa específica
+app.get('/api/whatsapp/conversations/:id/messages', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT sender, body, metadata, created_at FROM whatsapp_messages WHERE conversation_id = $1 ORDER BY created_at`,
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Métricas dos agentes
+app.get('/api/metrics', async (req, res) => {
+  const { agent, days = 7 } = req.query;
+  try {
+    const params = [parseInt(days) || 7];
+    let sql = `SELECT agent_name, event_type, COUNT(*) as total FROM agent_metrics WHERE created_at > NOW() - INTERVAL '1 day' * $1`;
+    if (agent) { params.push(agent); sql += ` AND agent_name = $${params.length}`; }
+    sql += ` GROUP BY agent_name, event_type ORDER BY total DESC`;
+    const { rows } = await query(sql, params);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/whatsapp/mark-replied/:phone', (req, res) => {
   const ok = whatsapp.markAsReplied(req.params.phone);
   res.json({ success: ok });
+});
+
+app.post('/api/whatsapp/conversations/:phone/resolve', (req, res) => {
+  whatsapp.resolveConversation(req.params.phone);
+  broadcast({ type: 'whatsapp_resolved', phone: req.params.phone });
+  res.json({ success: true });
 });
 
 // ============================================
@@ -435,17 +642,35 @@ app.post('/api/orchestrator/run', async (req, res) => {
 server.listen(PORT, () => {
   // Conecta orchestrator ao broadcast e ao registry
   setBroadcast(broadcast);
+  setLogChat(logAgentChat);
   setOnTaskCreated((taskId) => processTask(taskId));
 
-  // Inicializa WhatsApp (Luna)
+  // Inicializa WhatsApp (Luna) — conecta broadcast + processamento de tasks
   whatsapp.setBroadcast(broadcast);
+  whatsapp.setLogChat(logAgentChat);
+  whatsapp.setOnTaskCreated((taskId) => processTask(taskId));
   whatsapp.initialize().catch(err => console.error('[WhatsApp] Falha:', err.message));
+
+  // Loop periódico: processa tasks pendentes a cada 30s (safety net)
+  setInterval(() => {
+    processPendingTasks().then(count => {
+      if (count > 0) console.log(`[Orchestrator] ${count} tasks pendentes processadas (loop)`);
+    }).catch(() => {});
+  }, 30000);
 
   // Telegram Bot — desativado por enquanto (ativar se necessário)
   // telegram.initialize(process.env.TELEGRAM_BOT_TOKEN).catch(err => console.error('[Telegram] Falha:', err.message));
 
   // Agenda relatório diário do Rodrigo (18h)
   scheduleDailyReport();
+
+  // Limpeza automática — tasks concluídas/canceladas > 7 dias
+  setInterval(async () => {
+    try {
+      const { rowCount } = await query(`DELETE FROM tasks WHERE status IN ('done', 'cancelled') AND completed_at < NOW() - INTERVAL '7 days'`);
+      if (rowCount > 0) console.log(`[Cleanup] ${rowCount} tasks antigas removidas`);
+    } catch {}
+  }, 6 * 3600 * 1000); // a cada 6h
 
   // Inicia scheduler (verificações automáticas às 8h)
   scheduler.start();

@@ -83,8 +83,8 @@ export const tools = {
     );
 
     const { rows } = await query(
-      `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, result)
-       VALUES ($1, $2, $3, $4, 'medium', $5) RETURNING id`,
+      `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, completed_at, result)
+       VALUES ($1, $2, $3, $4, 'medium', 'done', NOW(), $5) RETURNING id`,
       [
         `Documento: ${documento} — ${cliente}`,
         `Coleta de documento para ${cliente}: ${documento}. Status: ${statusDoc}`,
@@ -144,24 +144,50 @@ export const tools = {
     };
   },
 
-  async whatsapp_enviar() {
-    return {
-      disponivel: false,
-      mensagem: 'Integração com WhatsApp via Evolution API em desenvolvimento. Em breve será possível enviar mensagens diretamente.',
-    };
+  async whatsapp_enviar({ telefone, mensagem }) {
+    if (!telefone || !mensagem) {
+      return { erro: 'Parâmetros obrigatórios: telefone e mensagem' };
+    }
+
+    try {
+      // Import dinâmico para evitar dependência circular
+      const whatsapp = await import('../services/whatsapp.js');
+      const status = whatsapp.getStatus();
+      if (!status.connected) {
+        return { disponivel: false, erro: 'WhatsApp não está conectado' };
+      }
+
+      // Limpa telefone e envia
+      const phone = telefone.replace(/\D/g, '');
+      await whatsapp.sendMessage(phone, mensagem);
+
+      // Log da métrica
+      await query(
+        `INSERT INTO agent_metrics (agent_name, event_type, details) VALUES ($1, $2, $3)`,
+        ['Luna', 'whatsapp_sent', JSON.stringify({ phone, messageLength: mensagem.length })]
+      );
+
+      return {
+        sucesso: true,
+        telefone: phone,
+        mensagem_enviada: mensagem.substring(0, 100) + (mensagem.length > 100 ? '...' : ''),
+      };
+    } catch (err) {
+      return { sucesso: false, erro: err.message };
+    }
   },
 
   async whatsapp_receber() {
     return {
-      disponivel: false,
-      mensagem: 'Webhook de recebimento do WhatsApp via Evolution API em desenvolvimento.',
+      disponivel: true,
+      mensagem: 'Mensagens são recebidas automaticamente via whatsapp-web.js. Use o dashboard ou /api/whatsapp/pending para ver mensagens pendentes.',
     };
   },
 
   async email_enviar() {
     return {
       disponivel: false,
-      mensagem: 'Integração de email em desenvolvimento. Em breve será possível enviar emails diretamente.',
+      mensagem: 'Integração de email em desenvolvimento.',
     };
   },
 };

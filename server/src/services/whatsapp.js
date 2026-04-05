@@ -1,9 +1,11 @@
 import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth } = pkg;
+const { Client, LocalAuth, MessageMedia } = pkg;
 import qrcode from 'qrcode';
 import * as telegram from './telegram.js';
-import { analyzeSentiment, analyzeConversation, registerNPS } from './luna-analyzer.js';
+import { analyzeSentiment, analyzeConversation, registerNPS, classifyDemand } from './luna-analyzer.js';
 import { addAnalysis } from './daily-report.js';
+import { query } from '../db/pool.js';
+import { findClientByPhone } from './gesthub.js';
 
 // ============================================
 // ESTADO
@@ -12,9 +14,107 @@ let client = null;
 let qrCodeData = null;
 let isReady = false;
 let broadcastFn = null;
+let logChatFn = null;
+
+export function setLogChat(fn) { logChatFn = fn; }
+function chat(msg) { logChatFn?.(msg); }
 
 const conversations = new Map();
 let botIsSending = false; // Flag: true enquanto o bot está enviando mensagem
+
+// ============================================
+// PERSISTÊNCIA — PostgreSQL
+// ============================================
+async function dbSaveConversation(phone, conv) {
+  try {
+    const result = await query(`
+      INSERT INTO whatsapp_conversations (phone, chat_id, client_name, real_phone, display_phone, escalation_level, human_replied, greeted, outside_hours, started_at, last_message_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ON CONFLICT (phone) DO UPDATE SET
+        client_name = EXCLUDED.client_name,
+        escalation_level = EXCLUDED.escalation_level,
+        human_replied = EXCLUDED.human_replied,
+        greeted = EXCLUDED.greeted,
+        outside_hours = EXCLUDED.outside_hours,
+        last_message_at = EXCLUDED.last_message_at
+      RETURNING id
+    `, [phone, conv.chatId, conv.name, conv.realPhone, conv.displayPhone, conv.escalationLevel, conv.humanReplied, conv.greeted, conv.outsideHours || false, conv.receivedAt, new Date().toISOString()]);
+    conv.dbId = result.rows[0].id;
+    return conv.dbId;
+  } catch (err) {
+    log(`DB ERRO saveConversation: ${err.message}`);
+  }
+}
+
+async function dbUpdateConversation(phone, fields) {
+  try {
+    const sets = Object.entries(fields).map(([k, v], i) => `${k} = $${i + 2}`);
+    const vals = Object.values(fields);
+    await query(`UPDATE whatsapp_conversations SET ${sets.join(', ')} WHERE phone = $1 AND resolved = false`, [phone, ...vals]);
+  } catch (err) {
+    log(`DB ERRO updateConversation: ${err.message}`);
+  }
+}
+
+async function dbSaveMessage(conv, sender, body, metadata = {}) {
+  if (!conv.dbId) return;
+  try {
+    await query(`INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata) VALUES ($1, $2, $3, $4)`,
+      [conv.dbId, sender, body, JSON.stringify(metadata)]);
+    await query(`UPDATE whatsapp_conversations SET last_message_at = NOW() WHERE id = $1`, [conv.dbId]);
+  } catch (err) {
+    log(`DB ERRO saveMessage: ${err.message}`);
+  }
+}
+
+async function dbResolveConversation(phone) {
+  try {
+    await query(`UPDATE whatsapp_conversations SET resolved = true, resolved_at = NOW(), closed_at = NOW() WHERE phone = $1 AND resolved = false`, [phone]);
+  } catch (err) {
+    log(`DB ERRO resolveConversation: ${err.message}`);
+  }
+}
+
+async function dbLoadActiveConversations() {
+  try {
+    const { rows: convs } = await query(`SELECT * FROM whatsapp_conversations WHERE resolved = false ORDER BY started_at`);
+    for (const row of convs) {
+      const { rows: msgs } = await query(`SELECT sender, body, created_at FROM whatsapp_messages WHERE conversation_id = $1 ORDER BY created_at`, [row.id]);
+      const conv = {
+        dbId: row.id,
+        name: row.client_name,
+        chatId: row.chat_id,
+        realPhone: row.real_phone,
+        displayPhone: row.display_phone,
+        messages: msgs.map(m => ({ body: m.body, from: m.sender, at: m.created_at.toISOString() })),
+        receivedAt: row.started_at.toISOString(),
+        escalationLevel: row.escalation_level,
+        timers: [],
+        greetingTimer: null,
+        analysisTimer: null,
+        humanReplied: row.human_replied,
+        humanRepliedAt: row.human_replied_at?.toISOString(),
+        resolved: false,
+        greeted: row.greeted,
+        outsideHours: row.outside_hours,
+        analysis: row.analysis,
+        classification: row.classification,
+      };
+      conversations.set(row.phone, conv);
+    }
+    if (convs.length > 0) log(`Restauradas ${convs.length} conversas ativas do banco`);
+    return convs.length;
+  } catch (err) {
+    log(`DB ERRO loadActive: ${err.message}`);
+    return 0;
+  }
+}
+
+async function dbLogMetric(agentName, eventType, details = {}) {
+  try {
+    await query(`INSERT INTO agent_metrics (agent_name, event_type, details) VALUES ($1, $2, $3)`, [agentName, eventType, JSON.stringify(details)]);
+  } catch (err) { /* silent */ }
+}
 
 // ============================================
 // CONFIGURAÇÃO
@@ -31,15 +131,31 @@ const ESCALATION_LEVELS = [
   { minutes: 1440, severity: 'grave', emoji: '🚨', label: 'GRAVE — 24h sem retorno' },
 ];
 
-// Mensagens da Luna ao cliente por nível (null = não envia)
+// Mensagens da Luna ao cliente por nível (null = não envia, só notifica equipe)
 const CLIENT_MESSAGES = {
-  0: null, // 10min: só notifica equipe
-  1: (name) => `${name}, nossos atendentes estão finalizando outros atendimentos no momento. Já já alguém da equipe vai te atender, tá? Obrigada pela paciência! 🙏`,
-  2: (name) => `${name}, peço desculpas pela demora! Estamos com um volume alto de atendimentos hoje. Sua solicitação é prioridade e um atendente entrará em contato em breve. 💙`,
-  3: null, // 2h: só equipe
-  4: (name) => `${name}, pedimos sinceras desculpas. Sua solicitação está sendo tratada internamente e um responsável entrará em contato com você. Agradecemos a compreensão. 🙏`,
+  0: (name) => {
+    const firstName = (name || '').split(' ')[0];
+    return `${firstName}, agradecemos a paciência! Notamos que você ainda está aguardando. Nossa equipe está empenhada em finalizar os atendimentos atuais para te responder com a atenção que você merece.\n\nSe preferir, pode deixar os detalhes da sua solicitação descritos abaixo. Isso ajuda muito a nossa equipe a te dar um retorno mais assertivo e rápido assim que assumirmos seu chat! 😊`;
+  },
+  1: (name) => {
+    const firstName = (name || '').split(' ')[0];
+    return `${firstName}, agradecemos a espera! Estamos com um volume elevado de atendimentos hoje. Sua solicitação é prioridade e um colaborador entrará em contato em breve. 💙`;
+  },
+  2: (name) => {
+    const firstName = (name || '').split(' ')[0];
+    const horario = isHorarioComercial();
+    if (!horario.open) {
+      return `${firstName}, nosso time encerrou o expediente, mas sua mensagem está salva e será a primeira a ser respondida amanhã às 8h.\n\nSe for algo extremamente urgente, entre em contato pelo ${CONTACT_PHONE} 🔔`;
+    }
+    return `${firstName}, sabemos que a espera está longa. Sua solicitação é prioridade e estimamos que um colaborador assuma seu atendimento nos próximos minutos.\n\nSe for algo extremamente urgente, entre em contato pelo ${CONTACT_PHONE} 🔔`;
+  },
+  3: (name) => {
+    const firstName = (name || '').split(' ')[0];
+    return `${firstName}, sua solicitação está sendo tratada internamente e um responsável entrará em contato com você. Agradecemos a compreensão. 🙏`;
+  },
+  4: null, // 6h: só equipe
   5: null, // 12h: só equipe
-  6: (name) => `${name}, sabemos que está aguardando e lamentamos a demora. Sua solicitação é prioridade máxima. Um responsável entrará em contato hoje. Se preferir, ligue para ${CONTACT_PHONE}. 🔔`,
+  6: null, // 24h: só equipe
 };
 
 const NOTIFY_NUMBERS = ['5581997166091'];
@@ -52,8 +168,21 @@ let groupChatId = null;
 
 const FERIADOS_FIXOS = ['01-01','04-21','05-01','09-07','10-12','11-02','11-15','12-25'];
 
+const LUNA_HEADER = '✨ *Luna — Assistente Virtual* | Átrio Contabilidade\n\n';
 const GREETING_DELAY_MS = 30 * 1000; // 30 segundos
 const URGENTE_KEYWORDS = ['urgente', 'urgência', 'urgencia', 'emergencia', 'emergência'];
+
+// Detecção de solicitação de NFS-e
+const NFSE_KEYWORDS = [
+  'nota fiscal', 'nota de serviço', 'nfs-e', 'nfse', 'emitir nota',
+  'emissão de nota', 'emissao de nota', 'preciso da nota', 'minha nota',
+  'nota do mês', 'nota do mes', 'enviar nota', 'gerar nota',
+];
+
+function isNfseRequest(text) {
+  const lower = (text || '').toLowerCase();
+  return NFSE_KEYWORDS.some(k => lower.includes(k));
+}
 
 // ============================================
 // UTILS
@@ -102,10 +231,35 @@ function formatPhone(num) {
 
 async function botSend(chatId, text) {
   if (!client) throw new Error('WhatsApp não conectado');
+
+  // NUNCA enviar para status/broadcast/stories
+  if (!chatId || chatId === 'status@broadcast' || chatId.includes('@broadcast')) {
+    log(`BLOQUEADO: tentativa de enviar para ${chatId}`);
+    return null;
+  }
+
   botIsSending = true;
   try {
     const sent = await client.sendMessage(chatId, text);
     // Espera o message_create processar antes de liberar
+    await new Promise(r => setTimeout(r, 500));
+    return sent;
+  } finally {
+    botIsSending = false;
+  }
+}
+
+async function botSendMedia(chatId, base64Data, filename, mimetype, caption) {
+  if (!client) throw new Error('WhatsApp não conectado');
+  if (!chatId || chatId === 'status@broadcast' || chatId.includes('@broadcast')) {
+    log(`BLOQUEADO: tentativa de enviar mídia para ${chatId}`);
+    return null;
+  }
+
+  botIsSending = true;
+  try {
+    const media = new MessageMedia(mimetype, base64Data, filename);
+    const sent = await client.sendMessage(chatId, media, { caption });
     await new Promise(r => setTimeout(r, 500));
     return sent;
   } finally {
@@ -121,7 +275,9 @@ function log(msg) {
 // ============================================
 // API PÚBLICA
 // ============================================
+let onTaskCreatedFn = null;
 export function setBroadcast(fn) { broadcastFn = fn; }
+export function setOnTaskCreated(fn) { onTaskCreatedFn = fn; }
 
 export function getStatus() {
   return {
@@ -158,6 +314,8 @@ export function markAsReplied(rawPhone) {
   if (conv && !conv.resolved) {
     conv.humanReplied = true;
     conv.humanRepliedAt = new Date().toISOString();
+    dbUpdateConversation(phone, { human_replied: true, human_replied_at: conv.humanRepliedAt });
+    dbLogMetric('Luna', 'human_replied', { phone, name: conv.name });
     log(`${conv.name} (${phone}) — humano respondeu`);
     return true;
   }
@@ -172,6 +330,8 @@ export function resolveConversation(rawPhone) {
     conv.timers = [];
     if (conv.greetingTimer) clearTimeout(conv.greetingTimer);
     conv.resolved = true;
+    dbResolveConversation(phone);
+    dbLogMetric('Luna', 'conversation_resolved', { phone, name: conv.name, escalationLevel: conv.escalationLevel });
     log(`${conv.name} (${phone}) — conversa resolvida`);
     return true;
   }
@@ -196,11 +356,33 @@ export async function initialize() {
     broadcastFn?.({ type: 'whatsapp_qr', hasQR: true });
   });
 
-  client.on('ready', () => {
+  client.on('ready', async () => {
     log(`Conectado! ${client.info?.wid?.user}`);
     isReady = true;
     qrCodeData = null;
     broadcastFn?.({ type: 'whatsapp_ready', phone: client.info?.wid?.user });
+
+    // Restaura conversas ativas do banco e retoma fluxos pendentes
+    const restored = await dbLoadActiveConversations();
+    if (restored > 0) {
+      conversations.forEach((conv, phone) => {
+        if (conv.resolved) return;
+
+        // Greeting pendente — envia agora
+        if (!conv.greeted) {
+          log(`Greeting pendente para ${conv.name} — enviando agora`);
+          sendGreeting(conv.chatId, conv.name, conv).catch(() => {});
+        }
+
+        // Retoma escalation
+        if (!conv.humanReplied) {
+          const nextLevel = Math.max(conv.escalationLevel + 1, 0);
+          const cappedLevel = Math.min(nextLevel, ESCALATION_LEVELS.length - 1);
+          startEscalation(phone, conv.chatId, conv.name, cappedLevel);
+          log(`Escalation retomada para ${conv.name} no nível ${cappedLevel}`);
+        }
+      });
+    }
   });
 
   client.on('disconnected', (reason) => {
@@ -215,6 +397,7 @@ export async function initialize() {
 
   client.on('message_create', async (msg) => {
     if (!msg.fromMe || !msg.to) return;
+    if (msg.to === 'status@broadcast' || msg.to.includes('@broadcast')) return;
 
     // Se é mensagem que o bot enviou, ignora
     if (botIsSending) return;
@@ -224,6 +407,7 @@ export async function initialize() {
     if (!conv || conv.resolved) return;
 
     conv.messages.push({ body: msg.body, from: 'team', at: new Date().toISOString() });
+    dbSaveMessage(conv, 'team', msg.body);
     markAsReplied(msg.to);
     log(`Humano respondeu para ${conv.name}`);
 
@@ -236,6 +420,14 @@ export async function initialize() {
   client.on('message', async (msg) => {
     if (msg.fromMe) return;
     if (msg.from?.includes('@g.us')) return; // ignora grupos
+    if (msg.from === 'status@broadcast') return; // ignora status/stories
+
+    // Ignora reações (reactions) — não são mensagens reais
+    if (msg.type === 'reaction' || msg.type === 'reaction_sent') return;
+
+    // Ignora mensagens sem corpo real (stickers, locations sem texto, etc)
+    if (!msg.body?.trim() || msg.type === 'sticker') return;
+
     try {
       await handleIncoming(msg);
     } catch (err) {
@@ -252,6 +444,11 @@ export async function initialize() {
 // ============================================
 async function handleIncoming(msg) {
   const from = msg.from;
+
+  // Proteção extra: ignora broadcast, status, reações
+  if (!from || from === 'status@broadcast' || from.includes('@broadcast')) return;
+  if (msg.type === 'reaction' || msg.type === 'reaction_sent' || msg.type === 'sticker') return;
+
   const phone = normalizePhone(from);
   const body = msg.body;
   if (!body?.trim()) return;
@@ -271,15 +468,14 @@ async function handleIncoming(msg) {
     receivedAt: new Date().toISOString(),
   });
 
-  // Análise de sentimento em background
+  // Análise de sentimento em background (só dashboard + Telegram se crítico)
   analyzeSentiment(body).then(analysis => {
     if (!analysis) return;
     log(`Sentimento ${name}: ${analysis.sentimento}, urgência: ${analysis.urgencia}`);
     broadcastFn?.({ type: 'whatsapp_analysis', phone, name, analysis });
 
     if (analysis.precisa_atencao_imediata || analysis.sentimento === 'irritado') {
-      const alertMsg = `🚨 *ATENÇÃO IMEDIATA*\n\nCliente: *${name}* (${phone})\nSentimento: ${analysis.sentimento}\nUrgência: ${analysis.urgencia}\n_${analysis.resumo}_`;
-      notifyAll(alertMsg);
+      telegram.sendAlert(`🚨 *Atenção* — ${name}: ${analysis.sentimento} — _${analysis.resumo}_`);
     }
   }).catch(() => {});
 
@@ -287,16 +483,40 @@ async function handleIncoming(msg) {
   if (conversations.has(phone)) {
     const conv = conversations.get(phone);
     conv.messages.push({ body, from: 'client', at: new Date().toISOString() });
+    dbSaveMessage(conv, 'client', body);
 
-    // Reseta greeting timer (espera cliente terminar de digitar)
+    // Reseta greeting timer (espera cliente terminar de digitar) e reagenda
     if (conv.greetingTimer) {
       clearTimeout(conv.greetingTimer);
       conv.greetingTimer = null;
+    }
+    if (!conv.greeted) {
+      conv.greetingTimer = setTimeout(async () => {
+        if (conv.greeted || conv.resolved) return;
+        conv.greeted = true;
+        await sendGreeting(conv.chatId, conv.name, conv);
+      }, GREETING_DELAY_MS);
+    }
+
+    // Reseta timer de classificação/notificação (espera cliente parar de digitar)
+    if (!conv.classified) {
+      scheduleClassification(phone, from, name, conv);
+    }
+
+    // Se está coletando dados de NFS-e, processa a resposta
+    if (conv.nfseRequested && !conv.nfseTaskCreated) {
+      await handleNfseDataCollection(from, phone, name, body, conv);
+      return;
     }
 
     // Detecta URGENTE
     if (isUrgent(body)) {
       await handleUrgent(from, phone, name, body);
+    }
+
+    // Detecta solicitação de NFS-e
+    if (isNfseRequest(body)) {
+      await handleNfseRequest(from, phone, name, body, conv);
     }
 
     // Cliente insistiu após humano responder → reinicia monitoramento
@@ -323,9 +543,21 @@ async function handleIncoming(msg) {
   };
   conversations.set(phone, conv);
 
+  // Persistir no banco
+  await dbSaveConversation(phone, conv);
+  dbSaveMessage(conv, 'client', body);
+  dbLogMetric('Luna', 'new_conversation', { phone, name });
+
+  // Detecta NFS-e na primeira mensagem — pula greeting (a coleta de dados já é o greeting)
+  if (isNfseRequest(body)) {
+    conv.greeted = true;
+    conv.classified = true; // não precisa classificar, já sabemos que é fiscal
+    handleNfseRequest(from, phone, name, body, conv).catch(() => {});
+  }
+
   // Detecta URGENTE na primeira mensagem
   if (isUrgent(body)) {
-    conv.greeted = true; // pula greeting padrão
+    conv.greeted = true;
     await handleUrgent(from, phone, name, body);
   }
 
@@ -338,17 +570,88 @@ async function handleIncoming(msg) {
     }, GREETING_DELAY_MS);
   }
 
-  // Notifica grupo IMEDIATAMENTE
-  const firstMsg = body.substring(0, 150);
-  const displayPhone = formatPhone(realPhone);
-  const alertImediato = `📩 *Novo contato!*\n\nCliente: *${name}*\nTelefone: ${displayPhone}\nMensagem: _${firstMsg}_\n\nVamos lá equipe! 💪`;
-  notifyTeamWhatsApp(alertImediato).catch(() => {});
+  // Chat: Luna recebeu nova mensagem
+  chat({ from: 'Luna', text: `Nova mensagem de ${name}: "${body.substring(0, 60)}${body.length > 60 ? '...' : ''}"`, tag: 'whatsapp' });
 
-  broadcastFn?.({ type: 'whatsapp_new_contact', phone, name, body: firstMsg });
+  // Notifica dashboard imediatamente
+  broadcastFn?.({ type: 'whatsapp_new_contact', phone, name, body: body.substring(0, 150) });
+
+  // Aguarda 1 minuto para cliente terminar de digitar, depois classifica e notifica grupo
+  scheduleClassification(phone, from, name, conv);
 
   // Inicia escalation (10min sem resposta → alertas crescentes)
   startEscalation(phone, from, name, 0);
   log(`Nova conversa — ${name} (${phone})`);
+}
+
+// ============================================
+// CLASSIFICAÇÃO + NOTIFICAÇÃO (com delay de 1min)
+// ============================================
+const CLASSIFICATION_DELAY_MS = 60 * 1000; // 1 minuto
+
+function scheduleClassification(phone, chatId, name, conv) {
+  // Cancela timer anterior se existir
+  if (conv.classificationTimer) {
+    clearTimeout(conv.classificationTimer);
+    conv.classificationTimer = null;
+  }
+
+  conv.classificationTimer = setTimeout(async () => {
+    if (conv.classified || conv.resolved) return;
+    conv.classified = true;
+
+    // Pega todas as mensagens do cliente para classificar com contexto completo
+    const allClientMsgs = conv.messages
+      .filter(m => m.from === 'client')
+      .map(m => m.body)
+      .join('\n');
+
+    try {
+      const classification = await classifyDemand(allClientMsgs, name);
+      if (!classification) return;
+
+      conv.classification = classification.classificacao;
+      conv.priority = classification.prioridade;
+      conv.assignedTo = classification.atendente_sugerido;
+
+      dbUpdateConversation(phone, {
+        classification: classification.classificacao,
+        priority: classification.prioridade,
+        assigned_to: classification.atendente_sugerido,
+      });
+      dbLogMetric('Luna', 'demand_classified', { phone, name, ...classification });
+
+      log(`Classificação ${name}: ${classification.classificacao} → ${classification.atendente_sugerido} (${classification.resumo})`);
+      broadcastFn?.({ type: 'whatsapp_classification', phone, name, classification });
+
+      // Chat: Luna classifica e roteia
+      chat({ from: 'Luna', to: 'Rodrigo', text: `Classifiquei a demanda de ${name}: *${classification.classificacao}*. Sugiro encaminhar para ${classification.atendente_sugerido}.${classification.resumo ? ` Resumo: ${classification.resumo}` : ''}`, tag: classification.classificacao });
+      chat({ from: 'Rodrigo', text: `Certo, Luna. Vou direcionar para o setor adequado.` });
+
+      // UMA mensagem no grupo com tudo
+      const displayPhone = conv.displayPhone || phone;
+      const lastMsg = conv.messages.filter(m => m.from === 'client').pop()?.body || '';
+      const horarioInfo = isHorarioComercial();
+      const horarioTag = horarioInfo.open ? '' : `\n⏰ _Fora do horário (${horarioInfo.reason})_`;
+      const tipoTag = classification.classificacao !== 'geral' ? `\nTipo: *${classification.classificacao.toUpperCase()}* → *${classification.atendente_sugerido}*` : '';
+      const resumoTag = classification.resumo ? `\nResumo: _${classification.resumo}_` : '';
+
+      const alertUnico = `📩 *Novo contato*\n\nCliente: *${name}*\nTelefone: ${displayPhone}\nMensagem: _${lastMsg.substring(0, 150)}_${tipoTag}${resumoTag}${horarioTag}`;
+      notifyTeamWhatsApp(alertUnico).catch(() => {});
+
+      // Cria task e roteia (pula se já tem NFS-e em andamento ou se é fiscal com NFS-e ativo)
+      if (!conv.nfseRequested && !conv.nfseTaskId && classification.classificacao !== 'geral') {
+        await routeDemandToAgent(phone, name, chatId, allClientMsgs, conv, classification);
+      }
+    } catch (err) {
+      log(`ERRO classificação ${name}: ${err.message}`);
+      // Fallback — notifica grupo sem classificação
+      const displayPhone = conv.displayPhone || phone;
+      const lastMsg = conv.messages.filter(m => m.from === 'client').pop()?.body || '';
+      const alertFallback = `📩 *Novo contato*\n\nCliente: *${name}*\nTelefone: ${displayPhone}\nMensagem: _${lastMsg.substring(0, 150)}_`;
+      notifyTeamWhatsApp(alertFallback).catch(() => {});
+    }
+  }, CLASSIFICATION_DELAY_MS);
 }
 
 // ============================================
@@ -358,18 +661,23 @@ async function sendGreeting(chatId, name, conv) {
   const greeting = getGreeting();
   const horario = isHorarioComercial();
 
+  const firstName = (name || '').split(' ')[0];
+
   let message;
   if (horario.open) {
-    message = `${greeting}! Sua mensagem foi recebida, logo um atendente entrará em contato 😊`;
+    message = `${greeting}, ${firstName}! Sou a Luna, assistente virtual do Átrio Contabilidade 😊\nEstou aqui para te ajudar! Recebi sua mensagem e já estou encaminhando para a equipe. Em breve, um de nossos colaboradores dará continuidade ao seu atendimento.`;
   } else if (horario.isLunch) {
-    message = `${greeting}! Sua mensagem foi recebida. Nossa equipe está no intervalo de almoço e retorna às 13h.\n\nSe for algo urgente, responda *URGENTE* que acionaremos um atendente, ou ligue diretamente para ${CONTACT_PHONE} 🔔`;
+    message = `${greeting}, ${firstName}! Sou a Luna, assistente virtual do Átrio Contabilidade 😊\nRecebi sua mensagem. Nossa equipe está no intervalo de almoço e retorna às 13h.\n\nSe for algo urgente, responda *URGENTE* ou entre em contato pelo ${CONTACT_PHONE} 🔔`;
   } else {
-    message = `${greeting}! Sua mensagem foi recebida. No momento estamos com atendimento reduzido, mas retornaremos assim que possível.\n\nSe for algo urgente, responda *URGENTE* que acionaremos um atendente, ou ligue diretamente para ${CONTACT_PHONE} 🔔`;
+    message = `${greeting}, ${firstName}! Sou a Luna, assistente virtual do Átrio Contabilidade 😊\nRecebi sua mensagem. No momento estamos fora do horário de atendimento, mas assim que a equipe retornar daremos continuidade ao seu atendimento.\n\nSe for algo urgente, responda *URGENTE* ou entre em contato pelo ${CONTACT_PHONE} 🔔`;
   }
 
   try {
-    await botSend(chatId, message);
+    await botSend(chatId, LUNA_HEADER + message);
     conv.outsideHours = !horario.open;
+    dbUpdateConversation(normalizePhone(chatId), { greeted: true, outside_hours: conv.outsideHours });
+    dbSaveMessage(conv, 'luna', message);
+    dbLogMetric('Luna', 'greeting_sent', { name, outsideHours: conv.outsideHours });
     log(`Greeting enviado para ${name}${!horario.open ? ` (${horario.reason})` : ''}`);
   } catch (err) {
     log(`ERRO greeting ${name}: ${err.message}`);
@@ -380,17 +688,485 @@ async function sendGreeting(chatId, name, conv) {
 // URGENTE
 // ============================================
 async function handleUrgent(chatId, phone, name, body) {
+  const firstName = (name || '').split(' ')[0];
   log(`🚨 ${name} solicitou URGENTE`);
 
-  const alertMsg = `🚨 *URGENTE — Cliente solicitou prioridade*\n\nCliente: *${name}* (${phone})\nMensagem: _${body.substring(0, 150)}_`;
+  const alertMsg = `🚨 *URGENTE — Cliente solicitou prioridade*\n\nCliente: *${name}* (${formatPhone(phone)})\nMensagem: _${body.substring(0, 150)}_`;
   await notifyAll(alertMsg);
 
   try {
-    await botSend(chatId,
-      `Entendido! Estamos acionando um atendente para te atender com prioridade. Você também pode ligar diretamente para ${CONTACT_PHONE} 🔔`
-    );
+    const urgentReply = `${firstName}, entendido! Já estamos acionando um colaborador para atender sua solicitação com prioridade. Se preferir, entre em contato diretamente pelo ${CONTACT_PHONE} 🔔`;
+    await botSend(chatId, LUNA_HEADER + urgentReply);
+    const conv = conversations.get(phone);
+    if (conv) dbSaveMessage(conv, 'luna', urgentReply);
+    dbLogMetric('Luna', 'urgent_detected', { phone, name });
   } catch (err) {
     log(`ERRO resposta urgente: ${err.message}`);
+  }
+}
+
+// ============================================
+// NFS-e — Solicitação de nota fiscal (coleta de dados)
+// ============================================
+const NFSE_COLLECTION_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 horas
+
+async function handleNfseRequest(chatId, phone, name, body, conv) {
+  if (conv.nfseRequested) return;
+  conv.nfseRequested = true;
+  conv.nfseData = { step: 'tomador', mensagem_original: body, respostas: [body] };
+
+  // Timeout: se após 2h os dados não foram coletados, notifica equipe e reseta
+  conv.nfseCollectionTimer = setTimeout(async () => {
+    if (conv.nfseTaskCreated || !conv.nfseRequested) return;
+    log(`📄 NFS-e timeout — ${name} não completou dados em 2h`);
+    conv.nfseRequested = false;
+    conv.nfseData = null;
+    const alertMsg = `⏰ *NFS-e timeout*\n\nCliente ${name} (${phone}) solicitou NFS-e há 2h mas não completou o envio dos dados.\nConversa resetada — se o cliente reenviar, Luna vai recomeçar a coleta.`;
+    telegram.sendAlert(alertMsg.replace(/\*/g, ''));
+    try { await sendAlertToGroup(alertMsg); } catch {}
+  }, NFSE_COLLECTION_TIMEOUT_MS);
+
+  log(`📄 ${name} solicitou NFS-e — verificando se dados já vieram na mensagem`);
+
+  // Verifica se a mensagem JÁ contém os dados necessários (CPF/CNPJ + valor)
+  const cpfCnpj = extractCpfCnpj(body);
+  const valor = extractValor(body);
+
+  if (cpfCnpj && valor) {
+    // Dados já vieram na mensagem — confirma e cria task direto
+    conv.nfseTaskCreated = true;
+    const firstName = (name || '').split(' ')[0];
+
+    try {
+      const confirmMsg = `${firstName}, recebi todos os dados! Já estou encaminhando para nosso setor fiscal providenciar a emissão.\n\nAssim que a nota estiver pronta, um de nossos colaboradores envia aqui para você 😊`;
+      await botSend(chatId, LUNA_HEADER + confirmMsg);
+      dbSaveMessage(conv, 'luna', confirmMsg);
+    } catch (err) {
+      log(`ERRO confirma NFS-e: ${err.message}`);
+    }
+
+    try {
+      await createNfseTask(chatId, phone, name, conv);
+      log(`📄 NFS-e — dados completos na primeira mensagem, task criada direto`);
+    } catch (err) {
+      log(`ERRO criar task NFS-e (dados completos): ${err.message}`);
+      conv.nfseRequested = false;
+      conv.nfseTaskCreated = false;
+      conv.nfseData = null;
+      const alertMsg = `🚫 *Erro ao criar task NFS-e*\nCliente: ${name}\nErro: ${err.message}`;
+      telegram.sendAlert(alertMsg.replace(/\*/g, ''));
+      try { await sendAlertToGroup(alertMsg); } catch {}
+    }
+    return;
+  }
+
+  // Dados incompletos — pede o que falta
+  const firstName = (name || '').split(' ')[0];
+  const missing = [];
+  if (!cpfCnpj) missing.push('*CPF ou CNPJ* do tomador');
+  if (!valor) missing.push('*valor do serviço*');
+
+  // Se tem algum dado, reconhece. Se não tem nenhum, pede tudo.
+  let msg;
+  if (missing.length < 2) {
+    msg = `${firstName}, recebi parte dos dados! Ainda preciso do ${missing.join(' e ')} para prosseguir com a emissão 😊`;
+  } else {
+    msg = `${firstName}, para emitir a nota fiscal preciso de algumas informações sobre o *tomador* (para quem é a nota):\n\n1️⃣ *CPF ou CNPJ* do tomador\n2️⃣ *Valor do serviço*\n3️⃣ *Descrição do serviço prestado*\n\nPode me enviar? 😊`;
+  }
+
+  try {
+    await botSend(chatId, LUNA_HEADER + msg);
+    dbSaveMessage(conv, 'luna', msg);
+  } catch (err) {
+    log(`ERRO coleta NFS-e: ${err.message}`);
+  }
+}
+
+// Validação de CPF (mod 11)
+function isValidCpf(cpf) {
+  const digits = cpf.replace(/\D/g, '');
+  if (digits.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(digits)) return false; // todos iguais
+  let sum = 0;
+  for (let i = 0; i < 9; i++) sum += parseInt(digits[i]) * (10 - i);
+  let check = 11 - (sum % 11);
+  if (check >= 10) check = 0;
+  if (parseInt(digits[9]) !== check) return false;
+  sum = 0;
+  for (let i = 0; i < 10; i++) sum += parseInt(digits[i]) * (11 - i);
+  check = 11 - (sum % 11);
+  if (check >= 10) check = 0;
+  return parseInt(digits[10]) === check;
+}
+
+// Validação de CNPJ (mod 11)
+function isValidCnpj(cnpj) {
+  const digits = cnpj.replace(/\D/g, '');
+  if (digits.length !== 14) return false;
+  if (/^(\d)\1{13}$/.test(digits)) return false; // todos iguais
+  const weights1 = [5,4,3,2,9,8,7,6,5,4,3,2];
+  const weights2 = [6,5,4,3,2,9,8,7,6,5,4,3,2];
+  let sum = 0;
+  for (let i = 0; i < 12; i++) sum += parseInt(digits[i]) * weights1[i];
+  let check = sum % 11 < 2 ? 0 : 11 - (sum % 11);
+  if (parseInt(digits[12]) !== check) return false;
+  sum = 0;
+  for (let i = 0; i < 13; i++) sum += parseInt(digits[i]) * weights2[i];
+  check = sum % 11 < 2 ? 0 : 11 - (sum % 11);
+  return parseInt(digits[13]) === check;
+}
+
+// Extrai CPF/CNPJ de um texto (com validação de dígitos verificadores)
+function extractCpfCnpj(text) {
+  // Tenta CNPJ formatado
+  const cnpjFmt = text.match(/\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[\\/\.\s]?\d{4}[\-\.\s]?\d{2}/);
+  if (cnpjFmt && isValidCnpj(cnpjFmt[0])) return cnpjFmt;
+
+  // Tenta CPF formatado
+  const cpfFmt = text.match(/\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\.\s]?\d{2}/);
+  if (cpfFmt && isValidCpf(cpfFmt[0])) return cpfFmt;
+
+  // Tenta CNPJ sem formatação
+  const cnpjRaw = text.match(/\b\d{14}\b/);
+  if (cnpjRaw && isValidCnpj(cnpjRaw[0])) return cnpjRaw;
+
+  // Tenta CPF sem formatação
+  const cpfRaw = text.match(/\b\d{11}\b/);
+  if (cpfRaw && isValidCpf(cpfRaw[0])) return cpfRaw;
+
+  // Encontrou padrão numérico mas dígitos inválidos — retorna null (Luna vai pedir confirmação)
+  const anyDoc = cnpjFmt || cpfFmt || cnpjRaw || cpfRaw;
+  if (anyDoc) {
+    // Marca como inválido para que a coleta peça confirmação
+    return null; // documento encontrado mas inválido
+  }
+
+  return null;
+}
+
+// Extrai valor de um texto
+function extractValor(text) {
+  return text.match(/[Rr]\$\s?[\d\.,]+/)
+    || text.match(/\b\d{1,3}(?:\.\d{3})*(?:,\d{2})\b/) // 1.000,00
+    || text.match(/\b\d{3,}\b/); // número solto >= 100
+}
+
+// Processa respostas do cliente durante coleta de NFS-e
+async function handleNfseDataCollection(chatId, phone, name, body, conv) {
+  if (!conv.nfseData || conv.nfseTaskCreated) return false;
+
+  // Acumula as respostas do cliente
+  if (!conv.nfseData.respostas) conv.nfseData.respostas = [];
+  conv.nfseData.respostas.push(body);
+
+  const allText = conv.nfseData.respostas.join('\n');
+  const firstName = (name || '').split(' ')[0];
+
+  const cpfCnpj = extractCpfCnpj(allText);
+  const valor = extractValor(allText);
+
+  // Se tem CPF/CNPJ + valor, consideramos dados suficientes
+  if (cpfCnpj && valor) {
+    conv.nfseTaskCreated = true;
+
+    try {
+      const confirmMsg = `Perfeito, ${firstName}! Recebi os dados. Já estou encaminhando para nosso setor fiscal providenciar a emissão.\n\nAssim que a nota estiver pronta, um de nossos colaboradores envia aqui para você 😊`;
+      await botSend(chatId, LUNA_HEADER + confirmMsg);
+      dbSaveMessage(conv, 'luna', confirmMsg);
+    } catch (err) {
+      log(`ERRO confirma NFS-e: ${err.message}`);
+    }
+
+    try {
+      await createNfseTask(chatId, phone, name, conv);
+    } catch (err) {
+      log(`ERRO criar task NFS-e (coleta completa): ${err.message}`);
+      conv.nfseRequested = false;
+      conv.nfseTaskCreated = false;
+      conv.nfseData = null;
+      const alertMsg = `🚫 *Erro ao criar task NFS-e*\nCliente: ${name}\nErro: ${err.message}`;
+      telegram.sendAlert(alertMsg.replace(/\*/g, ''));
+      try { await sendAlertToGroup(alertMsg); } catch {}
+    }
+    return true;
+  }
+
+  // Após muitas tentativas (4+), cria task com o que tem e deixa fiscal resolver
+  if (conv.nfseData.respostas.length >= 4) {
+    conv.nfseTaskCreated = true;
+
+    try {
+      const msg = `${firstName}, obrigada pelas informações! Vou encaminhar para o setor fiscal e, caso precise de mais algum dado, entraremos em contato 😊`;
+      await botSend(chatId, LUNA_HEADER + msg);
+      dbSaveMessage(conv, 'luna', msg);
+    } catch (err) {
+      log(`ERRO confirma NFS-e parcial: ${err.message}`);
+    }
+
+    try {
+      await createNfseTask(chatId, phone, name, conv);
+    } catch (err) {
+      log(`ERRO criar task NFS-e (parcial): ${err.message}`);
+      conv.nfseRequested = false;
+      conv.nfseTaskCreated = false;
+      conv.nfseData = null;
+      const alertMsg = `🚫 *Erro ao criar task NFS-e*\nCliente: ${name}\nErro: ${err.message}`;
+      telegram.sendAlert(alertMsg.replace(/\*/g, ''));
+      try { await sendAlertToGroup(alertMsg); } catch {}
+    }
+    return true;
+  }
+
+  // Verifica se há um documento com formato correto mas dígitos inválidos
+  const hasDocPattern = allText.match(/\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[\\/\.\s]?\d{4}[\-\.\s]?\d{2}/)
+    || allText.match(/\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\.\s]?\d{2}/)
+    || allText.match(/\b\d{14}\b/) || allText.match(/\b\d{11}\b/);
+  const docInvalid = hasDocPattern && !cpfCnpj;
+
+  // Pede o que falta (máximo 3 vezes)
+  const missing = [];
+  if (!cpfCnpj) {
+    if (docInvalid) {
+      missing.push('*CPF ou CNPJ válido* do tomador (o número informado parece estar incorreto — por favor, verifique os dígitos)');
+    } else {
+      missing.push('*CPF ou CNPJ* do tomador');
+    }
+  }
+  if (!valor) missing.push('*valor do serviço*');
+
+  try {
+    const msg = `${firstName}, obrigada! Ainda preciso do ${missing.join(' e ')} para prosseguir com a emissão 😊`;
+    await botSend(chatId, LUNA_HEADER + msg);
+    dbSaveMessage(conv, 'luna', msg);
+  } catch (err) {
+    log(`ERRO coleta NFS-e: ${err.message}`);
+  }
+
+  return true;
+}
+
+async function createNfseTask(chatId, phone, name, conv) {
+  try {
+    // 1. Cruza telefone do solicitante com Gesthub → descobre a empresa emissora
+    let prestadorInfo = null;
+    const realPhone = conv.realPhone || phone;
+    try {
+      prestadorInfo = await findClientByPhone(realPhone);
+      if (prestadorInfo) {
+        log(`📄 Gesthub: ${name} → empresa ${prestadorInfo.legalName} (${prestadorInfo.document})`);
+      } else {
+        log(`📄 Gesthub: ${name} (${realPhone}) — empresa NÃO encontrada`);
+      }
+    } catch (err) {
+      log(`ERRO buscar Gesthub: ${err.message}`);
+    }
+
+    // Se não encontrou empresa, alerta equipe interna (NUNCA perguntar ao cliente)
+    if (!prestadorInfo) {
+      const alertMsg = `⚠️ *Cadastro desatualizado*\n\nCliente ${name} solicitou NFS-e mas não foi possível identificar a empresa no Gesthub.\nTelefone: ${realPhone}\n\n_Equipe: atualize o cadastro no Gesthub com o telefone/WhatsApp deste cliente._`;
+      telegram.sendAlert(alertMsg.replace(/\*/g, ''));
+      try { await sendAlertToGroup(alertMsg); } catch {}
+    }
+
+    // 2. Monta task com dados enriquecidos
+    const { rows: lunaRows } = await query(
+      `SELECT tm.id FROM team_members tm JOIN agents a ON tm.agent_id = a.id WHERE a.name = 'Luna'`
+    );
+    let { rows: fiscalRows } = await query(
+      `SELECT tm.id FROM team_members tm WHERE tm.name IN ('Deyvison', 'Campelo') AND tm.status = 'available' ORDER BY tm.type ASC LIMIT 1`
+    );
+
+    // Fallback: se nenhum fiscal disponível, busca Campelo independente do status
+    if (!fiscalRows.length) {
+      const { rows: fallbackRows } = await query(
+        `SELECT tm.id FROM team_members tm JOIN agents a ON tm.agent_id = a.id WHERE a.name = 'Campelo' LIMIT 1`
+      );
+      fiscalRows = fallbackRows;
+      if (fiscalRows.length) {
+        log(`📄 NFS-e: nenhum fiscal disponível, usando Campelo como fallback`);
+      }
+    }
+
+    // Se realmente nenhum membro fiscal existe, notifica equipe e avisa cliente sobre atraso
+    if (!fiscalRows.length && !lunaRows.length) {
+      const alertMsg = `🚫 *NFS-e sem responsável*\n\nCliente ${name} solicitou NFS-e mas nenhum membro fiscal (Campelo/Deyvison) foi encontrado no sistema.\nTask não pôde ser criada.`;
+      telegram.sendAlert(alertMsg.replace(/\*/g, ''));
+      try { await sendAlertToGroup(alertMsg); } catch {}
+      const firstName = (name || '').split(' ')[0];
+      try {
+        const delayMsg = `${firstName}, recebemos sua solicitação de nota fiscal. Nosso setor fiscal está com um volume elevado no momento, mas já encaminhamos internamente. Em breve daremos retorno 😊`;
+        await botSend(chatId, LUNA_HEADER + delayMsg);
+        dbSaveMessage(conv, 'luna', delayMsg);
+      } catch {}
+      return;
+    }
+
+    const dadosColetados = conv.nfseData.respostas?.join('\n') || '';
+    const prestadorCnpj = prestadorInfo?.document?.replace(/\D/g, '') || '';
+    const prestadorNome = prestadorInfo?.legalName || '';
+
+    // Extrai campos estruturados para Campelo não precisar inferir via IA
+    const allText = conv.nfseData.respostas?.join('\n') || '';
+    const parsedCpfCnpj = extractCpfCnpj(allText);
+    const parsedValor = extractValor(allText);
+    // Tenta extrair descrição (texto que não é número/documento)
+    const descricaoMatch = allText.match(/(?:servi[çc]o|descri[çc][aã]o)\s*[:=-]?\s*(.+)/i);
+    const parsedDescricao = descricaoMatch?.[1]?.trim() || '';
+
+    const taskResult = await query(
+      `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, result)
+       VALUES ($1, $2, $3, $4, 'high', $5) RETURNING id`,
+      [
+        `[NFSE] Emitir nota fiscal — ${name}`,
+        `Cliente ${name} (${phone}) solicitou emissão de NFS-e via WhatsApp.
+${prestadorInfo ? `\nEMPRESA EMISSORA (do Gesthub): ${prestadorNome} — CNPJ: ${prestadorInfo.document}` : '\nEMPRESA EMISSORA: NÃO IDENTIFICADA — cadastro desatualizado'}
+\nDados coletados pela Luna:\n${dadosColetados}\n\nMensagem original: "${conv.nfseData.mensagem_original?.substring(0, 300)}"`,
+        fiscalRows[0]?.id || lunaRows[0]?.id,
+        lunaRows[0]?.id,
+        JSON.stringify({
+          tipo: 'emissao_nfse',
+          cliente_nome: name,
+          cliente_phone: phone,
+          cliente_chatId: chatId,
+          prestador_cnpj: prestadorCnpj,
+          prestador_nome: prestadorNome,
+          // Campos estruturados para Campelo
+          parsed_fields: {
+            tomador_cpf_cnpj: parsedCpfCnpj?.[0]?.replace(/\D/g, '') || null,
+            tomador_tipo_doc: parsedCpfCnpj?.[0] ? (parsedCpfCnpj[0].replace(/\D/g, '').length === 11 ? 'CPF' : 'CNPJ') : null,
+            valor: parsedValor?.[0]?.replace(/[^\d.,]/g, '').replace(',', '.') || null,
+            descricao: parsedDescricao || null,
+            prestador_cnpj: prestadorCnpj || null,
+            prestador_nome: prestadorNome || null,
+          },
+          dados_coletados: conv.nfseData.respostas,
+          mensagem_original: conv.nfseData.mensagem_original,
+          solicitado_em: new Date().toISOString(),
+        }),
+      ]
+    );
+
+    const taskId = taskResult.rows[0].id;
+    conv.nfseTaskId = taskId;
+    // Clear the collection timeout since task was created successfully
+    if (conv.nfseCollectionTimer) {
+      clearTimeout(conv.nfseCollectionTimer);
+      conv.nfseCollectionTimer = null;
+    }
+    dbUpdateConversation(phone, { classification: 'fiscal' });
+
+    telegram.sendAlert(`📄 Task NFS-e #${taskId.substring(0, 8)} — ${name}${prestadorInfo ? ` (${prestadorNome})` : ' — empresa não identificada'}`);
+
+    // Chat: Luna encaminha NFS-e para Campelo via Rodrigo
+    chat({ from: 'Luna', to: 'Rodrigo', text: `Coletei os dados de NFS-e de ${name}${prestadorInfo ? ` (${prestadorNome})` : ''}. Task criada para o Campelo.`, tag: 'nfs-e' });
+    chat({ from: 'Rodrigo', to: 'Campelo', text: `Campelo, temos uma solicitação de NFS-e. Prioridade: ${prestadorInfo ? 'dados completos' : '⚠️ empresa não identificada'}.` });
+
+    if (onTaskCreatedFn) {
+      setTimeout(() => onTaskCreatedFn(taskId), 500);
+      log(`Task NFS-e disparada para processamento imediato: ${taskId}`);
+    }
+
+    dbLogMetric('Luna', 'nfse_requested', { phone, name, taskId, prestador: prestadorCnpj });
+    log(`Task NFS-e criada: ${taskId} para ${name}${prestadorInfo ? ` → ${prestadorNome}` : ''}`);
+
+  } catch (err) {
+    log(`ERRO criar task NFS-e: ${err.message}`);
+  }
+}
+
+// ============================================
+// ROTEAMENTO DE DEMANDAS → AGENTES
+// ============================================
+// Agente IA executa, humano revisa/aprova e responde ao cliente
+const DEMAND_ROUTING = {
+  fiscal:      { agent: 'Campelo',  humans: ['Deyvison', 'Diego', 'Karla'], emoji: '📊', label: 'Fiscal' },
+  financeiro:  { agent: 'Sneijder', humans: ['Diogo'],                      emoji: '💰', label: 'Financeiro' },
+  societario:  { agent: 'Sofia',    humans: ['Deyvison'],                   emoji: '📜', label: 'Societário' },
+  comercial:   { agent: null,       humans: ['Caio'],                       emoji: '🤝', label: 'Comercial' },
+  atendimento: { agent: 'Luna',      humans: ['Quésia'],                     emoji: '📋', label: 'Atendimento' },
+  pessoal:     { agent: null,       humans: ['Rafaela'],                    emoji: '👥', label: 'Pessoal/Folha' },
+};
+
+async function routeDemandToAgent(phone, name, chatId, body, conv, classification) {
+  const tipo = classification.classificacao;
+  const route = DEMAND_ROUTING[tipo];
+  if (!route) return;
+
+  // Evita task duplicada na mesma conversa
+  if (conv.demandTaskCreated) return;
+  conv.demandTaskCreated = true;
+
+  try {
+    // Busca Luna como delegante
+    const { rows: lunaRows } = await query(
+      `SELECT tm.id FROM team_members tm JOIN agents a ON tm.agent_id = a.id WHERE a.name = 'Luna'`
+    );
+
+    // Busca agente IA do setor (executa a tarefa)
+    let agentId = null;
+    if (route.agent) {
+      const { rows } = await query(
+        `SELECT tm.id FROM team_members tm JOIN agents a ON tm.agent_id = a.id WHERE a.name = $1 LIMIT 1`,
+        [route.agent]
+      );
+      if (rows.length > 0) agentId = rows[0].id;
+    }
+
+    // Busca humano responsável (revisa/aprova e responde ao cliente)
+    let humanId = null;
+    for (const humanName of route.humans) {
+      const { rows } = await query(
+        `SELECT tm.id FROM team_members tm WHERE tm.name = $1 AND tm.type = 'human' AND tm.status = 'available' LIMIT 1`,
+        [humanName]
+      );
+      if (rows.length > 0) { humanId = rows[0].id; break; }
+    }
+
+    // Task SEMPRE vai para o agente IA — humano apenas revisa/aprova
+    if (!agentId) {
+      log(`Roteamento ${tipo}: sem agente IA disponível para ${route.agent || 'setor'}. Notificando equipe.`);
+      const alertMsg = `📋 *Demanda sem agente IA*\n\nCliente: ${name}\nTipo: ${tipo}\nResumo: ${classification.resumo}\n\n_Precisa de atendimento humano direto._`;
+      notifyTeamWhatsApp(alertMsg).catch(() => {});
+      telegram.sendAlert(alertMsg.replace(/\*/g, ''));
+      return;
+    }
+    const assigneeId = agentId;
+    const humanResponsavel = route.humans[0];
+
+    const taskResult = await query(
+      `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6) RETURNING id`,
+      [
+        `[${route.label.toUpperCase()}] ${classification.resumo} — ${name}`,
+        `Cliente ${name} (${phone}) enviou solicitação via WhatsApp.\n\nClassificação: ${tipo}\nPrioridade: ${classification.prioridade}\nResponsável humano: ${humanResponsavel}\n\nMensagem original:\n"${body.substring(0, 500)}"`,
+        assigneeId,
+        lunaRows[0]?.id,
+        classification.prioridade || 'medium',
+        JSON.stringify({
+          tipo: `demanda_${tipo}`,
+          cliente_nome: name,
+          cliente_phone: phone,
+          cliente_chatId: chatId,
+          agente_ia: route.agent,
+          responsavel_humano: humanResponsavel,
+          classificacao: classification,
+          solicitado_em: new Date().toISOString(),
+        }),
+      ]
+    );
+
+    const taskId = taskResult.rows[0].id;
+    conv.demandTaskId = taskId;
+
+    // Notifica Telegram + chat inter-agentes
+    telegram.sendAlert(`${route.emoji} Task #${taskId.substring(0, 8)} — ${route.label} — ${name} → ${route.agent} (IA) / ${humanResponsavel} (revisão)`);
+    chat({ from: 'Rodrigo', to: route.agent, text: `${route.agent}, nova demanda de ${name}: "${classification.resumo}". Prioridade: ${classification.prioridade}.`, tag: tipo });
+
+    dbLogMetric('Luna', 'demand_routed', { phone, name, tipo, taskId, agent: route.agent, human: humanResponsavel });
+    log(`Task criada: ${route.label} → ${executorLabel} / revisa: ${humanResponsavel} (${taskId.substring(0, 8)}) para ${name}`);
+
+  } catch (err) {
+    log(`ERRO routeDemand: ${err.message}`);
   }
 }
 
@@ -421,22 +1197,30 @@ async function escalate(phone, chatId, name, levelIndex) {
   const level = ESCALATION_LEVELS[levelIndex];
   conv.escalationLevel = levelIndex;
   const lastMsg = conv.messages[conv.messages.length - 1]?.body || '';
+  dbUpdateConversation(phone, { escalation_level: levelIndex });
+  dbLogMetric('Luna', 'escalation', { phone, name, level: levelIndex, severity: level.severity });
 
   log(`${level.emoji} ${level.label} — ${name} (${phone})`);
 
-  // Mensagem ao cliente (se configurada para este nível)
+  // Mensagem ao cliente — SOMENTE em horário comercial
+  // Fora do expediente o greeting já avisou que a equipe retorna no próximo dia útil
+  const horario = isHorarioComercial();
+
   const clientMsgFn = CLIENT_MESSAGES[levelIndex];
-  if (clientMsgFn) {
+  if (clientMsgFn && horario.open) {
     try {
-      await botSend(chatId, clientMsgFn(name));
+      const msg = clientMsgFn(name);
+      await botSend(chatId, LUNA_HEADER + msg);
+      dbSaveMessage(conv, 'luna', msg);
     } catch (err) {
       log(`ERRO follow-up nível ${levelIndex}: ${err.message}`);
     }
+  } else if (clientMsgFn && !horario.open) {
+    log(`Escalation nível ${levelIndex} para ${name} — fora do horário, não envia ao cliente`);
   }
 
   // SEMPRE notifica equipe via Telegram (independente do horário)
   // WhatsApp da equipe só em horário comercial
-  const horario = isHorarioComercial();
   const foraHorario = !horario.open ? `\n⏰ _${horario.reason}_` : '';
   const urgencia = levelIndex >= 2 ? '\n\n⚠️ *AÇÃO IMEDIATA NECESSÁRIA*' : '';
   const alertMsg = `${level.emoji} *${level.label}*\n\nCliente: *${name}*\nTelefone: ${conv.displayPhone || phone}\nÚltima msg: _${lastMsg.substring(0, 150)}_${foraHorario}${urgencia}`;
@@ -470,6 +1254,8 @@ async function analyzeAndReport(phone) {
     if (!result) return;
 
     conv.analysis = result;
+    dbUpdateConversation(phone, { analysis: JSON.stringify(result) });
+    dbLogMetric('Luna', 'conversation_analysis', { phone, name: conv.name, nps: result.nps_estimado, sentiment: result.sentimento_cliente, attended: result.demanda_atendida });
     log(`Análise ${conv.name}: atendida=${result.demanda_atendida}, NPS=${result.nps_estimado}, sentimento=${result.sentimento_cliente}`);
 
     broadcastFn?.({ type: 'whatsapp_conversation_analysis', phone, name: conv.name, analysis: result });
@@ -542,6 +1328,62 @@ export async function sendMessage(phone, message) {
   await botSend(chatId, message);
   markAsReplied(phone);
   log(`Enviado para ${phone}`);
+}
+
+// ============================================
+// ENVIAR NFS-e NO GRUPO (PDF + caption)
+// ============================================
+export async function sendNfseToGroup({ pdfBase64, clienteNome, tomadorNome, tomadorDoc, valor, numeroNfse, taskId }) {
+  if (!isReady || !client) {
+    log('WhatsApp não conectado — NFS-e não enviada ao grupo');
+    return false;
+  }
+
+  const gid = await findGroupChat();
+  if (!gid) {
+    log('Grupo não encontrado — NFS-e não enviada');
+    return false;
+  }
+
+  const valorFmt = typeof valor === 'number' ? `R$ ${valor.toFixed(2).replace('.', ',')}` : `R$ ${valor}`;
+  const caption = `📄 *NFS-e emitida*\n\nCliente: *${clienteNome}*\nTomador: ${tomadorNome} (${tomadorDoc})\nValor: ${valorFmt}${numeroNfse ? `\nNº: ${numeroNfse}` : ''}${taskId ? `\nTask: #${taskId.substring(0, 8)}` : ''}`;
+
+  try {
+    if (pdfBase64) {
+      await botSendMedia(gid, pdfBase64, `nfse-${numeroNfse || Date.now()}.pdf`, 'application/pdf', caption);
+      log(`NFS-e PDF enviado no grupo — ${clienteNome}`);
+    } else {
+      await botSend(gid, caption);
+      log(`NFS-e notificação enviada no grupo (sem PDF) — ${clienteNome}`);
+    }
+    return true;
+  } catch (err) {
+    log(`ERRO enviar NFS-e no grupo: ${err.message}`);
+    return false;
+  }
+}
+
+// ============================================
+// ALERTA GENÉRICO NO GRUPO (erros, bloqueios, avisos)
+// ============================================
+export async function sendAlertToGroup(message) {
+  if (!isReady || !client) {
+    log('WhatsApp não conectado — alerta não enviado ao grupo');
+    return false;
+  }
+  const gid = await findGroupChat();
+  if (!gid) {
+    log('Grupo não encontrado — alerta não enviado');
+    return false;
+  }
+  try {
+    await botSend(gid, message);
+    log('Alerta enviado ao grupo');
+    return true;
+  } catch (err) {
+    log(`ERRO enviar alerta no grupo: ${err.message}`);
+    return false;
+  }
 }
 
 // ============================================

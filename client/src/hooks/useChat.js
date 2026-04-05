@@ -1,17 +1,19 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import { api } from '../lib/api'
 
 export function useChat(agentId) {
   const [messages, setMessages] = useState([])
   const [conversationId, setConversationId] = useState(null)
   const [loading, setLoading] = useState(false)
+  const loadingRef = useRef(false)
 
   const sendMessage = useCallback(async (text) => {
-    if (!text.trim() || loading) return
+    if (!text.trim() || loadingRef.current) return
 
     // Add user message optimistically
     setMessages(prev => [...prev, { role: 'user', content: text, created_at: new Date().toISOString() }])
     setLoading(true)
+    loadingRef.current = true
 
     try {
       const data = await api.sendMessage(agentId, text, conversationId)
@@ -30,8 +32,9 @@ export function useChat(agentId) {
       }])
     } finally {
       setLoading(false)
+      loadingRef.current = false
     }
-  }, [agentId, conversationId, loading])
+  }, [agentId, conversationId])
 
   const clearChat = useCallback(() => {
     setMessages([])

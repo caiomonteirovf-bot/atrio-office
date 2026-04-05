@@ -1,5 +1,6 @@
 import * as gesthub from '../services/gesthub.js';
 import { consultarCnpj } from './shared.js';
+import * as nuvemFiscal from '../services/nuvem-fiscal.js';
 
 // Tabela Simples Nacional 2024 (Anexos I a V) — faixas simplificadas
 const SIMPLES_ANEXOS = {
@@ -237,10 +238,86 @@ export const tools = {
     };
   },
 
-  async emitir_nfse() {
-    return {
-      disponivel: false,
-      mensagem: 'Integração com Nuvem Fiscal / Focus NFe em desenvolvimento. Em breve será possível emitir NFS-e diretamente pelo sistema.',
-    };
+  async emitir_nfse({ prestador_cnpj, tomador_cpf_cnpj, tomador_nome, valor, descricao, codigo_servico, aliquota_iss, task_id }) {
+    // Validação de dados obrigatórios
+    if (!prestador_cnpj) return { sucesso: false, erro: 'CNPJ do prestador não informado.' };
+    if (!tomador_cpf_cnpj) return { sucesso: false, erro: 'CPF/CNPJ do tomador não informado.' };
+    if (!valor || valor <= 0) return { sucesso: false, erro: 'Valor do serviço não informado ou inválido.' };
+    if (!descricao) return { sucesso: false, erro: 'Descrição do serviço não informada.' };
+
+    const NFSE_SYSTEM_URL = process.env.NFSE_SYSTEM_URL || 'http://localhost:3020';
+    const fmt = (v) => typeof v === 'number' ? v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : v;
+    const valorNum = typeof valor === 'string' ? parseFloat(valor.replace(/[^\d.,]/g, '').replace(',', '.')) : Number(valor);
+    const docLimpo = tomador_cpf_cnpj.replace(/\D/g, '');
+    const isCpf = docLimpo.length === 11;
+    const agora = new Date();
+    const numero = `ATR${Date.now().toString().slice(-8)}`;
+
+    try {
+      // 1. Criar registro da NFS-e no NFS-e System
+      const criarRes = await fetch(`${NFSE_SYSTEM_URL}/api/nfses`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          numero,
+          dataEmissao: agora.toISOString().split('T')[0],
+          competencia: `${agora.getFullYear()}-${String(agora.getMonth() + 1).padStart(2, '0')}-01`,
+          tomadorCpfCnpj: docLimpo,
+          tomadorRazaoSocial: tomador_nome || (isCpf ? 'Pessoa Física' : 'Pessoa Jurídica'),
+          valorServicos: valorNum,
+          descricaoServico: descricao,
+          aliquotaIss: aliquota_iss || 5.0,
+          codigoServico: codigo_servico || '0107',
+          status: 'PENDENTE',
+          origem: 'WHATSAPP',
+          observacoes: `Emissão automática via Campelo | Task: ${task_id || 'N/A'} | Prestador: ${prestador_cnpj}`,
+        }),
+      });
+
+      const criarData = await criarRes.json();
+      if (!criarData.ok) {
+        return { sucesso: false, erro: `Erro ao criar NFS-e no sistema: ${criarData.detail || criarData.error || JSON.stringify(criarData)}`, dados_coletados: { prestador_cnpj, tomador_cpf_cnpj, tomador_nome, valor: valorNum, descricao } };
+      }
+
+      const nfseId = criarData.data?.id;
+
+      // 2. Emitir via Nuvem Fiscal (através do NFS-e System)
+      const emitirRes = await fetch(`${NFSE_SYSTEM_URL}/api/emissao/nuvem-fiscal/emitir`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [nfseId] }),
+      });
+
+      const emitirData = await emitirRes.json();
+
+      // 3. Verifica resultado
+      const resultado = emitirData?.resultados?.[0] || emitirData;
+      const sucesso = resultado.ok !== false && !resultado.error;
+
+      return {
+        sucesso,
+        tipo: 'emissao_nfse',
+        nfse_system_id: nfseId,
+        numero_nfse: numero,
+        tomador_nome: tomador_nome || '',
+        tomador_cpf_cnpj: docLimpo,
+        tomador_tipo_doc: isCpf ? 'CPF' : 'CNPJ',
+        valor: fmt(valorNum),
+        descricao,
+        status_nfse: sucesso ? 'processando' : 'erro',
+        mensagem: sucesso
+          ? `NFS-e criada no sistema (Nº ${numero}) e enviada para emissão via Nuvem Fiscal.`
+          : `NFS-e criada no sistema (Nº ${numero}), mas a emissão via Nuvem Fiscal falhou: ${resultado.error || 'Verifique o certificado digital e configurações no NFS-e System.'}`,
+        acao_necessaria: sucesso ? null : 'Verificar certificado digital A1 no NFS-e System (Configurações) e tentar emitir manualmente.',
+      };
+    } catch (err) {
+      return {
+        sucesso: false,
+        tipo: 'emissao_nfse',
+        erro: `Falha ao conectar com NFS-e System (${NFSE_SYSTEM_URL}): ${err.message}`,
+        dados_coletados: { prestador_cnpj, tomador_cpf_cnpj, tomador_nome, valor: valorNum, descricao },
+        acao_necessaria: 'Verificar se o NFS-e System está rodando na porta 3020.',
+      };
+    }
   },
 };

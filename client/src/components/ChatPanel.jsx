@@ -26,43 +26,70 @@ export default function ChatPanel({ agent, onClose }) {
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#1e293b]/50">
+    <div className="flex flex-col h-full" style={{ background: `linear-gradient(180deg, var(--ao-topbar) 0%, var(--ao-bg) 100%)` }}>
       {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-3 border-b border-slate-700/40 shrink-0">
-        <div className="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-[12px]"
-          style={{ backgroundColor: `${color}15`, color }}>
+      <div className="flex items-center gap-3 px-4 py-3.5 shrink-0" style={{ borderBottom: `1px solid var(--ao-border-subtle)` }}>
+        <div className="w-9 h-9 rounded-xl flex items-center justify-center font-bold text-[13px]"
+          style={{
+            background: `linear-gradient(135deg, ${color}20 0%, ${color}08 100%)`,
+            color,
+            border: `1px solid ${color}15`,
+          }}>
           {letter}
         </div>
         <div className="flex-1 min-w-0">
-          <h3 className="text-[13px] font-semibold text-slate-100">{agent.name}</h3>
-          <p className="text-[10px] text-slate-500">{agent.role}</p>
+          <h3 className="text-[13px] font-semibold" style={{ fontFamily: 'Outfit', color: 'var(--ao-text-primary)' }}>{agent.name}</h3>
+          <p className="text-[10px]" style={{ color: 'var(--ao-text-dim)' }}>{agent.role}</p>
         </div>
-        <button onClick={clearChat} className="p-1.5 rounded-md text-slate-600 hover:text-slate-400 hover:bg-slate-700/50 transition-all text-[11px]">↻</button>
-        <button onClick={onClose} className="p-1.5 rounded-md text-slate-600 hover:text-slate-400 hover:bg-slate-700/50 transition-all text-[11px]">✕</button>
+        <button onClick={clearChat}
+          className="p-1.5 rounded-lg transition-all text-[11px] cursor-pointer"
+          style={{ color: 'var(--ao-text-xs)', border: '1px solid transparent' }}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--ao-border)'; e.currentTarget.style.color = 'var(--ao-text-muted)' }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--ao-text-xs)' }}>
+          {'\u21BB'}
+        </button>
+        <button onClick={onClose}
+          className="p-1.5 rounded-lg transition-all text-[11px] cursor-pointer"
+          style={{ color: 'var(--ao-text-xs)', border: '1px solid transparent' }}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--ao-border)'; e.currentTarget.style.color = 'var(--ao-text-muted)' }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--ao-text-xs)' }}>
+          {'\u2715'}
+        </button>
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3 chat-scroll">
         {messages.length === 0 && (
           <div className="text-center mt-16">
-            <div className="w-12 h-12 rounded-xl mx-auto mb-3 flex items-center justify-center font-bold text-lg"
-              style={{ backgroundColor: `${color}10`, color }}>
+            <div className="w-14 h-14 rounded-2xl mx-auto mb-3 flex items-center justify-center font-bold text-lg"
+              style={{
+                background: `linear-gradient(135deg, ${color}10 0%, ${color}05 100%)`,
+                color,
+                border: `1px solid ${color}10`,
+              }}>
               {letter}
             </div>
-            <p className="text-slate-400 text-[12px]">Conversa com <span className="text-slate-200">{agent.name}</span></p>
-            <p className="text-slate-600 text-[10px] mt-1 max-w-[250px] mx-auto">{agent.personality?.substring(0, 100)}</p>
+            <p className="text-[12px]" style={{ color: 'var(--ao-text-dim)' }}>Conversa com <span style={{ color: 'var(--ao-text-secondary)' }}>{agent.name}</span></p>
+            <p className="text-[10px] mt-1.5 max-w-[250px] mx-auto leading-relaxed" style={{ color: 'var(--ao-text-xs)' }}>{agent.personality?.substring(0, 100)}</p>
           </div>
         )}
 
         {messages.map((msg, i) => (
-          <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div className={`max-w-[85%] rounded-xl px-3.5 py-2.5 text-[12px] leading-relaxed
-              ${msg.role === 'user'
-                ? 'bg-indigo-600/20 text-slate-200 border border-indigo-500/20'
-                : msg.role === 'system'
-                  ? 'bg-red-500/10 text-red-300/80'
-                  : 'bg-slate-800/60 text-slate-300 border border-slate-700/30'
-              }`}>
+          <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-slide-in`}>
+            <div className={`max-w-[85%] rounded-xl px-3.5 py-2.5 text-[12px] leading-relaxed`}
+              style={{
+                background: msg.role === 'user'
+                  ? `linear-gradient(135deg, ${color}15 0%, ${color}08 100%)`
+                  : msg.role === 'system'
+                    ? 'rgba(239, 68, 68, 0.06)'
+                    : 'var(--ao-input-bg)',
+                border: msg.role === 'user'
+                  ? `1px solid ${color}20`
+                  : msg.role === 'system'
+                    ? '1px solid rgba(239, 68, 68, 0.08)'
+                    : `1px solid var(--ao-border-subtle)`,
+                color: msg.role === 'system' ? 'rgba(239, 68, 68, 0.6)' : 'var(--ao-text-secondary)',
+              }}>
               <p className="whitespace-pre-wrap">{msg.content}</p>
             </div>
           </div>
@@ -70,10 +97,11 @@ export default function ChatPanel({ agent, onClose }) {
 
         {loading && (
           <div className="flex justify-start">
-            <div className="bg-slate-800/60 border border-slate-700/30 rounded-xl px-4 py-3 flex gap-1.5">
-              <span className="typing-dot w-1.5 h-1.5 bg-slate-500 rounded-full" />
-              <span className="typing-dot w-1.5 h-1.5 bg-slate-500 rounded-full" />
-              <span className="typing-dot w-1.5 h-1.5 bg-slate-500 rounded-full" />
+            <div className="rounded-xl px-4 py-3 flex gap-1.5"
+              style={{ background: 'var(--ao-input-bg)', border: `1px solid var(--ao-border-subtle)` }}>
+              <span className="typing-dot w-1.5 h-1.5 rounded-full" style={{ background: `${color}60` }} />
+              <span className="typing-dot w-1.5 h-1.5 rounded-full" style={{ background: `${color}60` }} />
+              <span className="typing-dot w-1.5 h-1.5 rounded-full" style={{ background: `${color}60` }} />
             </div>
           </div>
         )}
@@ -81,14 +109,21 @@ export default function ChatPanel({ agent, onClose }) {
       </div>
 
       {/* Input */}
-      <form onSubmit={handleSubmit} className="px-4 py-3 border-t border-slate-700/40 shrink-0">
-        <div className="flex items-center gap-2 bg-slate-800/60 border border-slate-700/40 rounded-xl px-3.5 py-1.5 focus-within:border-indigo-500/30 transition-colors">
+      <form onSubmit={handleSubmit} className="px-4 py-3 shrink-0" style={{ borderTop: `1px solid var(--ao-border-subtle)` }}>
+        <div className="flex items-center gap-2 rounded-xl px-3.5 py-1.5 transition-all duration-200"
+          style={{ background: 'var(--ao-input-bg)', border: `1px solid var(--ao-input-border)` }}>
           <input ref={inputRef} value={input} onChange={(e) => setInput(e.target.value)}
             placeholder={`Falar com ${agent.name}...`} disabled={loading}
-            className="flex-1 bg-transparent text-[12px] text-slate-200 placeholder:text-slate-600 outline-none py-1.5" />
+            className="flex-1 bg-transparent text-[12px] outline-none py-1.5"
+            style={{ color: 'var(--ao-text-secondary)', '--tw-placeholder-opacity': 1 }}
+          />
           <button type="submit" disabled={!input.trim() || loading}
-            className="p-1.5 rounded-md transition-all disabled:text-slate-700 text-indigo-400 hover:text-indigo-300">
-            ➤
+            className="p-1.5 rounded-md transition-all disabled:opacity-20 cursor-pointer"
+            style={{ color }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13" />
+              <polygon points="22 2 15 22 11 13 2 9 22 2" />
+            </svg>
           </button>
         </div>
       </form>

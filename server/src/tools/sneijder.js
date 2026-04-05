@@ -1,62 +1,82 @@
 import * as gesthub from '../services/gesthub.js';
+import * as omie from '../services/omie.js';
+
+const fmt = (v) => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 
 export const tools = {
   async contas_pagar() {
-    const clients = await gesthub.getClients();
-    const ativos = clients.filter(c => c.status === 'ATIVO');
+    if (!omie.isConfigured()) {
+      return { disponivel: false, erro: 'Omie não configurado. Adicione OMIE_APP_KEY e OMIE_APP_SECRET no .env' };
+    }
 
-    // Simula contas a pagar baseado nos dados disponíveis
-    const custos = [
-      { descricao: 'Folha de pagamento', valor_estimado: 'Consultar RH', vencimento: 'Dia 5', status: 'recorrente' },
-      { descricao: 'FGTS', valor_estimado: '8% da folha', vencimento: 'Dia 7', status: 'recorrente' },
-      { descricao: 'INSS', valor_estimado: '20% da folha', vencimento: 'Dia 20', status: 'recorrente' },
-      { descricao: 'Aluguel / Infraestrutura', valor_estimado: 'Consultar financeiro', vencimento: 'Variável', status: 'recorrente' },
-      { descricao: 'Software / Sistemas', valor_estimado: 'Consultar contratos', vencimento: 'Variável', status: 'recorrente' },
-    ];
+    const titulos = await omie.listarContasPagar({ status: 'ABERTO' });
+    const vencidos = titulos.filter(t => {
+      const venc = t.data_vencimento?.split('/');
+      if (!venc || venc.length !== 3) return false;
+      return new Date(venc[2], venc[1] - 1, venc[0]) < new Date();
+    });
+
+    const totalAberto = titulos.reduce((s, t) => s + Number(t.valor_documento || 0), 0);
+    const totalVencido = vencidos.reduce((s, t) => s + Number(t.valor_documento || 0), 0);
+
+    const proximos = await omie.contasVencendoProximosDias(7);
 
     return {
-      total_clientes_ativos: ativos.length,
-      contas_fixas: custos,
-      nota: 'Para contas detalhadas, é necessário integração com sistema financeiro completo. Dados acima são estimativas baseadas em obrigações recorrentes.',
+      resumo: {
+        total_aberto: fmt(totalAberto),
+        total_vencido: fmt(totalVencido),
+        qtd_aberto: titulos.length,
+        qtd_vencido: vencidos.length,
+      },
+      vencendo_7dias: proximos.slice(0, 15).map(t => ({
+        fornecedor_id: t.codigo_cliente_fornecedor,
+        valor: fmt(t.valor_documento),
+        vencimento: t.data_vencimento,
+        categoria: t.codigo_categoria,
+      })),
+      fonte: 'Omie ERP (dados reais)',
     };
   },
 
   async contas_receber() {
-    const clients = await gesthub.getClients();
-    const ativos = clients.filter(c => c.status === 'ATIVO');
-    const fmt = (v) => v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    if (!omie.isConfigured()) {
+      // Fallback: dados do Gesthub
+      const clients = await gesthub.getClients();
+      const ativos = clients.filter(c => c.status === 'ATIVO');
+      const comHonorario = ativos.filter(c => c.monthlyFee > 0);
+      const totalMensal = comHonorario.reduce((sum, c) => sum + (c.monthlyFee || 0), 0);
+      return {
+        fonte: 'Gesthub (sem Omie)',
+        resumo: { clientes_ativos: ativos.length, receita_mensal: fmt(totalMensal) },
+      };
+    }
 
-    const comHonorario = ativos.filter(c => c.monthlyFee > 0);
-    const semHonorario = ativos.filter(c => !c.monthlyFee || c.monthlyFee === 0);
-    const totalMensal = comHonorario.reduce((sum, c) => sum + (c.monthlyFee || 0), 0);
-
-    const maiores = [...comHonorario]
-      .sort((a, b) => b.monthlyFee - a.monthlyFee)
-      .slice(0, 10)
-      .map(c => ({
-        cliente: c.legalName?.substring(0, 50),
-        honorario: fmt(c.monthlyFee),
-        regime: c.taxRegime,
-        responsavel: c.analyst || c.officeOwner,
-      }));
+    const resumo = await omie.resumoContasReceber();
+    const vencidos = await omie.listarContasReceber({ apenasVencidos: true });
 
     return {
       resumo: {
-        clientes_ativos: ativos.length,
-        com_honorario: comHonorario.length,
-        sem_honorario_definido: semHonorario.length,
-        receita_mensal_total: fmt(totalMensal),
-        receita_anual_estimada: fmt(totalMensal * 12),
+        total_aberto: resumo.formatado.total_aberto,
+        total_vencido: resumo.formatado.total_vencido,
+        total_a_vencer: resumo.formatado.total_a_vencer,
+        vencendo_7dias: resumo.formatado.vencendo_7dias,
+        qtd_titulos: resumo.qtd_titulos,
       },
-      top_10_clientes: maiores,
+      inadimplentes: vencidos.slice(0, 15).map(t => ({
+        cliente_id: t.codigo_cliente_fornecedor,
+        valor: fmt(t.valor_documento),
+        vencimento: t.data_vencimento,
+        documento: t.numero_documento,
+      })),
+      fonte: 'Omie ERP (dados reais)',
     };
   },
 
   async alertas_cobranca() {
-    const clients = await gesthub.getClients();
-    const fmt = (v) => v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    const alertas = [];
 
-    // Identifica clientes sem honorário definido (potencial inadimplência/descuido)
+    // Dados Gesthub (honorários sem definição)
+    const clients = await gesthub.getClients();
     const semHonorario = clients
       .filter(c => c.status === 'ATIVO' && (!c.monthlyFee || c.monthlyFee === 0))
       .slice(0, 20)
@@ -64,92 +84,129 @@ export const tools = {
         cliente: c.legalName?.substring(0, 50),
         cnpj: c.document,
         regime: c.taxRegime,
-        responsavel: c.analyst || c.officeOwner,
         alerta: 'Honorário não definido',
+        severidade: 'amarelo',
       }));
+    alertas.push(...semHonorario);
 
-    const inativos = clients
-      .filter(c => c.status === 'INATIVO')
-      .slice(0, 10)
-      .map(c => ({
-        cliente: c.legalName?.substring(0, 50),
-        cnpj: c.document,
-        motivo: c.motivoInativacao || 'Não informado',
-      }));
+    // Dados Omie (títulos vencidos)
+    if (omie.isConfigured()) {
+      const vencidos = await omie.listarContasReceber({ apenasVencidos: true });
+      const hoje = new Date();
+
+      for (const t of vencidos.slice(0, 20)) {
+        const venc = t.data_vencimento?.split('/');
+        if (!venc || venc.length !== 3) continue;
+        const dataVenc = new Date(venc[2], venc[1] - 1, venc[0]);
+        const diasAtraso = Math.floor((hoje - dataVenc) / (1000 * 60 * 60 * 24));
+
+        alertas.push({
+          cliente_id: t.codigo_cliente_fornecedor,
+          valor: fmt(t.valor_documento),
+          vencimento: t.data_vencimento,
+          dias_atraso: diasAtraso,
+          severidade: diasAtraso > 30 ? 'vermelho' : diasAtraso > 15 ? 'laranja' : 'amarelo',
+          documento: t.numero_documento,
+        });
+      }
+    }
 
     return {
-      alertas_honorario: {
-        total: semHonorario.length,
-        clientes: semHonorario,
-      },
-      clientes_inativos: {
-        total: inativos.length,
-        clientes: inativos,
-      },
-      nota: 'Para alertas de inadimplência detalhados, integrar com sistema de cobrança.',
+      total_alertas: alertas.length,
+      alertas: alertas.sort((a, b) => (b.dias_atraso || 0) - (a.dias_atraso || 0)),
+      fonte: omie.isConfigured() ? 'Omie + Gesthub' : 'Gesthub (sem Omie)',
     };
   },
 
   async fluxo_caixa({ meses }) {
     const periodo = meses || 3;
-    const clients = await gesthub.getClients();
-    const ativos = clients.filter(c => c.status === 'ATIVO');
-    const receitaMensal = ativos.reduce((sum, c) => sum + (c.monthlyFee || 0), 0);
-    const fmt = (v) => v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 
-    const now = new Date();
-    const projecao = [];
-    for (let i = 0; i < periodo; i++) {
-      const mes = new Date(now.getFullYear(), now.getMonth() + i, 1);
-      projecao.push({
-        mes: mes.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' }),
-        receita_prevista: fmt(receitaMensal),
-        observacao: i === 0 ? 'Mês atual' : 'Projeção',
-      });
+    if (!omie.isConfigured()) {
+      // Fallback: projeção por honorários
+      const clients = await gesthub.getClients();
+      const ativos = clients.filter(c => c.status === 'ATIVO');
+      const receitaMensal = ativos.reduce((sum, c) => sum + (c.monthlyFee || 0), 0);
+      const projecao = [];
+      const now = new Date();
+      for (let i = 0; i < periodo; i++) {
+        const mes = new Date(now.getFullYear(), now.getMonth() + i, 1);
+        projecao.push({ mes: mes.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' }), receita_prevista: fmt(receitaMensal) });
+      }
+      return { fonte: 'Gesthub (estimativa)', receita_mensal_base: fmt(receitaMensal), projecao };
     }
 
+    // Dados reais do Omie
+    const [receber, pagar] = await Promise.all([
+      omie.resumoContasReceber(),
+      omie.listarContasPagar({ status: 'ABERTO' }),
+    ]);
+
+    const totalPagar = pagar.reduce((s, t) => s + Number(t.valor_documento || 0), 0);
+
     return {
-      clientes_ativos: ativos.length,
-      receita_mensal_base: fmt(receitaMensal),
-      projecao,
-      nota: 'Projeção baseada em honorários recorrentes. Não inclui receitas variáveis ou despesas.',
+      posicao_atual: {
+        a_receber: receber.formatado.total_aberto,
+        a_pagar: fmt(totalPagar),
+        saldo_projetado: fmt(receber.total_aberto - totalPagar),
+      },
+      receber_vencido: receber.formatado.total_vencido,
+      receber_7dias: receber.formatado.vencendo_7dias,
+      fonte: 'Omie ERP (dados reais)',
     };
   },
 
   async relatorio_dre({ periodo }) {
-    const clients = await gesthub.getClients();
-    const ativos = clients.filter(c => c.status === 'ATIVO');
-    const receitaBruta = ativos.reduce((sum, c) => sum + (c.monthlyFee || 0), 0);
-    const fmt = (v) => v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    if (!omie.isConfigured()) {
+      return { disponivel: false, mensagem: 'DRE requer integração Omie. Configure OMIE_APP_KEY no .env.' };
+    }
 
-    // DRE simplificado com estimativas
-    const impostos = receitaBruta * 0.06; // estimativa Simples
-    const receitaLiquida = receitaBruta - impostos;
-    const custoServicos = receitaBruta * 0.35; // estimativa
-    const lucroBruto = receitaLiquida - custoServicos;
-    const despesasOp = receitaBruta * 0.20; // estimativa
-    const resultado = lucroBruto - despesasOp;
+    const [receber, pagar] = await Promise.all([
+      omie.listarContasReceber(),
+      omie.listarContasPagar(),
+    ]);
+
+    // Filtra recebidos e pagos (liquidados)
+    const recebidos = receber.filter(t => t.status_titulo === 'RECEBIDO');
+    const pagos = pagar.filter(t => t.status_titulo === 'PAGO');
+
+    const receita = recebidos.reduce((s, t) => s + Number(t.valor_documento || 0), 0);
+    const despesa = pagos.reduce((s, t) => s + Number(t.valor_documento || 0), 0);
+    const resultado = receita - despesa;
 
     return {
-      periodo: periodo || 'Mês atual (estimativa)',
+      periodo: periodo || 'Acumulado (todos os registros)',
       dre: {
-        receita_bruta: fmt(receitaBruta),
-        deducoes_impostos: fmt(impostos),
-        receita_liquida: fmt(receitaLiquida),
-        custo_servicos_prestados: fmt(custoServicos),
-        lucro_bruto: fmt(lucroBruto),
-        despesas_operacionais: fmt(despesasOp),
-        resultado_operacional: fmt(resultado),
-        margem_liquida: receitaBruta > 0 ? (resultado / receitaBruta * 100).toFixed(1) + '%' : '0%',
+        receita_bruta: fmt(receita),
+        despesas_totais: fmt(despesa),
+        resultado: fmt(resultado),
+        margem: receita > 0 ? (resultado / receita * 100).toFixed(1) + '%' : '0%',
       },
-      nota: 'DRE simplificado baseado em honorários e estimativas de custos. Para DRE completo, integrar com sistema contábil.',
+      qtd_recebimentos: recebidos.length,
+      qtd_pagamentos: pagos.length,
+      fonte: 'Omie ERP (dados reais)',
     };
   },
 
-  async conciliar_extrato() {
-    return {
-      disponivel: false,
-      mensagem: 'Conciliação bancária requer integração com Open Banking ou importação de extratos OFX. Funcionalidade em desenvolvimento.',
-    };
+  async conciliar_extrato({ conta_corrente_id }) {
+    if (!omie.isConfigured()) {
+      return { disponivel: false, mensagem: 'Conciliação requer Omie configurado.' };
+    }
+
+    if (!conta_corrente_id) {
+      // Lista contas disponíveis
+      const contas = await omie.listarContasCorrentes();
+      return {
+        mensagem: 'Informe o ID da conta corrente para extrato.',
+        contas_disponiveis: contas.map(c => ({
+          id: c.nCodCC,
+          descricao: c.descricao,
+          tipo: c.tipo === 'CX' ? 'Caixa' : 'Conta Corrente',
+          banco: c.codigo_banco,
+        })),
+      };
+    }
+
+    const extrato = await omie.extratoConta(conta_corrente_id);
+    return { conta_corrente_id, extrato, fonte: 'Omie ERP' };
   },
 };

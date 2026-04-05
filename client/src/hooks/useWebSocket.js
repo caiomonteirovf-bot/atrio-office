@@ -4,8 +4,11 @@ export function useWebSocket() {
   const [connected, setConnected] = useState(false)
   const [lastMessage, setLastMessage] = useState(null)
   const wsRef = useRef(null)
+  const reconnectTimer = useRef(null)
 
-  useEffect(() => {
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws`)
     wsRef.current = ws
@@ -13,13 +16,11 @@ export function useWebSocket() {
     ws.onopen = () => setConnected(true)
     ws.onclose = () => {
       setConnected(false)
+      wsRef.current = null
       // Reconnect after 3s
-      setTimeout(() => {
-        if (wsRef.current?.readyState === WebSocket.CLOSED) {
-          wsRef.current = null
-        }
-      }, 3000)
+      reconnectTimer.current = setTimeout(connect, 3000)
     }
+    ws.onerror = () => ws.close()
     ws.onmessage = (event) => {
       try {
         setLastMessage(JSON.parse(event.data))
@@ -27,9 +28,15 @@ export function useWebSocket() {
         // ignore non-JSON messages
       }
     }
-
-    return () => ws.close()
   }, [])
+
+  useEffect(() => {
+    connect()
+    return () => {
+      clearTimeout(reconnectTimer.current)
+      wsRef.current?.close()
+    }
+  }, [connect])
 
   const send = useCallback((data) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {

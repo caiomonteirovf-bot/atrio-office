@@ -104,6 +104,54 @@ export async function registerNPS(analysis, clientPhone, clientName) {
 }
 
 /**
+ * Classifica a demanda do cliente por setor e sugere atendente.
+ * Roda na primeira mensagem para direcionar corretamente.
+ */
+export async function classifyDemand(message, clientName) {
+  try {
+    const { rows: agents } = await query('SELECT * FROM agents WHERE id = $1', [LUNA_AGENT_ID]);
+    if (!agents.length) return null;
+
+    const prompt = `Você é a Luna, gestora de atendimento de um escritório de contabilidade. Classifique a demanda do cliente abaixo.
+
+Cliente: ${clientName}
+Mensagem: "${message}"
+
+Responda APENAS em JSON:
+{
+  "classificacao": "fiscal" | "financeiro" | "societario" | "atendimento" | "comercial" | "pessoal" | "geral",
+  "prioridade": "low" | "medium" | "high" | "urgent",
+  "resumo": "resumo em 1 frase da demanda",
+  "atendente_sugerido": "Deyvison" | "Diego" | "Diogo" | "Karla" | "Quésia" | "Rafaela" | "Caio" | "equipe",
+  "motivo_atribuicao": "por que esse atendente"
+}
+
+Regras de atribuição:
+- Fiscal (impostos, DAS, NFS-e, DCTF, SPED, guias, certidões) → Deyvison, Diego ou Karla
+- Financeiro (honorários, pagamentos, cobranças, boletos) → Diogo
+- Societário (contrato social, alteração, abertura, encerramento) → Deyvison
+- Pessoal (folha de pagamento, férias, rescisão, FGTS, eSocial) → Rafaela
+- Comercial (proposta, preço, contratação de serviço) → Caio
+- Atendimento (dúvida simples, documento, senha, suporte geral) → Quésia
+- Geral (saudação, agradecimento, sem demanda clara) → equipe`;
+
+    const response = await chatWithAgent(
+      { ...agents[0], tools: [] },
+      [{ role: 'user', content: prompt }]
+    );
+
+    if (!response.success || !response.text) return null;
+    const jsonMatch = response.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+
+    return JSON.parse(jsonMatch[0]);
+  } catch (err) {
+    console.error('[Luna Classifier] Erro:', err.message);
+    return null;
+  }
+}
+
+/**
  * Analisa sentimento de uma única mensagem (rápido)
  */
 export async function analyzeSentiment(message, context) {

@@ -1,28 +1,430 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: 'DM Sans', system-ui, -apple-system, sans-serif;
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-heading: 'Outfit', system-ui, sans-serif;
+  --font-mono: 'Space Grotesk', monospace;
+  --color-gold: #C4956A;
+  --color-gold-dim: #C4956A66;
+  --color-void: #08080A;
+  --color-surface: #0f1117;
+  --color-card: #131620;
+  --color-card-hover: #161a24;
+  --color-border: rgba(255, 255, 255, 0.06);
+  --color-border-hover: rgba(255, 255, 255, 0.1);
+}
+
+/* ===== Dark Theme (default) ===== */
+:root, [data-theme="dark"] {
+  --ao-bg: #08080A;
+  --ao-text: #e2e8f0;
+  --ao-text-xs: rgba(255, 255, 255, 0.12);
+  --ao-text-dim: rgba(255, 255, 255, 0.35);
+  --ao-text-muted: rgba(255, 255, 255, 0.5);
+  --ao-text-secondary: rgba(255, 255, 255, 0.6);
+  --ao-text-primary: rgba(255, 255, 255, 0.85);
+  --ao-surface: #0f1117;
+  --ao-card: #131620;
+  --ao-card-hover: #161a24;
+  --ao-border: rgba(255, 255, 255, 0.06);
+  --ao-border-hover: rgba(255, 255, 255, 0.1);
+  --ao-border-subtle: rgba(255, 255, 255, 0.04);
+  --ao-topbar: rgba(13, 15, 23, 0.95);
+  --ao-glass: rgba(19, 22, 32, 0.8);
+  --ao-glass-half: rgba(19, 22, 32, 0.5);
+  --ao-glass-hover: rgba(22, 26, 36, 0.9);
+  --ao-glass-hover-half: rgba(22, 26, 36, 0.7);
+  --ao-input-bg: rgba(255, 255, 255, 0.04);
+  --ao-input-border: rgba(255, 255, 255, 0.05);
+  --ao-badge-bg: rgba(255, 255, 255, 0.06);
+  --ao-hover-bg: rgba(255, 255, 255, 0.02);
+  --ao-separator: rgba(255, 255, 255, 0.025);
+  --ao-shadow: rgba(0, 0, 0, 0.3);
+  --ao-scrollbar: rgba(196, 149, 106, 0.15);
+  --ao-scrollbar-hover: rgba(196, 149, 106, 0.3);
+  --ao-popup-bg: #1a1b1f;
+}
+
+/* ===== Light Theme ===== */
+[data-theme="light"] {
+  --ao-bg: #EEEAE4;
+  --ao-text: #2c2c3a;
+  --ao-text-xs: rgba(0, 0, 0, 0.25);
+  --ao-text-dim: rgba(0, 0, 0, 0.45);
+  --ao-text-muted: rgba(0, 0, 0, 0.55);
+  --ao-text-secondary: rgba(0, 0, 0, 0.7);
+  --ao-text-primary: rgba(0, 0, 0, 0.88);
+  --ao-surface: #F5F2ED;
+  --ao-card: #F8F6F2;
+  --ao-card-hover: #F0EDE7;
+  --ao-border: rgba(0, 0, 0, 0.1);
+  --ao-border-hover: rgba(0, 0, 0, 0.18);
+  --ao-border-subtle: rgba(0, 0, 0, 0.06);
+  --ao-topbar: rgba(248, 245, 240, 0.97);
+  --ao-glass: rgba(248, 246, 242, 0.9);
+  --ao-glass-half: rgba(248, 246, 242, 0.7);
+  --ao-glass-hover: rgba(240, 237, 231, 0.95);
+  --ao-glass-hover-half: rgba(240, 237, 231, 0.85);
+  --ao-input-bg: rgba(0, 0, 0, 0.04);
+  --ao-input-border: rgba(0, 0, 0, 0.1);
+  --ao-badge-bg: rgba(0, 0, 0, 0.06);
+  --ao-hover-bg: rgba(0, 0, 0, 0.04);
+  --ao-separator: rgba(0, 0, 0, 0.08);
+  --ao-shadow: rgba(0, 0, 0, 0.1);
+  --ao-scrollbar: rgba(196, 149, 106, 0.25);
+  --ao-scrollbar-hover: rgba(196, 149, 106, 0.45);
+  --ao-popup-bg: #F5F2ED;
+}
+
+[data-theme="light"] .glass-card {
+  background: linear-gradient(135deg, rgba(248, 246, 242, 0.95) 0%, rgba(245, 242, 237, 0.85) 100%);
+  border-color: var(--ao-border);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+[data-theme="light"] .glass-card:hover {
+  background: linear-gradient(135deg, rgba(240, 237, 231, 0.98) 0%, rgba(240, 237, 231, 0.9) 100%);
+  border-color: var(--ao-border-hover);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+[data-theme="light"] .section-header {
+  color: rgba(0, 0, 0, 0.5);
+}
+
+[data-theme="light"] .stat-gradient-amber { background: linear-gradient(135deg, rgba(245, 158, 11, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
+[data-theme="light"] .stat-gradient-red { background: linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
+[data-theme="light"] .stat-gradient-gold { background: linear-gradient(135deg, rgba(196, 149, 106, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
+[data-theme="light"] .stat-gradient-emerald { background: linear-gradient(135deg, rgba(34, 197, 94, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
+
+[data-theme="light"] .text-gradient-gold {
+  background: linear-gradient(135deg, #A67B52 0%, #8B6544 50%, #A67B52 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: var(--ao-scrollbar); }
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: var(--ao-scrollbar-hover); }
+[data-theme="light"] .chat-scroll::-webkit-scrollbar-thumb { background: var(--ao-scrollbar); }
+
+[data-theme="light"] .vista-bar { background: rgba(196, 149, 106, 0.12); }
+[data-theme="light"] .vista-bar::after {
+  background: linear-gradient(90deg, transparent, rgba(196, 149, 106, 0.6), rgba(196, 149, 106, 0.8), rgba(196, 149, 106, 0.6), transparent);
 }
 
 body {
   margin: 0;
-  background-color: #0f172a;
-  color: #e2e8f0;
+  background-color: var(--ao-bg);
+  color: var(--ao-text);
   font-family: var(--font-sans);
+  font-size: 14px;
   -webkit-font-smoothing: antialiased;
+  scroll-behavior: smooth;
+  transition: background-color 0.3s, color 0.3s;
 }
 
 #root { min-height: 100vh; }
 
+/* ============================================
+   SCROLLBAR — premium dark
+   ============================================ */
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.2); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,0.35); }
+::-webkit-scrollbar-thumb { background: rgba(196, 149, 106, 0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(196, 149, 106, 0.3); }
 
+/* ============================================
+   TYPING DOTS
+   ============================================ */
 @keyframes pulse-dot {
-  0%, 80%, 100% { opacity: 0.3; }
-  40% { opacity: 1; }
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.85); }
+  40% { opacity: 1; transform: scale(1.1); }
 }
 .typing-dot { animation: pulse-dot 1.4s infinite; }
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* ============================================
+   VISTA LOADING BAR — barra de luz deslizante
+   ============================================ */
+@keyframes vista-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+.vista-bar {
+  position: relative;
+  overflow: hidden;
+  height: 2px;
+  background: rgba(196, 149, 106, 0.06);
+  border-radius: 2px;
+}
+
+.vista-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 30%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(196, 149, 106, 0.5), rgba(196, 149, 106, 0.7), rgba(196, 149, 106, 0.5), transparent);
+  border-radius: 2px;
+  animation: vista-sweep 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Variante com cor do agente (usa --agent-color) */
+.vista-bar-agent {
+  position: relative;
+  overflow: hidden;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 2px;
+}
+
+.vista-bar-agent::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 25%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--agent-color, #C4956A), transparent);
+  border-radius: 2px;
+  animation: vista-sweep 2.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  opacity: 0.5;
+}
+
+/* ============================================
+   SHIMMER — skeleton loading sutil nos cards
+   ============================================ */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer-bg {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(196, 149, 106, 0.03) 40%,
+    rgba(196, 149, 106, 0.06) 50%,
+    rgba(196, 149, 106, 0.03) 60%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 3s ease-in-out infinite;
+}
+
+/* ============================================
+   GLOW PULSE — indicador de atividade (online)
+   ============================================ */
+@keyframes glow-breathe {
+  0%, 100% { opacity: 0.3; box-shadow: 0 0 4px currentColor; }
+  50%      { opacity: 0.8; box-shadow: 0 0 12px currentColor; }
+}
+
+.glow-breathe {
+  animation: glow-breathe 3s ease-in-out infinite;
+}
+
+/* ============================================
+   ORBIT — ícones orbitando (status working)
+   ============================================ */
+@keyframes orbit {
+  0%   { transform: rotate(0deg) translateX(6px) rotate(0deg); }
+  100% { transform: rotate(360deg) translateX(6px) rotate(-360deg); }
+}
+
+.orbit-dot {
+  animation: orbit 2.5s linear infinite;
+}
+
+/* ============================================
+   ACTIVITY PULSE — ponto com ring expandindo
+   ============================================ */
+@keyframes ring-expand {
+  0%   { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+
+.activity-ring {
+  position: relative;
+}
+
+.activity-ring::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  animation: ring-expand 2s ease-out infinite;
+}
+
+/* ============================================
+   FADE SLIDE IN — chat messages entrance
+   ============================================ */
+@keyframes fadeSlideIn {
+  0% {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.005);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-fade-slide-in {
+  animation: fadeSlideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ============================================
+   PULSE GLOW — new message / active agent glow
+   ============================================ */
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 var(--glow-color, rgba(196, 149, 106, 0.3));
+  }
+  50% {
+    box-shadow: 0 0 16px 4px var(--glow-color, rgba(196, 149, 106, 0.15));
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* ============================================
+   MESSAGE GLOW — subtle highlight for new msgs
+   ============================================ */
+@keyframes message-glow {
+  0% {
+    background-color: rgba(196, 149, 106, 0.08);
+    box-shadow: 0 0 20px rgba(196, 149, 106, 0.1);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: none;
+  }
+}
+
+.animate-message-glow {
+  animation: message-glow 2.5s ease-out forwards;
+}
+
+/* ============================================
+   TYPING WAVE — for agent typing indicator
+   ============================================ */
+@keyframes typing-wave {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-6px);
+    opacity: 1;
+  }
+}
+
+.typing-wave-dot {
+  animation: typing-wave 1.2s ease-in-out infinite;
+}
+
+.typing-wave-dot:nth-child(2) { animation-delay: 0.15s; }
+.typing-wave-dot:nth-child(3) { animation-delay: 0.3s; }
+
+/* ============================================
+   GRADIENT TEXT — premium heading effect
+   ============================================ */
+.text-gradient-gold {
+  background: linear-gradient(135deg, #C4956A 0%, #E8C9A8 50%, #C4956A 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ============================================
+   GLASS CARD — glassmorphism base
+   ============================================ */
+.glass-card {
+  background: linear-gradient(135deg, rgba(19, 22, 32, 0.8) 0%, rgba(19, 22, 32, 0.6) 100%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.glass-card:hover {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: linear-gradient(135deg, rgba(22, 26, 36, 0.9) 0%, rgba(22, 26, 36, 0.7) 100%);
+}
+
+/* ============================================
+   STAT CARD GRADIENTS
+   ============================================ */
+.stat-gradient-amber {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.06) 0%, rgba(19, 22, 32, 0.8) 100%);
+}
+
+.stat-gradient-red {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.06) 0%, rgba(19, 22, 32, 0.8) 100%);
+}
+
+.stat-gradient-gold {
+  background: linear-gradient(135deg, rgba(196, 149, 106, 0.06) 0%, rgba(19, 22, 32, 0.8) 100%);
+}
+
+.stat-gradient-emerald {
+  background: linear-gradient(135deg, rgba(34, 197, 94, 0.06) 0%, rgba(19, 22, 32, 0.8) 100%);
+}
+
+/* ============================================
+   SUBTLE NOISE TEXTURE — premium depth feel
+   ============================================ */
+.noise-overlay::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.015;
+  background: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='256' height='256' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+/* ============================================
+   SECTION HEADER
+   ============================================ */
+.section-header {
+  font-family: 'Outfit', system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* ============================================
+   CUSTOM SCROLLBAR for chat panel
+   ============================================ */
+.chat-scroll::-webkit-scrollbar { width: 3px; }
+.chat-scroll::-webkit-scrollbar-track { background: transparent; }
+.chat-scroll::-webkit-scrollbar-thumb { background: rgba(196, 149, 106, 0.1); border-radius: 3px; }
+.chat-scroll::-webkit-scrollbar-thumb:hover { background: rgba(196, 149, 106, 0.2); }
+
+/* ============================================
+   ENTRANCE STAGGER — for list items
+   ============================================ */
+@keyframes stagger-in {
+  0% { opacity: 0; transform: translateX(-8px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+
+.stagger-item {
+  animation: stagger-in 0.3s ease-out forwards;
+  opacity: 0;
+}

@@ -7,7 +7,7 @@
 **Criador:** Caio Monteiro — contador (CRC PE-029471/O-2), fundador do Átrio Contabilidade.
 **Co-fundador/operador:** Deyvison.
 
-## Agentes IA (5 agentes)
+## Agentes IA (8 agentes)
 
 ### Rodrigo — Diretor de operações (Diretoria)
 - **Função:** Orquestrador. NUNCA executa — coordena. Toda demanda passa por ele.
@@ -42,20 +42,50 @@
 - **Tools:** gerar_contrato, alteracao_contratual, consultar_jucep, consultar_cnpj, simular_estrutura, checklist_abertura
 - **Personalidade:** Estratégica, visão de longo prazo. Sempre considera proteção patrimonial.
 
-## Colaboradores humanos
+### Valência — Gestor Comercial (Setor Comercial)
+- **Função:** Funil de vendas, propostas, contratos de serviço, análise de churn, upsell.
+- **Cor:** #E05A33 (Coral) | **Letra:** V
+- **Tools:** funil_vendas, gerar_proposta, gerar_contrato_servico, analise_churn, relatorio_comercial, oportunidade_upsell, consultar_vendas_gesthub
+- **Personalidade:** Consultivo, orientado a dados, vende valor e não preço.
+- **Integrações:** Gesthub (vendas/leads), Omie (faturamento), Maia (leads qualificados)
 
-- **Deyvison** — Coordenador operacional (humano)
-- **Diego** — Assistente contábil (humano)
+### Maia — Estrategista de Marketing (Setor Marketing)
+- **Função:** Campanhas, conteúdo educativo, segmentação, nutrição de leads, posicionamento, programa de indicação.
+- **Cor:** #D946A8 (Rosa) | **Letra:** M
+- **Tools:** campanha_whatsapp, gerar_conteudo, segmentar_clientes, calendario_marketing, programa_indicacao, nutrir_lead, relatorio_marketing
+- **Personalidade:** Criativa, estratégica, comunicativa. Transforma contabilidade em conteúdo que engaja.
+- **Integrações:** Luna (execução WhatsApp), Campelo (conteúdo fiscal), Valência (conversão de leads)
+
+## Colaboradores humanos (7)
+
+- **Caio** — CEO / Comercial / Marketing (diretoria)
+- **Deyvison** — Legalização / Contabilidade / Fiscal (fiscal)
+- **Diego** — Contabilidade / Fiscal (fiscal)
+- **Diogo** — Financeiro (financeiro)
+- **Karla** — Contabilidade / Fiscal (fiscal)
+- **Quésia** — Sucesso do Cliente / Atendimento (atendimento)
+- **Rafaela** — Folha de Pagamento (pessoal)
+
+## Roteamento de demandas
+
+| Tipo | Agente IA (executa) | Humano (revisa) |
+|------|-------------------|-----------------|
+| Fiscal | Campelo | Deyvison / Diego / Karla |
+| Financeiro | Sneijder | Diogo |
+| Societário | Sofia | Deyvison |
+| Comercial | — | Caio |
+| Atendimento | Luna | Quésia |
+| Pessoal/Folha | — | Rafaela |
 
 ## Fluxo padrão de uma demanda
 
-1. Cliente envia mensagem (WhatsApp/email)
-2. **Luna** recebe, classifica (fiscal/financeiro/societário/geral), extrai intenção
-3. Luna envia para **Rodrigo** via task queue com classificação e prioridade
-4. **Rodrigo** avalia: complexidade, urgência, disponibilidade → delega
-5. Rodrigo cria **task** e atribui ao agente/humano adequado
-6. Agente executa e reporta resultado na task
-7. **Luna** formata e envia resposta ao cliente
+1. Cliente envia mensagem (WhatsApp)
+2. **Luna** envia greeting com nome do cliente (30s delay)
+3. **Luna** classifica com todas as mensagens do cliente (60s delay)
+4. UMA notificação no grupo WhatsApp Luna_Atendimento
+5. Task criada → agente IA executa + humano revisa/aprova
+6. Humano responde ao cliente (Luna não responde conclusão)
+7. Escalation automática se ninguém responder (10min → 30min → 1h → 2h → 6h → 12h → 24h)
 
 ## Stack técnica
 
@@ -64,18 +94,19 @@
 | Frontend | React + Vite (SPA dashboard) |
 | Backend | Node.js + Express (API REST + WebSocket) |
 | Banco | PostgreSQL (já rodando na VPS) |
-| IA | Claude API (claude-sonnet-4-20250514) |
-| WhatsApp | Evolution API (já rodando) |
+| IA | Minimax M2.5 (OpenAI-compatible SDK) |
+| WhatsApp | whatsapp-web.js (sessão local) |
+| Notificações | Telegram Bot API |
+| Gestão | Gesthub (sistema próprio) |
+| Financeiro | Omie API |
 | NFS-e | Nuvem Fiscal / Focus NFe (API) |
-| Orquestração | n8n + task queue interna (Node.js) |
-| Deploy | Docker + Traefik (mesmo padrão Bira/FleetOS) |
+| Deploy | Docker + Caddy reverse proxy |
 
 ## Infraestrutura
 
-- **VPS principal:** 89.167.63.141 (PostgreSQL, Evolution API, n8n, Redis)
-- **Deploy:** Docker containers com Traefik reverse proxy
-- **Domínio previsto:** atrio-office.vcatech.online (ou similar via Traefik)
-- **Portas:** server 3010, WebSocket 3011, frontend 5173 (dev)
+- **VPS principal:** 89.167.63.141 (PostgreSQL, Gesthub, serviços)
+- **Deploy:** Docker containers com Caddy reverse proxy
+- **Portas:** server 3010, frontend 5173 (dev)
 
 ## Banco de dados — 6 tabelas
 
@@ -101,62 +132,65 @@ Seed (agentes + humanos) em: `server/src/db/seed.sql`
 
 ```
 atrio-office/
-├── client/                    # React + Vite
+├── client/                      # React 19 + Vite 8 + Tailwind 4
 │   ├── src/
-│   │   ├── components/        # AgentCard, ChatPanel, TaskBoard, etc.
-│   │   ├── hooks/             # useAgent, useWebSocket
-│   │   ├── pages/             # Office, Agent, Tasks
+│   │   ├── components/          # 10 componentes (AgentCard, ChatPanel, TaskBoard, etc.)
+│   │   ├── hooks/               # useAgents, useChat, useWebSocket
+│   │   ├── pages/Office.jsx     # Dashboard principal
+│   │   ├── portal/              # Portal do cliente (login + dashboard)
+│   │   ├── office/              # Escritório virtual 2D (PixiJS)
+│   │   ├── lib/api.js           # API client
 │   │   └── App.jsx
 │   └── package.json
-├── server/                    # Node.js + Express
+├── server/                      # Node.js 22 + Express
 │   ├── src/
-│   │   ├── agents/            # System prompts + tools por agente
-│   │   ├── services/          # claude.js, taskQueue.js, whatsapp.js, nfse.js
-│   │   ├── routes/            # agents, chat, tasks, clients
-│   │   ├── db/                # schema.sql, seed.sql, pool.js
-│   │   ├── websocket.js
-│   │   └── index.js
+│   │   ├── services/            # 10 serviços (whatsapp, omie, gesthub, telegram, etc.)
+│   │   ├── tools/               # 31 tools (registry + por agente)
+│   │   ├── db/                  # schema.sql, seed.sql, pool.js, migrations
+│   │   └── index.js             # Express + WebSocket + rotas
 │   └── package.json
-├── docker-compose.yml
-├── .env.example
-├── CLAUDE.md                  # Este arquivo
+├── Dockerfile                   # Multi-stage build
+├── docker-compose.yml           # PostgreSQL + server
+├── Caddyfile                    # Reverse proxy
+├── deploy.sh                    # Deploy VPS
+├── CLAUDE.md                    # Este arquivo
 └── README.md
 ```
 
 ## Estado atual
 
-### Já criado:
-- [x] Definição completa dos 5 agentes (nomes, roles, system prompts, tools, personalidades)
-- [x] Schema do banco (schema.sql) com 6 tabelas, índices e triggers
-- [x] Seed data (seed.sql) com agentes + humanos
-- [x] Server Express básico (index.js) com rotas de agents, chat, tasks, clients, stats
-- [x] Claude API wrapper (claude.js) com suporte a tool use loop
-- [x] Pool PostgreSQL (pool.js)
-- [x] .env.example com todas as variáveis
-- [x] Protótipo visual do dashboard (React JSX)
+### Funcionando:
+- [x] 8 agentes IA com system prompts, tools e personalidades
+- [x] 7 colaboradores humanos no banco (seed.sql)
+- [x] 31 tools registradas e funcionais
+- [x] Schema do banco com 9 tabelas (6 core + 3 WhatsApp/métricas)
+- [x] Server Express com rotas, WebSocket, orchestrator
+- [x] Frontend React + Vite + Tailwind com 10 componentes
+- [x] Chat funcional com Minimax M2.5 (tool use loop)
+- [x] WhatsApp operacional (whatsapp-web.js) — Luna ativa
+- [x] Fluxo completo: greeting → classificação → roteamento → escalation
+- [x] Coleta de dados NFS-e via WhatsApp
+- [x] Integração Omie (inadimplência, contas a pagar/receber)
+- [x] Integração Gesthub (clientes, bootstrap)
+- [x] Integração Telegram (alertas equipe)
+- [x] Scheduler automático (verificações Omie + Gesthub)
+- [x] Relatório diário automático
+- [x] Docker + Caddy para deploy
+- [x] Persistência de conversas WhatsApp no banco
 
-### Próximos passos (Fase 2-3):
-- [ ] Setup completo do frontend React + Vite com Tailwind
-- [ ] Componentizar o dashboard (AgentCard, ChatPanel, TaskBoard, SectorView)
-- [ ] Conectar frontend ao backend (fetch API, WebSocket para chat real-time)
-- [ ] Chat funcional com Claude API (mensagens reais, não mock)
-- [ ] Implementar tool execution no backend (calcular_fator_r, alertas_prazos, etc.)
-- [ ] WebSocket broadcast para atualizações em tempo real
-- [ ] Docker compose para deploy
-
-### Fase 4+ (futuro):
-- [ ] Integração WhatsApp via Evolution API (Luna)
-- [ ] Integração email
-- [ ] Integração Nuvem Fiscal (NFS-e)
-- [ ] Orquestração inter-agentes real (Rodrigo delegando)
+### Próximos passos:
+- [ ] Escritório virtual 2D com avatares animados (PixiJS)
+- [ ] Scheduler proativo — Campelo alerta prazos fiscais por cliente
+- [ ] Integração Cliente 360 do Gesthub no contexto da Luna
+- [ ] Comunicação proativa (lembretes, coleta de documentos)
+- [ ] Dashboard de gestão CEO (NPS, SLA, produtividade)
 - [ ] Portal do cliente
-- [ ] Multi-tenant para SaaS
 
 ## Convenções de código
 
 - **ES Modules** (import/export, "type": "module" no package.json)
 - **Nomes de variáveis/funções:** camelCase em JS, snake_case no banco
-- **Agentes:** cada agente é um arquivo em `server/src/agents/` exportando { systemPrompt, tools }
+- **Tools:** cada agente tem um arquivo em `server/src/tools/` com suas tools registradas
 - **Rotas:** prefixo `/api/` para todas as rotas
 - **Erros:** sempre retornar `{ error: "mensagem" }` com status HTTP adequado
 - **IDs:** UUID v4 para todas as entidades

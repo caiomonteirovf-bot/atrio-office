@@ -321,7 +321,7 @@ app.get('/api/sessions', async (req, res) => {
     if (channel) { sql += ` AND c.channel = $${idx++}`; params.push(channel) }
     if (status) { sql += ` AND c.status = $${idx++}`; params.push(status) }
 
-    sql += ` ORDER BY c.updated_at DESC LIMIT $${idx++} OFFSET $${idx++}`
+    sql += ` ORDER BY c.started_at DESC LIMIT $${idx++} OFFSET $${idx++}`
     params.push(limit, offset)
 
     const { rows } = await query(sql, params)

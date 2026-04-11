@@ -220,7 +220,7 @@ export default function SessionHistory() {
 
                 {/* Date */}
                 <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', minWidth: 100, textAlign: 'right' }}>
-                  {formatDate(s.updated_at || s.created_at)}
+                  {formatDate(s.closed_at || s.started_at)}
                 </div>
 
                 {/* Expand arrow */}

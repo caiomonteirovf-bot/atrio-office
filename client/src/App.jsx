@@ -10,6 +10,9 @@ import AttendanceQueue from './components/AttendanceQueue'
 import AgentChat from './components/AgentChat'
 import GlobalSearch from './components/GlobalSearch'
 import StatusBar from './components/StatusBar'
+import ActivityHeatmap from './components/ActivityHeatmap'
+import CronManager from './components/CronManager'
+import CostAnalytics from './components/CostAnalytics'
 import PortalLogin from './portal/PortalLogin'
 import PortalDashboard from './portal/PortalDashboard'
 
@@ -39,6 +42,7 @@ function AdminDashboard() {
   }, [lastMessage, refresh])
   const [selectedAgent, setSelectedAgent] = useState(null)
   const [searchOpen, setSearchOpen] = useState(false)
+  const [currentPage, setCurrentPage] = useState('home')
 
   // Global search shortcut (Cmd+K / Ctrl+K)
   useEffect(() => {
@@ -79,41 +83,47 @@ function AdminDashboard() {
   return (
     <div className="flex h-screen overflow-hidden" style={{ background: 'var(--ao-bg)', color: 'var(--ao-text)', transition: 'background 0.3s, color 0.3s' }}>
       <div className="flex-1 flex flex-col overflow-hidden">
-        <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} />
+        <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} currentPage={currentPage} onNavigate={setCurrentPage} />
 
         {/* Main content: two-column layout */}
         <div className="flex-1 flex overflow-hidden">
           {/* LEFT COLUMN — 60% */}
           <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
-            <div className="max-w-[960px] mx-auto px-5 py-5 space-y-5">
-              <StatsBar />
+            {currentPage === 'home' && (
+              <div className="max-w-[960px] mx-auto px-5 py-5 space-y-5">
+                <StatsBar />
 
-              {/* Agent Cards Grid */}
-              <section>
-                <div className="flex items-center justify-between mb-3">
-                  <h2 className="section-header">Equipe</h2>
-                  <span className="text-[11px] tabular-nums" style={{ fontFamily: 'Space Grotesk', color: 'var(--ao-text-xs)' }}>
-                    {agents.filter(a => a.status === 'online').length}/{agents.length} online
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                  {agents.map(agent => (
-                    <AgentCard
-                      key={agent.id}
-                      agent={agent}
-                      isSelected={selectedAgent?.id === agent.id}
-                      onClick={() => setSelectedAgent(selectedAgent?.id === agent.id ? null : agent)}
-                    />
-                  ))}
-                </div>
-              </section>
+                {/* Agent Cards Grid */}
+                <section>
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="section-header">Equipe</h2>
+                    <span className="text-[11px] tabular-nums" style={{ fontFamily: 'Space Grotesk', color: 'var(--ao-text-xs)' }}>
+                      {agents.filter(a => a.status === 'online').length}/{agents.length} online
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                    {agents.map(agent => (
+                      <AgentCard
+                        key={agent.id}
+                        agent={agent}
+                        isSelected={selectedAgent?.id === agent.id}
+                        onClick={() => setSelectedAgent(selectedAgent?.id === agent.id ? null : agent)}
+                      />
+                    ))}
+                  </div>
+                </section>
 
-              <AttendanceQueue />
-              <ActivityFeed />
+                <AttendanceQueue />
+                <ActivityFeed />
+                <ActivityHeatmap />
 
-              {/* Bottom spacer */}
-              <div className="h-4" />
-            </div>
+                {/* Bottom spacer */}
+                <div className="h-4" />
+              </div>
+            )}
+
+            {currentPage === 'crons' && <CronManager />}
+            {currentPage === 'custos' && <CostAnalytics />}
           </div>
 
           {/* RIGHT COLUMN — Agent Chat (tall panel, always visible) */}

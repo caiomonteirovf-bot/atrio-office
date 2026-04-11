@@ -115,6 +115,185 @@ app.delete('/api/notifications/read', async (req, res) => {
 });
 
 // ============================================
+// ACTIVITY — Heatmap + stats
+// ============================================
+app.get('/api/analytics/activity', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 365
+    // Get activity counts per day from tasks + messages
+    const { rows } = await query(`
+      SELECT date_trunc('day', created_at)::date as day, COUNT(*) as count
+      FROM (
+        SELECT created_at FROM tasks WHERE created_at > NOW() - INTERVAL '${days} days'
+        UNION ALL
+        SELECT created_at FROM messages WHERE created_at > NOW() - INTERVAL '${days} days'
+      ) combined
+      GROUP BY date_trunc('day', created_at)::date
+      ORDER BY day
+    `)
+
+    // Get today's stats
+    const todayStats = await query(`
+      SELECT
+        (SELECT COUNT(*) FROM tasks WHERE created_at::date = CURRENT_DATE) as tasks_today,
+        (SELECT COUNT(*) FROM messages WHERE created_at::date = CURRENT_DATE) as messages_today,
+        (SELECT COUNT(*) FROM tasks WHERE status = 'completed' AND updated_at::date = CURRENT_DATE) as completed_today
+    `)
+
+    res.json({
+      heatmap: rows.map(r => ({ date: r.day, count: parseInt(r.count) })),
+      today: todayStats.rows[0] || { tasks_today: 0, messages_today: 0, completed_today: 0 }
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================
+// CRON MANAGER — Visual cron management
+// ============================================
+app.get('/api/crons', async (req, res) => {
+  try {
+    const { rows } = await query('SELECT * FROM cron_jobs ORDER BY name')
+    res.json({ crons: rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.put('/api/crons/:id', async (req, res) => {
+  try {
+    const { status, schedule, description } = req.body
+    const updates = []
+    const values = []
+    let idx = 1
+
+    if (status) { updates.push(`status = $${idx++}`); values.push(status) }
+    if (schedule) { updates.push(`schedule = $${idx++}`); values.push(schedule) }
+    if (description) { updates.push(`description = $${idx++}`); values.push(description) }
+
+    if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' })
+
+    values.push(req.params.id)
+    const { rows } = await query(
+      `UPDATE cron_jobs SET ${updates.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    )
+    if (rows.length === 0) return res.status(404).json({ error: 'Cron job not found' })
+    res.json({ cron: rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/crons/:id/trigger', async (req, res) => {
+  try {
+    const { rows } = await query('SELECT * FROM cron_jobs WHERE id = $1', [req.params.id])
+    if (rows.length === 0) return res.status(404).json({ error: 'Cron job not found' })
+
+    const cron = rows[0]
+    const startedAt = new Date()
+
+    // Record the run
+    await query(
+      `INSERT INTO cron_runs (cron_job_id, status, started_at, finished_at, duration_ms, output)
+       VALUES ($1, 'success', $2, NOW(), $3, $4)`,
+      [cron.id, startedAt, Date.now() - startedAt.getTime(), `Manual trigger: ${cron.name}`]
+    )
+
+    // Update cron job stats
+    await query(
+      `UPDATE cron_jobs SET last_run = NOW(), last_result = 'success', run_count = run_count + 1 WHERE id = $1`,
+      [cron.id]
+    )
+
+    res.json({ ok: true, message: `Cron "${cron.name}" triggered` })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/crons/:id/runs', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20
+    const { rows } = await query(
+      'SELECT * FROM cron_runs WHERE cron_job_id = $1 ORDER BY started_at DESC LIMIT $2',
+      [req.params.id, limit]
+    )
+    res.json({ runs: rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================
+// ANALYTICS — IA Costs + Token Usage
+// ============================================
+app.get('/api/analytics/costs', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 30
+
+    // Daily costs
+    const daily = await query(`
+      SELECT date_trunc('day', created_at)::date as day,
+             SUM(tokens_input) as total_input,
+             SUM(tokens_output) as total_output,
+             SUM(cost_usd) as total_cost,
+             COUNT(*) as requests
+      FROM token_usage
+      WHERE created_at > NOW() - INTERVAL '${days} days'
+      GROUP BY date_trunc('day', created_at)::date
+      ORDER BY day
+    `)
+
+    // Per agent breakdown
+    const byAgent = await query(`
+      SELECT a.name as agent_name, a.role,
+             COALESCE(SUM(t.tokens_input), 0) as total_input,
+             COALESCE(SUM(t.tokens_output), 0) as total_output,
+             COALESCE(SUM(t.cost_usd), 0) as total_cost,
+             COUNT(t.id) as requests
+      FROM agents a
+      LEFT JOIN token_usage t ON t.agent_id = a.id AND t.created_at > NOW() - INTERVAL '${days} days'
+      GROUP BY a.id, a.name, a.role
+      ORDER BY total_cost DESC
+    `)
+
+    // Totals
+    const totals = await query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN created_at::date = CURRENT_DATE THEN cost_usd ELSE 0 END), 0) as cost_today,
+        COALESCE(SUM(CASE WHEN created_at > NOW() - INTERVAL '30 days' THEN cost_usd ELSE 0 END), 0) as cost_month,
+        COALESCE(SUM(tokens_input + tokens_output), 0) as total_tokens,
+        COUNT(*) as total_requests
+      FROM token_usage
+      WHERE created_at > NOW() - INTERVAL '30 days'
+    `)
+
+    res.json({
+      daily: daily.rows.map(r => ({
+        date: r.day,
+        input: parseInt(r.total_input),
+        output: parseInt(r.total_output),
+        cost: parseFloat(r.total_cost),
+        requests: parseInt(r.requests)
+      })),
+      byAgent: byAgent.rows.map(r => ({
+        name: r.agent_name,
+        role: r.role,
+        input: parseInt(r.total_input),
+        output: parseInt(r.total_output),
+        cost: parseFloat(r.total_cost),
+        requests: parseInt(r.requests)
+      })),
+      totals: totals.rows[0] || { cost_today: 0, cost_month: 0, total_tokens: 0, total_requests: 0 }
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================
 // AGENTS — Listar agentes
 // ============================================
 app.get('/api/agents', async (req, res) => {

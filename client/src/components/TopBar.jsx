@@ -4,13 +4,15 @@ import NotificationDropdown from './NotificationDropdown'
 
 const LINKS = [
   { label: 'Escritorio', type: 'internal', id: 'home' },
+  { label: 'Crons', type: 'internal', id: 'crons' },
+  { label: 'Custos IA', type: 'internal', id: 'custos' },
   { label: 'Gesthub', type: 'external', url: 'https://gesthub-xlvb.onrender.com' },
   { label: 'Banking', type: 'external', url: 'http://31.97.175.200:3000' },
   { label: 'NFS-e System', type: 'external', url: 'http://31.97.175.200:3020' },
   { label: 'Relatorio', type: 'action', id: 'relatorio' },
 ]
 
-export default function TopBar({ agents, connected, onAction, onSearchOpen }) {
+export default function TopBar({ agents, connected, onAction, onSearchOpen, currentPage, onNavigate }) {
   const { theme, toggle: toggleTheme } = useContext(ThemeContext)
   const [time, setTime] = useState(new Date())
 
@@ -26,6 +28,8 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen }) {
       window.open(link.url, '_blank', 'noopener')
     } else if (link.type === 'action') {
       onAction?.(link.id)
+    } else if (link.type === 'internal') {
+      onNavigate?.(link.id)
     }
   }
 
@@ -58,9 +62,9 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen }) {
             key={link.label}
             onClick={() => handleClick(link)}
             className="relative flex items-center gap-1.5 h-full px-4 text-[12.5px] font-medium transition-all duration-200 cursor-pointer"
-            style={{ color: link.type === 'internal' ? 'var(--ao-text-primary)' : 'var(--ao-text-dim)' }}
-            onMouseEnter={(e) => { if (link.type !== 'internal') e.target.style.color = 'var(--ao-text-secondary)' }}
-            onMouseLeave={(e) => { if (link.type !== 'internal') e.target.style.color = 'var(--ao-text-dim)' }}
+            style={{ color: (link.type === 'internal' && currentPage === link.id) ? 'var(--ao-text-primary)' : link.type === 'internal' ? 'var(--ao-text-secondary)' : 'var(--ao-text-dim)' }}
+            onMouseEnter={(e) => { if (!(link.type === 'internal' && currentPage === link.id)) e.target.style.color = 'var(--ao-text-secondary)' }}
+            onMouseLeave={(e) => { if (link.type === 'internal' && currentPage === link.id) e.target.style.color = 'var(--ao-text-primary)'; else if (link.type === 'internal') e.target.style.color = 'var(--ao-text-secondary)'; else e.target.style.color = 'var(--ao-text-dim)' }}
           >
             {link.label}
             {link.type === 'external' && (
@@ -68,7 +72,7 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen }) {
                 <path d="M4.5 1.5H2a.5.5 0 00-.5.5v8a.5.5 0 00.5.5h8a.5.5 0 00.5-.5V7.5M7 1.5h3.5V5M6 6l4.5-4.5" strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
             )}
-            {link.type === 'internal' && (
+            {link.type === 'internal' && currentPage === link.id && (
               <span className="absolute bottom-0 left-4 right-4 h-[2px] rounded-t-full" style={{
                 background: 'linear-gradient(90deg, #C4956A, #C4956A80)',
                 boxShadow: '0 0 8px rgba(196, 149, 106, 0.3)',

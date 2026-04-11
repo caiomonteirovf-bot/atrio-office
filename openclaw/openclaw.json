@@ -1,0 +1,20 @@
+{
+  "agent": {
+    "model": "openai/gpt-4o"
+  },
+  "skills": {
+    "entries": {
+      "atrio-luna": {
+        "enabled": true,
+        "env": {
+          "ATRIO_API_URL": "http://89.167.63.141:3010"
+        }
+      }
+    }
+  },
+  "channels": {
+    "whatsapp": {
+      "allowFrom": ["*"]
+    }
+  }
+}

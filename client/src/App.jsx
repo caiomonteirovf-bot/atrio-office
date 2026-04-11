@@ -13,6 +13,9 @@ import StatusBar from './components/StatusBar'
 import ActivityHeatmap from './components/ActivityHeatmap'
 import CronManager from './components/CronManager'
 import CostAnalytics from './components/CostAnalytics'
+import SessionHistory from './components/SessionHistory'
+import WeeklyCalendar from './components/WeeklyCalendar'
+import MemoryBrowser from './components/MemoryBrowser'
 import PortalLogin from './portal/PortalLogin'
 import PortalDashboard from './portal/PortalDashboard'
 
@@ -124,6 +127,9 @@ function AdminDashboard() {
 
             {currentPage === 'crons' && <CronManager />}
             {currentPage === 'custos' && <CostAnalytics />}
+            {currentPage === 'sessions' && <SessionHistory />}
+            {currentPage === 'calendar' && <WeeklyCalendar />}
+            {currentPage === 'memory' && <MemoryBrowser />}
           </div>
 
           {/* RIGHT COLUMN — Agent Chat (tall panel, always visible) */}

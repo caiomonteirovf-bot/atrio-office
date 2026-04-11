@@ -294,12 +294,213 @@ app.get('/api/analytics/costs', async (req, res) => {
 })
 
 // ============================================
+// SESSIONS — Histórico de conversas
+// ============================================
+app.get('/api/sessions', async (req, res) => {
+  try {
+    const { agent, client, channel, status, limit: lim, offset: off } = req.query
+    const limit = parseInt(lim) || 50
+    const offset = parseInt(off) || 0
+
+    let sql = `
+      SELECT c.*,
+             a.name as agent_name, a.role as agent_role,
+             cl.name as client_name,
+             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
+             (SELECT COALESCE(SUM(t.tokens_input + t.tokens_output), 0) FROM token_usage t WHERE t.conversation_id = c.id) as total_tokens
+      FROM conversations c
+      LEFT JOIN agents a ON c.agent_id = a.id
+      LEFT JOIN clients cl ON c.client_id = cl.id
+      WHERE 1=1
+    `
+    const params = []
+    let idx = 1
+
+    if (agent) { sql += ` AND c.agent_id = $${idx++}`; params.push(agent) }
+    if (client) { sql += ` AND c.client_id = $${idx++}`; params.push(client) }
+    if (channel) { sql += ` AND c.channel = $${idx++}`; params.push(channel) }
+    if (status) { sql += ` AND c.status = $${idx++}`; params.push(status) }
+
+    sql += ` ORDER BY c.updated_at DESC LIMIT $${idx++} OFFSET $${idx++}`
+    params.push(limit, offset)
+
+    const { rows } = await query(sql, params)
+
+    // Total count for pagination
+    let countSql = 'SELECT COUNT(*) FROM conversations WHERE 1=1'
+    const countParams = []
+    let ci = 1
+    if (agent) { countSql += ` AND agent_id = $${ci++}`; countParams.push(agent) }
+    if (client) { countSql += ` AND client_id = $${ci++}`; countParams.push(client) }
+    if (channel) { countSql += ` AND channel = $${ci++}`; countParams.push(channel) }
+    if (status) { countSql += ` AND status = $${ci++}`; countParams.push(status) }
+
+    const countResult = await query(countSql, countParams)
+
+    res.json({
+      sessions: rows,
+      total: parseInt(countResult.rows[0].count),
+      limit,
+      offset
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/sessions/:id/messages', async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC',
+      [req.params.id]
+    )
+    res.json({ messages: rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================
+// CALENDAR — Prazos fiscais + eventos
+// ============================================
+app.get('/api/calendar', async (req, res) => {
+  try {
+    const { start, end, type, category } = req.query
+
+    let sql = 'SELECT * FROM calendar_events WHERE 1=1'
+    const params = []
+    let idx = 1
+
+    if (start) { sql += ` AND start_time >= $${idx++}`; params.push(start) }
+    if (end) { sql += ` AND start_time <= $${idx++}`; params.push(end) }
+    if (type) { sql += ` AND type = $${idx++}`; params.push(type) }
+    if (category) { sql += ` AND category = $${idx++}`; params.push(category) }
+
+    sql += ' ORDER BY start_time ASC'
+    const { rows } = await query(sql, params)
+    res.json({ events: rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/calendar', async (req, res) => {
+  try {
+    const { title, description, type, category, start_time, end_time, all_day, color, agent_id, task_id, client_id, recurrence, metadata } = req.body
+    if (!title || !start_time) return res.status(400).json({ error: 'title and start_time required' })
+
+    const { rows } = await query(
+      `INSERT INTO calendar_events (title, description, type, category, start_time, end_time, all_day, color, agent_id, task_id, client_id, recurrence, metadata)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [title, description || null, type || 'task', category || null, start_time, end_time || null, all_day || false, color || null, agent_id || null, task_id || null, client_id || null, recurrence || null, metadata || {}]
+    )
+    res.status(201).json({ event: rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.put('/api/calendar/:id', async (req, res) => {
+  try {
+    const { title, description, type, category, start_time, end_time, all_day, color, metadata } = req.body
+    const { rows } = await query(
+      `UPDATE calendar_events SET
+        title = COALESCE($1, title), description = COALESCE($2, description),
+        type = COALESCE($3, type), category = COALESCE($4, category),
+        start_time = COALESCE($5, start_time), end_time = COALESCE($6, end_time),
+        all_day = COALESCE($7, all_day), color = COALESCE($8, color),
+        metadata = COALESCE($9, metadata)
+       WHERE id = $10 RETURNING *`,
+      [title, description, type, category, start_time, end_time, all_day, color, metadata || null, req.params.id]
+    )
+    if (rows.length === 0) return res.status(404).json({ error: 'Event not found' })
+    res.json({ event: rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.delete('/api/calendar/:id', async (req, res) => {
+  try {
+    await query('DELETE FROM calendar_events WHERE id = $1', [req.params.id])
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================
+// MEMORY — Agent knowledge/context browser
+// ============================================
+app.get('/api/agents/:agentId/memory', async (req, res) => {
+  try {
+    const { category } = req.query
+    let sql = 'SELECT * FROM agent_memory WHERE agent_id = $1'
+    const params = [req.params.agentId]
+
+    if (category) {
+      sql += ' AND category = $2'
+      params.push(category)
+    }
+
+    sql += ' ORDER BY pinned DESC, updated_at DESC'
+    const { rows } = await query(sql, params)
+    res.json({ memories: rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/agents/:agentId/memory', async (req, res) => {
+  try {
+    const { category, title, content, metadata, pinned } = req.body
+    if (!content) return res.status(400).json({ error: 'content required' })
+
+    const { rows } = await query(
+      `INSERT INTO agent_memory (agent_id, category, title, content, metadata, pinned)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.params.agentId, category || 'general', title || null, content, metadata || {}, pinned || false]
+    )
+    res.status(201).json({ memory: rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.put('/api/agents/:agentId/memory/:memId', async (req, res) => {
+  try {
+    const { category, title, content, metadata, pinned } = req.body
+    const { rows } = await query(
+      `UPDATE agent_memory SET
+        category = COALESCE($1, category), title = COALESCE($2, title),
+        content = COALESCE($3, content), metadata = COALESCE($4, metadata),
+        pinned = COALESCE($5, pinned), updated_at = NOW()
+       WHERE id = $6 AND agent_id = $7 RETURNING *`,
+      [category, title, content, metadata, pinned, req.params.memId, req.params.agentId]
+    )
+    if (rows.length === 0) return res.status(404).json({ error: 'Memory not found' })
+    res.json({ memory: rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.delete('/api/agents/:agentId/memory/:memId', async (req, res) => {
+  try {
+    await query('DELETE FROM agent_memory WHERE id = $1 AND agent_id = $2', [req.params.memId, req.params.agentId])
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================
 // AGENTS — Listar agentes
 // ============================================
 app.get('/api/agents', async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT id, name, role, department, personality, status, config 
+      `SELECT id, name, role, department, personality, status, config
        FROM agents ORDER BY (config->>'order')::int`
     );
     res.json(rows);

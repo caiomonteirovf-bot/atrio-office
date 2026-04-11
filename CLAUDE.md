@@ -229,3 +229,266 @@ atrio-office/
 8. Se algo trava 2x ou é urgente, Rodrigo escala para Caio
 9. Colaboradores humanos recebem tasks da mesma forma que agentes IA
 10. Theme: dark mode com identidade visual Átrio (#C4956A + #08080A)
+
+---
+
+## BLUEPRINT v2 — Evolução do Frontend (Abril 2026)
+
+Referência: tenacitOS (Mission Control do OpenClaw) — repo clonado em `../tenacitOS/` como referência de código.
+O tenacitOS é um dashboard de gestão de agentes IA com 18 módulos frontend (Next.js 16 + React 19 + Tailwind v4).
+Diretriz: **absorver features e patterns de UX do tenacitOS, reescrever na linguagem visual do Átrio**.
+
+### DNA Visual — O QUE NÃO MUDA
+
+Estes elementos são a assinatura da marca. NUNCA substituir por equivalentes do tenacitOS:
+
+| Elemento | Átrio (MANTER) | tenacitOS (NÃO USAR) |
+|----------|----------------|----------------------|
+| Accent | `#C4956A` Warm Gold | `#FF3B30` Red |
+| Background | `#08080A` Void | `#0C0C0C` Pure Black |
+| Surface | `#0f1117` / `#131620` (dark slate) | `#1A1A1A` / `#242424` (flat gray) |
+| Cards | Glassmorphism (blur 12px + gradientes alpha + noise texture) | Flat surfaces (cor sólida) |
+| Borders | Alpha-based `rgba(255,255,255,0.06)` | Fixed `#2A2A2A` |
+| Fontes body | Plus Jakarta Sans | Inter |
+| Fontes heading | Outfit | Sora |
+| Fontes mono | Space Grotesk | JetBrains Mono |
+| Animações | Gold-tinted (shimmer, glow-breathe, vista-sweep, pulse-glow) | Transitions simples 150ms |
+| Navegação | TopBar horizontal 52px com links textuais + gold underline | Dock lateral 68px com ícones |
+| Tema | Dark (padrão) + Light toggle | Dark only |
+
+### Design System — Tokens CSS
+
+```css
+/* Cores principais */
+--ao-gold: #C4956A;
+--ao-gold-dim: #C4956A66;
+--ao-void: #08080A;
+--ao-surface: #0f1117;
+--ao-card: #131620;
+--ao-card-hover: #161a24;
+
+/* Texto (alpha-based para transparência natural) */
+--ao-text-primary: rgba(255, 255, 255, 0.85);
+--ao-text-secondary: rgba(255, 255, 255, 0.6);
+--ao-text-muted: rgba(255, 255, 255, 0.5);
+--ao-text-dim: rgba(255, 255, 255, 0.35);
+
+/* Borders */
+--ao-border: rgba(255, 255, 255, 0.06);
+--ao-border-hover: rgba(255, 255, 255, 0.10);
+
+/* Glass card pattern (USAR em todas as cards) */
+.glass-card {
+  background: linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Status colors dos agentes */
+--working: #fbbf24 (amber);
+--blocked: #f87171 (red);
+--pending: #60a5fa (blue);
+--success: #22c55e (green);
+--standby: rgba(255,255,255,0.35);
+```
+
+### Features a Absorver do tenacitOS
+
+#### Fase 1 — Instrumentação do TopBar (~3-4 dias)
+Sem mudança no layout. Apenas adições na shell existente.
+
+1. **Busca Global (⌘K)** — Barra de busca no TopBar (centro-direita)
+   - Modal overlay com busca em conversas, tasks, clientes, agentes
+   - Atalho de teclado ⌘K / Ctrl+K
+   - Resultados categorizados com ícones por tipo
+   - Ref: `tenacitOS/src/components/GlobalSearch.tsx`
+
+2. **Central de Notificações** — Sino no TopBar com badge
+   - Dropdown 420px com cards de notificação
+   - Tipos: task_complete, escalation, prazo_fiscal, erro_servico
+   - Marca como lido, limpar lidos
+   - Requer: nova tabela `notifications` no banco + endpoint `/api/notifications`
+   - Ref: `tenacitOS/src/components/NotificationDropdown.tsx`
+
+3. **StatusBar (Health)** — Barra fixa no footer 32px
+   - Status de: WhatsApp, Omie API, Gesthub, Telegram, PostgreSQL
+   - Dots verde/vermelho + uptime + contagem de agentes online
+   - Polling a cada 30s no `/api/health`
+   - Dot pulsa com `glow-breathe` gold quando serviço cai
+   - Ref: `tenacitOS/src/components/TenacitOS/StatusBar.tsx`
+
+#### Fase 2 — Visibilidade Operacional (~4-5 dias)
+Novos componentes dentro do layout existente.
+
+4. **Activity Heatmap** — Embaixo do ActivityFeed
+   - Grid 52 semanas × 7 dias (estilo GitHub contributions)
+   - Escala de cor: gold-pale → gold saturado (NÃO vermelho como tenacitOS)
+   - Tooltip com contagem de atividades por dia
+   - Ref: `tenacitOS/src/components/ActivityHeatmap.tsx`
+
+5. **Cron Manager Visual** — Nova página acessível via TopBar
+   - Cards para cada scheduler (Omie sync, Gesthub sync, relatório diário, health check)
+   - Cada card: nome, schedule (monospace), status, última run, próxima run
+   - Botões: play/pause, run now, ver histórico inline
+   - Timeline semanal com blocos coloridos
+   - Requer: endpoints `/api/crons` (GET, PUT, POST /trigger)
+   - Ref: `tenacitOS/src/components/CronJobCard.tsx`, `CronWeeklyTimeline.tsx`
+
+6. **Analytics / Custos IA** — Nova página acessível via TopBar
+   - KPI cards: custo hoje, custo mês, projetado, orçamento
+   - Chart.js: trend line diário (gold), breakdown por agente (bar)
+   - Requer: nova tabela `token_usage` (agent_id, tokens_in, tokens_out, cost, timestamp)
+   - Ref: `tenacitOS/src/app/(dashboard)/costs/page.tsx`
+
+#### Fase 3 — Gestão Avançada (~5-7 dias)
+Novas páginas e funcionalidades de gestão.
+
+7. **Histórico de Sessões** — Todas as conversas com filtros
+   - Filtro por tipo (chat, task, cron), agente, cliente, data
+   - Token usage por sessão
+   - Ref: `tenacitOS/src/app/(dashboard)/sessions/page.tsx`
+
+8. **Calendário Semanal** — Prazos fiscais + tasks agendadas
+   - Grade 7 dias × horário (6h-22h)
+   - Cards coloridos por tipo (fiscal, financeiro, societário)
+   - Ref: `tenacitOS/src/components/WeeklyCalendar.tsx`
+
+9. **Memory Browser** — Contexto/memória dos agentes
+   - Navegar e editar o que cada agente "sabe"
+   - Markdown editor/preview
+   - Ref: `tenacitOS/src/app/(dashboard)/memory/page.tsx`
+
+#### Fase 4 — Avaliar (Pós Fase 3)
+
+10. **Migração Next.js** — Só se o projeto crescer além de 5-6 páginas
+    - Sai React+Vite, entra Next.js com App Router
+    - SSR, API routes integradas, middleware de auth nativo
+    - Muda deploy: PM2 ou container Node (não mais static build)
+    - Decisão: avaliar após implementar fases 1-3
+
+### O QUE NÃO ABSORVER do tenacitOS
+
+- **Sidebar Dock lateral** — TopBar horizontal é assinatura Átrio
+- **Red accent (#FF3B30)** — Comunica urgência/dev tool, não premium
+- **Flat surfaces sem blur** — Glassmorphism é diferencial visual
+- **Inter / Sora / JetBrains Mono** — Manter fontes premium Átrio
+- **SQLite** — Já temos PostgreSQL
+- **Terminal embutido** — Feature de dev, não de CEO/contador
+- **Git Dashboard** — Irrelevante para contexto contábil
+- **Skills Manager** — Tools já gerenciados pelo backend
+- **Office 3D (Three.js)** — Já temos 2D canvas. 3D é fase futura de branding
+- **Pixel art themes** (Habbo, Stardew, Zelda) — Desnecessário
+
+### Referência de código do tenacitOS
+
+Repo local: `../tenacitOS/` (clonado de github.com/caiomonteirovf-bot/tenacitOS)
+
+Componentes-chave para consulta:
+```
+tenacitOS/src/components/
+├── GlobalSearch.tsx          → Busca ⌘K
+├── NotificationDropdown.tsx  → Sino + dropdown
+├── ActivityHeatmap.tsx       → Heatmap GitHub-style
+├── CronJobCard.tsx           → Card de cron job
+├── CronWeeklyTimeline.tsx    → Timeline semanal
+├── WeeklyCalendar.tsx        → Calendário 7 dias
+├── StatsCard.tsx             → KPI cards
+├── ActivityFeed.tsx          → Feed de atividades
+├── IntegrationStatus.tsx     → Status de integrações
+├── SystemInfo.tsx            → Info do sistema
+├── TenacitOS/
+│   ├── Dock.tsx              → Sidebar (NÃO USAR layout, só ref de UX)
+│   ├── TopBar.tsx            → TopBar (ref de busca + notificações)
+│   └── StatusBar.tsx         → StatusBar footer (ABSORVER)
+└── Office3D/                 → 3D office (fase futura)
+
+tenacitOS/src/app/(dashboard)/
+├── page.tsx                  → Dashboard home
+├── costs/page.tsx            → Analytics de custos
+├── cron/page.tsx             → Cron manager
+├── activity/page.tsx         → Activity log + heatmap
+├── sessions/page.tsx         → Histórico de sessões
+├── memory/page.tsx           → Memory browser
+└── calendar/page.tsx         → Calendário semanal
+```
+
+### Novas tabelas necessárias (PostgreSQL)
+
+```sql
+-- Notificações (Fase 1)
+CREATE TABLE notifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  type VARCHAR(50) NOT NULL, -- task_complete, escalation, prazo_fiscal, erro_servico
+  title TEXT NOT NULL,
+  message TEXT,
+  severity VARCHAR(20) DEFAULT 'info', -- info, warning, error, success
+  read BOOLEAN DEFAULT FALSE,
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Token usage / custos IA (Fase 2)
+CREATE TABLE token_usage (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID REFERENCES agents(id),
+  conversation_id UUID REFERENCES conversations(id),
+  tokens_input INTEGER DEFAULT 0,
+  tokens_output INTEGER DEFAULT 0,
+  model VARCHAR(100),
+  cost_usd DECIMAL(10,6) DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Cron jobs registry (Fase 2)
+CREATE TABLE cron_jobs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(100) NOT NULL,
+  description TEXT,
+  schedule VARCHAR(50) NOT NULL, -- cron expression
+  status VARCHAR(20) DEFAULT 'active', -- active, paused, failed
+  last_run TIMESTAMPTZ,
+  next_run TIMESTAMPTZ,
+  last_result VARCHAR(20), -- success, error
+  last_error TEXT,
+  run_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Cron run history (Fase 2)
+CREATE TABLE cron_runs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  cron_job_id UUID REFERENCES cron_jobs(id),
+  status VARCHAR(20) NOT NULL, -- success, error
+  duration_ms INTEGER,
+  output TEXT,
+  error TEXT,
+  started_at TIMESTAMPTZ DEFAULT NOW(),
+  finished_at TIMESTAMPTZ
+);
+```
+
+### Novos endpoints necessários
+
+```
+# Fase 1
+GET    /api/notifications         → Lista notificações (filtro: unread)
+PATCH  /api/notifications/:id     → Marca como lida
+DELETE /api/notifications/read    → Limpa lidas
+GET    /api/health                → Health de todos os serviços (já existe, expandir)
+
+# Fase 2
+GET    /api/crons                 → Lista cron jobs com status
+PUT    /api/crons/:id             → Toggle pause/active
+POST   /api/crons/:id/trigger     → Executa cron manualmente
+GET    /api/crons/:id/runs        → Histórico de runs
+GET    /api/analytics/costs       → Custos por período/agente
+GET    /api/analytics/activity    → Activity stats + heatmap data
+
+# Fase 3
+GET    /api/sessions              → Histórico de sessões com filtros
+GET    /api/calendar              → Tasks + prazos por semana
+GET    /api/agents/:id/memory     → Memória/contexto do agente
+PUT    /api/agents/:id/memory     → Editar memória
+```

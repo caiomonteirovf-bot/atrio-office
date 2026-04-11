@@ -1,5 +1,6 @@
 import { useState, useEffect, useContext } from 'react'
 import { ThemeContext } from '../App'
+import NotificationDropdown from './NotificationDropdown'
 
 const LINKS = [
   { label: 'Escritorio', type: 'internal', id: 'home' },
@@ -9,7 +10,7 @@ const LINKS = [
   { label: 'Relatorio', type: 'action', id: 'relatorio' },
 ]
 
-export default function TopBar({ agents, connected, onAction }) {
+export default function TopBar({ agents, connected, onAction, onSearchOpen }) {
   const { theme, toggle: toggleTheme } = useContext(ThemeContext)
   const [time, setTime] = useState(new Date())
 
@@ -78,7 +79,27 @@ export default function TopBar({ agents, connected, onAction }) {
       </div>
 
       {/* Right side */}
-      <div className="flex items-center gap-5 px-5 h-full" style={{ borderLeft: `1px solid var(--ao-border)` }}>
+      <div className="flex items-center gap-3 px-5 h-full" style={{ borderLeft: `1px solid var(--ao-border)` }}>
+        {/* Search button */}
+        <button
+          onClick={onSearchOpen}
+          title="Busca global (Ctrl+K)"
+          className="flex items-center gap-2 h-8 px-3 rounded-lg transition-all duration-200 cursor-pointer"
+          style={{
+            background: 'var(--ao-input-bg)',
+            border: '1px solid var(--ao-border)',
+            color: 'var(--ao-text-dim)',
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <span className="text-[11px]" style={{ fontFamily: 'Space Grotesk', color: 'var(--ao-text-dim)' }}>Ctrl+K</span>
+        </button>
+
+        {/* Notifications */}
+        <NotificationDropdown />
+
         {/* Theme toggle */}
         <button
           onClick={toggleTheme}

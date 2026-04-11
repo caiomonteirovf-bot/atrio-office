@@ -32,8 +32,86 @@ app.use(express.static(clientDist));
 // ============================================
 // HEALTH CHECK
 // ============================================
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'atrio-office', timestamp: new Date() });
+app.get('/api/health', async (req, res) => {
+  const services = {}
+
+  // PostgreSQL
+  try {
+    const start = Date.now()
+    await query('SELECT 1')
+    services.postgres = { status: 'ok', latency: Date.now() - start }
+  } catch (e) {
+    services.postgres = { status: 'error', error: e.message }
+  }
+
+  // WhatsApp
+  try {
+    const waStatus = whatsapp.getStatus()
+    services.whatsapp = { status: waStatus.connected ? 'ok' : 'disconnected', ...waStatus }
+  } catch (e) {
+    services.whatsapp = { status: 'unknown' }
+  }
+
+  // Agents count
+  try {
+    const { rows } = await query("SELECT status, COUNT(*) as count FROM agents GROUP BY status")
+    services.agents = { status: 'ok', breakdown: rows }
+  } catch (e) {
+    services.agents = { status: 'error' }
+  }
+
+  const allOk = Object.values(services).every(s => s.status === 'ok')
+  res.json({
+    status: allOk ? 'ok' : 'degraded',
+    service: 'atrio-office',
+    timestamp: new Date(),
+    services
+  })
+});
+
+// ============================================
+// NOTIFICATIONS — Central de notificações
+// ============================================
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const unreadOnly = req.query.unread === 'true'
+    const limit = parseInt(req.query.limit) || 50
+    let sql = 'SELECT * FROM notifications'
+    if (unreadOnly) sql += ' WHERE read = false'
+    sql += ' ORDER BY created_at DESC LIMIT $1'
+    const { rows } = await query(sql, [limit])
+    const countResult = await query('SELECT COUNT(*) FROM notifications WHERE read = false')
+    res.json({ notifications: rows, unreadCount: parseInt(countResult.rows[0].count) })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.patch('/api/notifications/read-all', async (req, res) => {
+  try {
+    await query('UPDATE notifications SET read = true WHERE read = false')
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.patch('/api/notifications/:id', async (req, res) => {
+  try {
+    await query('UPDATE notifications SET read = true WHERE id = $1', [req.params.id])
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.delete('/api/notifications/read', async (req, res) => {
+  try {
+    await query('DELETE FROM notifications WHERE read = true')
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
 });
 
 // ============================================

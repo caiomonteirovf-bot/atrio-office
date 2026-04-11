@@ -8,6 +8,8 @@ import ActivityFeed from './components/ActivityFeed'
 import StatsBar from './components/StatsBar'
 import AttendanceQueue from './components/AttendanceQueue'
 import AgentChat from './components/AgentChat'
+import GlobalSearch from './components/GlobalSearch'
+import StatusBar from './components/StatusBar'
 import PortalLogin from './portal/PortalLogin'
 import PortalDashboard from './portal/PortalDashboard'
 
@@ -36,6 +38,19 @@ function AdminDashboard() {
     }
   }, [lastMessage, refresh])
   const [selectedAgent, setSelectedAgent] = useState(null)
+  const [searchOpen, setSearchOpen] = useState(false)
+
+  // Global search shortcut (Cmd+K / Ctrl+K)
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        setSearchOpen(s => !s)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
   const [reportLoading, setReportLoading] = useState(false)
   const [reportData, setReportData] = useState(null)
   const [reportError, setReportError] = useState('')
@@ -64,7 +79,7 @@ function AdminDashboard() {
   return (
     <div className="flex h-screen overflow-hidden" style={{ background: 'var(--ao-bg)', color: 'var(--ao-text)', transition: 'background 0.3s, color 0.3s' }}>
       <div className="flex-1 flex flex-col overflow-hidden">
-        <TopBar agents={agents} connected={connected} onAction={handleAction} />
+        <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} />
 
         {/* Main content: two-column layout */}
         <div className="flex-1 flex overflow-hidden">
@@ -108,6 +123,9 @@ function AdminDashboard() {
           </div>
         </div>
       </div>
+
+      <GlobalSearch isOpen={searchOpen} onClose={() => setSearchOpen(false)} />
+      <StatusBar />
 
       {/* Chat Panel overlay when agent is selected */}
       {selectedAgent && (

@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth, MessageMedia } = pkg;
 import qrcode from 'qrcode';
@@ -6,6 +8,7 @@ import { analyzeSentiment, analyzeConversation, registerNPS, classifyDemand } fr
 import { addAnalysis } from './daily-report.js';
 import { query } from '../db/pool.js';
 import { findClientByPhone } from './gesthub.js';
+import { createNotification } from './notifications.js';
 
 // ============================================
 // ESTADO
@@ -173,15 +176,41 @@ const GREETING_DELAY_MS = 30 * 1000; // 30 segundos
 const URGENTE_KEYWORDS = ['urgente', 'urgência', 'urgencia', 'emergencia', 'emergência'];
 
 // Detecção de solicitação de NFS-e
-const NFSE_KEYWORDS = [
-  'nota fiscal', 'nota de serviço', 'nfs-e', 'nfse', 'emitir nota',
-  'emissão de nota', 'emissao de nota', 'preciso da nota', 'minha nota',
-  'nota do mês', 'nota do mes', 'enviar nota', 'gerar nota',
+// Termos que sozinhos já indicam NFS-e
+const NFSE_EXACT = ['nfs-e', 'nfse', 'nota fiscal', 'nota de serviço', 'nota de servico', 'nota de serviços', 'nota de servicos'];
+
+// Siglas isoladas (match por word boundary)
+const NFSE_SIGLAS = ['nf', 'nfs'];
+
+// Variações de "nota" que o cliente pode usar
+const NOTA_VARIANTS = ['nota', 'notas'];
+
+// Verbos de ação que combinados com "nota" indicam emissão
+const NFSE_VERBS = [
+  'emitir', 'emite', 'emissão', 'emissao', 'gerar', 'gere',
+  'fazer', 'faz', 'faça', 'faca', 'tirar', 'tira', 'tire',
+  'enviar', 'envia', 'envie', 'mandar', 'manda', 'mande',
+  'preciso', 'precisar', 'precisando', 'quero', 'queria',
+  'solicitar', 'solicito', 'pedir', 'peço', 'peco',
+  'cadê', 'cade', 'onde', 'minha', 'minhas',
 ];
 
 function isNfseRequest(text) {
-  const lower = (text || '').toLowerCase();
-  return NFSE_KEYWORDS.some(k => lower.includes(k));
+  const lower = (text || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const lowerOriginal = (text || '').toLowerCase();
+
+  // Match exato (termos que sozinhos já indicam NFS-e)
+  if (NFSE_EXACT.some(k => lowerOriginal.includes(k))) return true;
+
+  // Siglas isoladas: "NF", "NFS" (word boundary para não pegar "informação", "conforto")
+  if (NFSE_SIGLAS.some(s => new RegExp(`\\b${s}\\b`, 'i').test(lowerOriginal))) return true;
+
+  // Match combinado: "nota" + verbo de ação (com até 5 palavras de distância)
+  const hasNota = NOTA_VARIANTS.some(n => lowerOriginal.includes(n));
+  if (!hasNota) return false;
+
+  const hasVerb = NFSE_VERBS.some(v => lower.includes(v) || lowerOriginal.includes(v));
+  return hasVerb;
 }
 
 // ============================================
@@ -345,6 +374,13 @@ export async function initialize() {
   if (client) return;
   log('Inicializando...');
 
+  // Limpar lock files do Chromium que podem travar entre restarts
+  const sessionDir = './whatsapp-session/session';
+  for (const lockFile of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    const lockPath = path.join(sessionDir, lockFile);
+    try { fs.unlinkSync(lockPath); } catch {}
+  }
+
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: './whatsapp-session' }),
     puppeteer: {
@@ -393,6 +429,15 @@ export async function initialize() {
     log(`Desconectado: ${reason}`);
     isReady = false;
     broadcastFn?.({ type: 'whatsapp_disconnected' });
+
+    // Notification: WhatsApp desconectado
+    createNotification({
+      type: 'erro_servico',
+      title: 'WhatsApp desconectado',
+      message: `WhatsApp desconectou: ${reason || 'motivo desconhecido'}`,
+      severity: 'error',
+      metadata: { service: 'whatsapp', reason },
+    }).catch(() => {});
   });
 
   // Humano respondeu (via WhatsApp Web, celular)
@@ -472,6 +517,15 @@ async function handleIncoming(msg) {
     receivedAt: new Date().toISOString(),
   });
 
+  // Notification: nova mensagem WhatsApp
+  createNotification({
+    type: 'whatsapp_message',
+    title: 'Nova mensagem WhatsApp',
+    message: `${name}: ${body.substring(0, 120)}`,
+    severity: 'info',
+    metadata: { phone, name, preview: body.substring(0, 200) },
+  }).catch(() => {});
+
   // Análise de sentimento em background (só dashboard + Telegram se crítico)
   analyzeSentiment(body).then(analysis => {
     if (!analysis) return;
@@ -520,6 +574,7 @@ async function handleIncoming(msg) {
 
     // Detecta solicitação de NFS-e
     if (isNfseRequest(body)) {
+      conv.classified = true; // já sabemos que é fiscal, evita classificação duplicada
       await handleNfseRequest(from, phone, name, body, conv);
     }
 
@@ -574,8 +629,8 @@ async function handleIncoming(msg) {
     }, GREETING_DELAY_MS);
   }
 
-  // Chat: Luna recebeu nova mensagem
-  chat({ from: 'Luna', text: `Nova mensagem de ${name}: "${body.substring(0, 60)}${body.length > 60 ? '...' : ''}"`, tag: 'whatsapp' });
+  // Notificação no chat da equipe: nova mensagem recebida
+  chat({ from: 'Luna', text: `📩 Nova mensagem de *${name}*: "${body.substring(0, 60)}${body.length > 60 ? '...' : ''}"`, tag: 'whatsapp' });
 
   // Notifica dashboard imediatamente
   broadcastFn?.({ type: 'whatsapp_new_contact', phone, name, body: body.substring(0, 150) });
@@ -628,9 +683,8 @@ function scheduleClassification(phone, chatId, name, conv) {
       log(`Classificação ${name}: ${classification.classificacao} → ${classification.atendente_sugerido} (${classification.resumo})`);
       broadcastFn?.({ type: 'whatsapp_classification', phone, name, classification });
 
-      // Chat: Luna classifica e roteia
-      chat({ from: 'Luna', to: 'Rodrigo', text: `Classifiquei a demanda de ${name}: *${classification.classificacao}*. Sugiro encaminhar para ${classification.atendente_sugerido}.${classification.resumo ? ` Resumo: ${classification.resumo}` : ''}`, tag: classification.classificacao });
-      chat({ from: 'Rodrigo', text: `Certo, Luna. Vou direcionar para o setor adequado.` });
+      // Notificação no chat: classificação feita
+      chat({ from: 'Luna', text: `🏷️ *${name}* classificado: *${classification.classificacao}* → ${classification.atendente_sugerido}${classification.resumo ? `. ${classification.resumo}` : ''}`, tag: classification.classificacao });
 
       // UMA mensagem no grupo com tudo
       const displayPhone = conv.displayPhone || phone;
@@ -676,15 +730,24 @@ async function sendGreeting(chatId, name, conv) {
     message = `${greeting}, ${firstName}! Sou a Luna, assistente virtual do Átrio Contabilidade 😊\nRecebi sua mensagem. No momento estamos fora do horário de atendimento, mas assim que a equipe retornar daremos continuidade ao seu atendimento.\n\nSe for algo urgente, responda *URGENTE* ou entre em contato pelo ${CONTACT_PHONE} 🔔`;
   }
 
-  try {
-    await botSend(chatId, LUNA_HEADER + message);
-    conv.outsideHours = !horario.open;
-    dbUpdateConversation(normalizePhone(chatId), { greeted: true, outside_hours: conv.outsideHours });
-    dbSaveMessage(conv, 'luna', message);
-    dbLogMetric('Luna', 'greeting_sent', { name, outsideHours: conv.outsideHours });
-    log(`Greeting enviado para ${name}${!horario.open ? ` (${horario.reason})` : ''}`);
-  } catch (err) {
-    log(`ERRO greeting ${name}: ${err.message}`);
+  // Retry: WhatsApp pode estar reconectando quando o timer dispara
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await botSend(chatId, LUNA_HEADER + message);
+      conv.outsideHours = !horario.open;
+      dbUpdateConversation(normalizePhone(chatId), { greeted: true, outside_hours: conv.outsideHours });
+      dbSaveMessage(conv, 'luna', message);
+      dbLogMetric('Luna', 'greeting_sent', { name, outsideHours: conv.outsideHours });
+      log(`Greeting enviado para ${name}${!horario.open ? ` (${horario.reason})` : ''}`);
+      return;
+    } catch (err) {
+      if (attempt < 2 && (err.message.includes('não conectado') || err.message.includes('undefined'))) {
+        log(`Greeting ${name}: tentativa ${attempt + 1} falhou (${err.message}), aguardando reconexão...`);
+        await new Promise(r => setTimeout(r, 5000)); // espera 5s e tenta de novo
+      } else {
+        log(`ERRO greeting ${name}: ${err.message}`);
+      }
+    }
   }
 }
 
@@ -699,7 +762,17 @@ async function handleUrgent(chatId, phone, name, body) {
   await notifyAll(alertMsg);
 
   try {
-    const urgentReply = `${firstName}, entendido! Já estamos acionando um colaborador para atender sua solicitação com prioridade. Se preferir, entre em contato diretamente pelo ${CONTACT_PHONE} 🔔`;
+    const horario = isHorarioComercial();
+    let urgentReply;
+    if (!horario.open) {
+      const motivo = horario.reason === 'final de semana' ? 'final de semana'
+        : horario.reason === 'feriado' ? 'feriado'
+        : horario.reason === 'horário de almoço' ? 'horário de almoço'
+        : 'fora do horário de expediente';
+      urgentReply = `${firstName}, entendido! Recebemos sua solicitação de urgência. No momento estamos com atendimento limitado por ser ${motivo}, mas sua mensagem já foi sinalizada internamente com prioridade.\n\nPoderia nos detalhar brevemente o que está precisando? Assim que um colaborador estiver disponível, seu caso será o primeiro a ser atendido.\n\nSe for algo que não pode esperar, entre em contato diretamente pelo ${CONTACT_PHONE} 🔔`;
+    } else {
+      urgentReply = `${firstName}, entendido! Recebemos sua solicitação e um colaborador já está sendo acionado para atendê-lo com prioridade.\n\nPara agilizar, poderia nos detalhar brevemente o que está precisando? Assim conseguimos direcionar da melhor forma possível.\n\nSe preferir, entre em contato diretamente pelo ${CONTACT_PHONE} 🔔`;
+    }
     await botSend(chatId, LUNA_HEADER + urgentReply);
     const conv = conversations.get(phone);
     if (conv) dbSaveMessage(conv, 'luna', urgentReply);
@@ -775,7 +848,7 @@ async function handleNfseRequest(chatId, phone, name, body, conv) {
   if (missing.length < 2) {
     msg = `${firstName}, recebi parte dos dados! Ainda preciso do ${missing.join(' e ')} para prosseguir com a emissão 😊`;
   } else {
-    msg = `${firstName}, para emitir a nota fiscal preciso de algumas informações sobre o *tomador* (para quem é a nota):\n\n1️⃣ *CPF ou CNPJ* do tomador\n2️⃣ *Valor do serviço*\n3️⃣ *Descrição do serviço prestado*\n\nPode me enviar? 😊`;
+    msg = `${firstName}, para emitir a nota fiscal preciso de algumas informações sobre o *tomador* (para quem é a nota):\n\n1️⃣ *CPF ou CNPJ* do tomador\n2️⃣ *Valor do serviço*\n3️⃣ *Descrição do serviço prestado* (opcional)\n\nPode me enviar? 😊`;
   }
 
   try {
@@ -855,6 +928,15 @@ function extractValor(text) {
     || text.match(/\b\d{3,}\b/); // número solto >= 100
 }
 
+function extractCep(text) {
+  // CEP brasileiro: 5 dígitos + hífen opcional + 3 dígitos (ex: 50030-230, 50030230)
+  const match = text.match(/\b(\d{5})-?(\d{3})\b/);
+  if (!match) return null;
+  const cep = match[1] + match[2];
+  if (cep === '00000000') return null;
+  return cep;
+}
+
 // Processa respostas do cliente durante coleta de NFS-e
 async function handleNfseDataCollection(chatId, phone, name, body, conv) {
   if (!conv.nfseData || conv.nfseTaskCreated) return false;
@@ -868,8 +950,9 @@ async function handleNfseDataCollection(chatId, phone, name, body, conv) {
 
   const cpfCnpj = extractCpfCnpj(allText);
   const valor = extractValor(allText);
+  const cep = extractCep(allText);
 
-  // Se tem CPF/CNPJ + valor, consideramos dados suficientes
+  // Se tem CPF/CNPJ + valor, dados completos (CEP é opcional)
   if (cpfCnpj && valor) {
     conv.nfseTaskCreated = true;
 
@@ -895,8 +978,8 @@ async function handleNfseDataCollection(chatId, phone, name, body, conv) {
     return true;
   }
 
-  // Após muitas tentativas (4+), cria task com o que tem e deixa fiscal resolver
-  if (conv.nfseData.respostas.length >= 4) {
+  // Após muitas tentativas (3+), cria task com o que tem e deixa fiscal resolver
+  if (conv.nfseData.respostas.length >= 3) {
     conv.nfseTaskCreated = true;
 
     try {
@@ -991,17 +1074,11 @@ async function createNfseTask(chatId, phone, name, conv) {
       }
     }
 
-    // Se realmente nenhum membro fiscal existe, notifica equipe e avisa cliente sobre atraso
+    // Se realmente nenhum membro fiscal existe, notifica equipe (NÃO envia ao cliente — já recebeu confirmação)
     if (!fiscalRows.length && !lunaRows.length) {
-      const alertMsg = `🚫 *NFS-e sem responsável*\n\nCliente ${name} solicitou NFS-e mas nenhum membro fiscal (Campelo/Deyvison) foi encontrado no sistema.\nTask não pôde ser criada.`;
+      const alertMsg = `🚫 *NFS-e sem responsável*\n\nCliente ${name} solicitou NFS-e mas nenhum membro fiscal (Campelo/Deyvison) foi encontrado no sistema.\nTask não pôde ser criada. Verificar seed do banco.`;
       telegram.sendAlert(alertMsg.replace(/\*/g, ''));
       try { await sendAlertToGroup(alertMsg); } catch {}
-      const firstName = (name || '').split(' ')[0];
-      try {
-        const delayMsg = `${firstName}, recebemos sua solicitação de nota fiscal. Nosso setor fiscal está com um volume elevado no momento, mas já encaminhamos internamente. Em breve daremos retorno 😊`;
-        await botSend(chatId, LUNA_HEADER + delayMsg);
-        dbSaveMessage(conv, 'luna', delayMsg);
-      } catch {}
       return;
     }
 
@@ -1013,6 +1090,7 @@ async function createNfseTask(chatId, phone, name, conv) {
     const allText = conv.nfseData.respostas?.join('\n') || '';
     const parsedCpfCnpj = extractCpfCnpj(allText);
     const parsedValor = extractValor(allText);
+    const parsedCep = extractCep(allText);
     // Tenta extrair descrição (texto que não é número/documento)
     const descricaoMatch = allText.match(/(?:servi[çc]o|descri[çc][aã]o)\s*[:=-]?\s*(.+)/i);
     const parsedDescricao = descricaoMatch?.[1]?.trim() || '';
@@ -1040,6 +1118,7 @@ ${prestadorInfo ? `\nEMPRESA EMISSORA (do Gesthub): ${prestadorNome} — CNPJ: $
             tomador_tipo_doc: parsedCpfCnpj?.[0] ? (parsedCpfCnpj[0].replace(/\D/g, '').length === 11 ? 'CPF' : 'CNPJ') : null,
             valor: parsedValor?.[0]?.replace(/[^\d.,]/g, '').replace(',', '.') || null,
             descricao: parsedDescricao || null,
+            cep_tomador: parsedCep || null,
             prestador_cnpj: prestadorCnpj || null,
             prestador_nome: prestadorNome || null,
           },
@@ -1061,9 +1140,8 @@ ${prestadorInfo ? `\nEMPRESA EMISSORA (do Gesthub): ${prestadorNome} — CNPJ: $
 
     telegram.sendAlert(`📄 Task NFS-e #${taskId.substring(0, 8)} — ${name}${prestadorInfo ? ` (${prestadorNome})` : ' — empresa não identificada'}`);
 
-    // Chat: Luna encaminha NFS-e para Campelo via Rodrigo
-    chat({ from: 'Luna', to: 'Rodrigo', text: `Coletei os dados de NFS-e de ${name}${prestadorInfo ? ` (${prestadorNome})` : ''}. Task criada para o Campelo.`, tag: 'nfs-e' });
-    chat({ from: 'Rodrigo', to: 'Campelo', text: `Campelo, temos uma solicitação de NFS-e. Prioridade: ${prestadorInfo ? 'dados completos' : '⚠️ empresa não identificada'}.` });
+    // Notificação no chat: task NFS-e criada
+    chat({ from: 'Luna', text: `📄 NFS-e solicitada por *${name}*${prestadorInfo ? ` (${prestadorNome})` : ''}. Task criada → Campelo.`, tag: 'nfs-e' });
 
     if (onTaskCreatedFn) {
       setTimeout(() => onTaskCreatedFn(taskId), 500);
@@ -1164,10 +1242,11 @@ async function routeDemandToAgent(phone, name, chatId, body, conv, classificatio
 
     // Notifica Telegram + chat inter-agentes
     telegram.sendAlert(`${route.emoji} Task #${taskId.substring(0, 8)} — ${route.label} — ${name} → ${route.agent} (IA) / ${humanResponsavel} (revisão)`);
-    chat({ from: 'Rodrigo', to: route.agent, text: `${route.agent}, nova demanda de ${name}: "${classification.resumo}". Prioridade: ${classification.prioridade}.`, tag: tipo });
+    // Notificação no chat: demanda roteada
+    chat({ from: 'Luna', text: `${route.emoji} Demanda de *${name}* roteada → *${route.agent}* (${route.label})`, tag: tipo });
 
     dbLogMetric('Luna', 'demand_routed', { phone, name, tipo, taskId, agent: route.agent, human: humanResponsavel });
-    log(`Task criada: ${route.label} → ${executorLabel} / revisa: ${humanResponsavel} (${taskId.substring(0, 8)}) para ${name}`);
+    log(`Task criada: ${route.label} → ${route.agent} / revisa: ${humanResponsavel} (${taskId.substring(0, 8)}) para ${name}`);
 
   } catch (err) {
     log(`ERRO routeDemand: ${err.message}`);

@@ -9,6 +9,7 @@ import { query } from './db/pool.js';
 import { chatWithAgent, extractText } from './services/claude.js';
 import { executeToolCall, setOnTaskCreated } from './tools/registry.js';
 import { processTask, processPendingTasks, setBroadcast, setLogChat } from './services/orchestrator.js';
+import { createNotification } from './services/notifications.js';
 
 dotenv.config();
 
@@ -192,22 +193,17 @@ app.post('/api/crons/:id/trigger', async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: 'Cron job not found' })
 
     const cron = rows[0]
-    const startedAt = new Date()
 
-    // Record the run
-    await query(
-      `INSERT INTO cron_runs (cron_job_id, status, started_at, finished_at, duration_ms, output)
-       VALUES ($1, 'success', $2, NOW(), $3, $4)`,
-      [cron.id, startedAt, Date.now() - startedAt.getTime(), `Manual trigger: ${cron.name}`]
-    )
+    // Actually execute the handler via cronScheduler
+    const result = await executeCronJob(cron)
 
-    // Update cron job stats
-    await query(
-      `UPDATE cron_jobs SET last_run = NOW(), last_result = 'success', run_count = run_count + 1 WHERE id = $1`,
-      [cron.id]
-    )
-
-    res.json({ ok: true, message: `Cron "${cron.name}" triggered` })
+    res.json({
+      ok: result.success,
+      message: `Cron "${cron.name}" triggered`,
+      duration_ms: result.duration,
+      output: result.success ? result.output : undefined,
+      error: result.success ? undefined : result.error
+    })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -693,7 +689,19 @@ app.post('/api/tasks', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
       [title, description, assigned_to, delegated_by, client_id, priority || 'medium', due_date]
     );
-    res.status(201).json(rows[0]);
+    const newTask = rows[0];
+
+    // Notification: nova tarefa criada
+    createNotification({
+      type: 'task_created',
+      title: 'Nova tarefa criada',
+      message: newTask.title,
+      severity: 'info',
+      taskId: newTask.id,
+      metadata: { priority: newTask.priority, assigned_to },
+    }).catch(() => {});
+
+    res.status(201).json(newTask);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -722,6 +730,15 @@ app.patch('/api/tasks/:id', async (req, res) => {
     // Hook: Task concluída → broadcast para dashboard
     if (status === 'done') {
       broadcast({ type: 'task_completed', task });
+
+      // Notification: tarefa concluída via API
+      createNotification({
+        type: 'task_complete',
+        title: 'Tarefa concluída',
+        message: task.title,
+        severity: 'success',
+        taskId: task.id,
+      }).catch(() => {});
     }
 
     broadcast({ type: 'task_updated', task });
@@ -982,8 +999,11 @@ export function broadcast(data) {
 // ============================================
 import * as whatsapp from './services/whatsapp.js';
 import * as telegram from './services/telegram.js';
+import * as omie from './services/omie.js';
 import { scheduleDailyReport, generateDailyReport } from './services/daily-report.js';
 import * as scheduler from './services/scheduler.js';
+import { startCronScheduler, registerCronHandler, executeCronJob, getCronHandler } from './services/cronScheduler.js';
+import { checkInadimplencia, checkContasPagar, checkSemHonorario, checkAlertasFiscais, checkDadosIncompletos } from './services/scheduler.js';
 
 app.get('/api/whatsapp/status', (req, res) => {
   res.json(whatsapp.getStatus());
@@ -1181,6 +1201,50 @@ server.listen(PORT, () => {
 
   // Inicia scheduler (verificações automáticas às 8h)
   scheduler.start();
+
+  // ============================================
+  // CRON SCHEDULER — Register handlers and start
+  // ============================================
+  registerCronHandler('health_check', async () => {
+    const start = Date.now()
+    await query('SELECT 1')
+    const dbLatency = Date.now() - start
+    const waStatus = whatsapp.getStatus()
+    const omieOk = omie.isConfigured() ? 'configured' : 'not configured'
+    return `Database OK (${dbLatency}ms), WhatsApp: ${waStatus.connected ? 'connected' : 'disconnected'}, Omie: ${omieOk}`
+  })
+
+  registerCronHandler('omie_sync', async () => {
+    if (!omie.isConfigured()) return 'Omie not configured — skipped'
+    const inadimplentes = await checkInadimplencia()
+    const contas = await checkContasPagar()
+    return `Omie sync: ${inadimplentes.length} inadimplentes, ${contas.length} contas a pagar`
+  })
+
+  registerCronHandler('gesthub_sync', async () => {
+    const clients = await gesthub.getClients()
+    const semHonorario = await checkSemHonorario()
+    const incompletos = await checkDadosIncompletos()
+    return `Gesthub sync: ${clients.length} clientes, ${semHonorario.length} sem honorario, ${incompletos.length} incompletos`
+  })
+
+  registerCronHandler('relatorio_diario', async () => {
+    const report = await generateDailyReport()
+    return report ? 'Relatorio diario gerado' : 'Nenhuma atividade para reportar'
+  })
+
+  registerCronHandler('backup_db', async () => {
+    return 'Backup placeholder (paused by default — configure pg_dump externally)'
+  })
+
+  registerCronHandler('limpeza_logs', async () => {
+    const msgs = await query("DELETE FROM messages WHERE created_at < NOW() - INTERVAL '90 days'")
+    const tasks = await query("DELETE FROM tasks WHERE status IN ('done', 'cancelled') AND completed_at < NOW() - INTERVAL '30 days'")
+    const runs = await query("DELETE FROM cron_runs WHERE started_at < NOW() - INTERVAL '90 days'")
+    return `Limpeza: ${msgs.rowCount || 0} mensagens, ${tasks.rowCount || 0} tasks, ${runs.rowCount || 0} cron runs removidos`
+  })
+
+  startCronScheduler().catch(err => console.error('[CRON] Failed to start:', err.message))
 
   console.log(`\n⬡ Átrio Office Server rodando na porta ${PORT}`);
   console.log(`  API: http://localhost:${PORT}/api`);

@@ -138,7 +138,7 @@ app.get('/api/analytics/activity', async (req, res) => {
       SELECT
         (SELECT COUNT(*) FROM tasks WHERE created_at::date = CURRENT_DATE) as tasks_today,
         (SELECT COUNT(*) FROM messages WHERE created_at::date = CURRENT_DATE) as messages_today,
-        (SELECT COUNT(*) FROM tasks WHERE status = 'completed' AND updated_at::date = CURRENT_DATE) as completed_today
+        (SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at::date = CURRENT_DATE) as completed_today
     `)
 
     res.json({
@@ -1004,6 +1004,7 @@ import { scheduleDailyReport, generateDailyReport } from './services/daily-repor
 import * as scheduler from './services/scheduler.js';
 import { startCronScheduler, registerCronHandler, executeCronJob, getCronHandler } from './services/cronScheduler.js';
 import { checkInadimplencia, checkContasPagar, checkSemHonorario, checkAlertasFiscais, checkDadosIncompletos } from './services/scheduler.js';
+import agentsRouter from './routes/agents.mjs';
 
 app.get('/api/whatsapp/status', (req, res) => {
   res.json(whatsapp.getStatus());
@@ -1122,6 +1123,224 @@ app.post('/api/whatsapp/reconnect', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
+// Luna v2 - Agents API
+// === MEMORY ROUTES ===
+// GET /api/memory - List all approved memories
+app.get('/api/memory', async (req, res) => {
+  try {
+    const { status = 'approved', agent, category, search, limit = 100 } = req.query;
+    let sql = `SELECT m.*, a.name as agent_name, a.role as agent_role 
+               FROM memories m 
+               LEFT JOIN agents a ON m.agent_id = a.id 
+               WHERE 1=1`;
+    const params = [];
+    
+    if (status && status !== 'all') { params.push(status); sql += ` AND m.status = $${params.length}::memory_status`; }
+    if (agent) { params.push(agent); sql += ` AND a.name ILIKE $${params.length}`; }
+    if (category) { params.push(category); sql += ` AND m.category = $${params.length}::memory_category`; }
+    if (search) { params.push(`%${search}%`); sql += ` AND (m.title ILIKE $${params.length} OR m.content ILIKE $${params.length} OR m.summary ILIKE $${params.length})`; }
+    
+    params.push(parseInt(limit));
+    sql += ` ORDER BY m.priority DESC, m.updated_at DESC LIMIT $${params.length}`;
+    
+    const result = await query(sql, params);
+    
+    // Stats
+    const stats = await query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE status = 'approved') as active,
+        COUNT(*) FILTER (WHERE status = 'draft' OR status = 'pending_review') as pending_review,
+        COUNT(*) as total
+      FROM memories
+    `);
+    
+    res.json({ 
+      memories: result.rows,
+      stats: stats.rows[0] || { active: 0, pending_review: 0, total: 0 }
+    });
+  } catch (error) {
+    console.error('[Memory] Erro ao listar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/memory/suggestions - List pending suggestions for review
+app.get('/api/memory/suggestions', async (req, res) => {
+  try {
+    const { status = 'pending', limit = 50 } = req.query;
+    const result = await query(
+      `SELECT ms.*, a.name as agent_name 
+       FROM memory_suggestions ms 
+       LEFT JOIN agents a ON ms.agent_id = a.id 
+       WHERE ms.review_status = $1::suggestion_status
+       ORDER BY ms.priority_score DESC, ms.created_at DESC 
+       LIMIT $2`,
+      [status, parseInt(limit)]
+    );
+    res.json({ suggestions: result.rows });
+  } catch (error) {
+    console.error('[Memory] Erro suggestions:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/memory/suggestions/:id/approve - Approve a suggestion
+app.post('/api/memory/suggestions/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body || {};
+    
+    // Get the suggestion
+    const sugResult = await query('SELECT * FROM memory_suggestions WHERE id = $1', [id]);
+    if (sugResult.rows.length === 0) return res.status(404).json({ error: 'Suggestion not found' });
+    const suggestion = sugResult.rows[0];
+    
+    // Create memory from suggestion
+    const memResult = await query(
+      `INSERT INTO memories (agent_id, scope_type, category, title, content, summary, source_type, source_ref, confidence_score, status, tags)
+       VALUES ($1, 'agent', $2, $3, $4, $5, $6, $7, $8, 'approved', $9) RETURNING *`,
+      [suggestion.agent_id, suggestion.category || 'general', suggestion.title, 
+       suggestion.proposed_content, suggestion.proposed_summary,
+       suggestion.trigger_type || 'manual', suggestion.trigger_ref,
+       suggestion.confidence_score || 0.8, suggestion.tags || '{}']
+    );
+    
+    // Update suggestion status
+    await query(
+      `UPDATE memory_suggestions SET review_status = 'approved', review_notes = $1, reviewed_at = now(), promoted_memory_id = $2 WHERE id = $3`,
+      [notes || 'Approved', memResult.rows[0].id, id]
+    );
+    
+    // Audit log
+    await query(
+      `INSERT INTO memory_audit_log (memory_id, action, performed_by, details) VALUES ($1, 'created_from_suggestion', 'admin', $2)`,
+      [memResult.rows[0].id, JSON.stringify({ suggestion_id: id })]
+    ).catch(() => {});
+    
+    res.json({ success: true, memory: memResult.rows[0] });
+  } catch (error) {
+    console.error('[Memory] Erro ao aprovar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/memory/suggestions/:id/reject - Reject a suggestion
+app.post('/api/memory/suggestions/:id/reject', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body || {};
+    await query(
+      `UPDATE memory_suggestions SET review_status = 'rejected', review_notes = $1, reviewed_at = now() WHERE id = $2`,
+      [notes || 'Rejected', id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[Memory] Erro ao rejeitar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/memory/teach - Teach something new to an agent
+app.post('/api/memory/teach', async (req, res) => {
+  try {
+    const { agent_id, category = 'general', title, content, summary, tags = [] } = req.body;
+    if (!content || !title) return res.status(400).json({ error: 'title e content obrigatorios' });
+    
+    const result = await query(
+      `INSERT INTO memories (agent_id, scope_type, category, title, content, summary, source_type, status, tags, confidence_score)
+       VALUES ($1, CASE WHEN $1 IS NULL THEN 'team' ELSE 'agent' END, $2::memory_category, $3, $4, $5, 'manual', 'approved', $6, 1.0) RETURNING *`,
+      [agent_id || null, category, title, content, summary || '', tags]
+    );
+    
+    res.status(201).json({ memory: result.rows[0] });
+  } catch (error) {
+    console.error('[Memory] Erro ao ensinar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/memory/:id - Update a memory
+app.put('/api/memory/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, content, summary, category, tags, status } = req.body;
+    
+    const updates = [];
+    const params = [];
+    
+    if (title !== undefined) { params.push(title); updates.push(`title = $${params.length}`); }
+    if (content !== undefined) { params.push(content); updates.push(`content = $${params.length}`); }
+    if (summary !== undefined) { params.push(summary); updates.push(`summary = $${params.length}`); }
+    if (category !== undefined) { params.push(category); updates.push(`category = $${params.length}::memory_category`); }
+    if (tags !== undefined) { params.push(tags); updates.push(`tags = $${params.length}`); }
+    if (status !== undefined) { params.push(status); updates.push(`status = $${params.length}::memory_status`); }
+    
+    updates.push('updated_at = now()');
+    params.push(id);
+    
+    const result = await query(
+      `UPDATE memories SET ${updates.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+    
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Memory not found' });
+    res.json({ memory: result.rows[0] });
+  } catch (error) {
+    console.error('[Memory] Erro ao atualizar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/memory/:id - Archive a memory (soft delete)
+app.delete('/api/memory/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await query(`UPDATE memories SET status = 'archived', updated_at = now() WHERE id = $1`, [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[Memory] Erro ao arquivar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/memory/audit - Audit log of memory changes
+app.get('/api/memory/audit', async (req, res) => {
+  try {
+    const { limit = 100 } = req.query;
+    const result = await query(
+      `SELECT mal.*, m.title as memory_title, a.name as agent_name
+       FROM memory_audit_log mal 
+       LEFT JOIN memories m ON mal.memory_id = m.id
+       LEFT JOIN agents a ON m.agent_id = a.id
+       ORDER BY mal.created_at DESC LIMIT $1`,
+      [parseInt(limit)]
+    );
+    res.json({ audit: result.rows });
+  } catch (error) {
+    console.error('[Memory] Erro audit:', error);
+    // Return empty if table structure differs
+    res.json({ audit: [] });
+  }
+});
+
+// POST /api/memory/triggers/run - Run memory triggers (scan for auto-suggestions)
+app.post('/api/memory/triggers/run', async (req, res) => {
+  try {
+    // Count pending suggestions
+    const pending = await query(`SELECT COUNT(*) as count FROM memory_suggestions WHERE review_status = 'pending'`);
+    res.json({ 
+      success: true, 
+      message: 'Triggers executados',
+      pending_suggestions: parseInt(pending.rows[0]?.count || 0)
+    });
+  } catch (error) {
+    console.error('[Memory] Erro triggers:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+app.use('/api/luna', agentsRouter);
 
 // ============================================
 // SPA FALLBACK — Serve index.html para rotas do frontend
@@ -1257,3 +1476,9 @@ server.listen(PORT, () => {
     if (count > 0) console.log(`[Orchestrator] ${count} tasks pendentes processadas no startup`);
   }).catch(() => {});
 });
+
+// Dara Orquestrador - Auto-correção
+import('./services/dara-orquestrador.cjs').then(m => (m.default || m).iniciar()).catch(e => console.log('[Dara] optional:', e.message));
+
+// Start task processor worker
+import('./workers/task-processor.cjs').catch(e => console.log('[Worker] optional:', e.message));

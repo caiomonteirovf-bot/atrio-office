@@ -33,8 +33,11 @@ services:
       MINIMAX_MODEL: ${MINIMAX_MODEL:-MiniMax-M2.5}
       GESTHUB_API_URL: ${GESTHUB_API_URL:-https://gesthub-xlvb.onrender.com}
       PORT: 3010
+      OPENCLAW_GATEWAY: http://172.18.0.1:18789
       NODE_ENV: production
       CORS_ORIGIN: "*"
+      XAI_API_KEY: ${XAI_API_KEY}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
 
 volumes:
   pgdata:

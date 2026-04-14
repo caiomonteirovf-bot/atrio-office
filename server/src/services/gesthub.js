@@ -13,6 +13,12 @@ async function request(path, options = {}) {
     headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
   });
+  const ct = res.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    const txt = (await res.text()).slice(0, 120).replace(/\s+/g, ' ');
+    const suffix = res.status === 503 ? ' -- instancia suspensa no Render' : '';
+    throw new Error(`Gesthub indisponivel (${res.status})${suffix} [${txt}]`);
+  }
   const payload = await res.json();
   if (!res.ok || !payload.ok) {
     throw new Error(payload.error || `Gesthub error: ${res.status}`);
@@ -114,28 +120,36 @@ export async function getColaboradores() {
 // ============================================
 // BUSCAR EMPRESA POR TELEFONE (cruza contatos)
 // ============================================
+// Canonicaliza telefone BR: remove DDI 55, insere 9 se faltar.
+// Sempre retorna 11 dígitos (DD + 9 + 8 dígitos) para números BR válidos.
+// Retorna string vazia se não for reconhecível.
+function phoneKeyBR(raw) {
+  let d = (raw || "").replace(/\D/g, "");
+  if (!d) return "";
+  // Remove DDI 55 se presente
+  if ((d.length === 12 || d.length === 13) && d.startsWith("55")) d = d.slice(2);
+  // Se veio só 8 ou 9 dígitos (sem DDD), não dá pra normalizar com segurança
+  if (d.length < 10) return d;
+  // 10 dígitos: DD + 8dig (celular antigo sem 9) → insere 9
+  if (d.length === 10) d = d.slice(0, 2) + "9" + d.slice(2);
+  // 11 dígitos: DD + 9 + 8dig (formato canônico BR)
+  if (d.length > 11) d = d.slice(-11);
+  return d;
+}
+
 export async function findClientByPhone(phone) {
   const clients = await getClients();
-  const digits = phone.replace(/\D/g, '');
-  // Normaliza: pega os últimos 10-11 dígitos (DDD + número)
-  const shortDigits = digits.length > 11 ? digits.slice(-11) : digits;
+  const key = phoneKeyBR(phone);
+  if (!key) return null;
 
   for (const client of clients) {
-    // Verifica campo phone direto
-    if (client.phone) {
-      const clientDigits = client.phone.replace(/\D/g, '');
-      if (clientDigits.endsWith(shortDigits) || shortDigits.endsWith(clientDigits.slice(-10))) {
-        return client;
-      }
+    if (client.phone && phoneKeyBR(client.phone) === key) {
+      return client;
     }
-    // Verifica nos contatos (array com telefone de cada sócio/contato)
     if (Array.isArray(client.contatos)) {
       for (const contato of client.contatos) {
-        if (contato.telefone) {
-          const contatoDigits = contato.telefone.replace(/\D/g, '');
-          if (contatoDigits.endsWith(shortDigits.slice(-10)) || shortDigits.endsWith(contatoDigits.slice(-10))) {
-            return { ...client, _contato: contato };
-          }
+        if (contato.telefone && phoneKeyBR(contato.telefone) === key) {
+          return { ...client, _contato: contato };
         }
       }
     }

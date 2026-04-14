@@ -83,7 +83,7 @@ const minimax = process.env.MINIMAX_API_KEY
 // AGENT → PROVIDER CONFIG
 // ============================================
 const AGENT_CONFIG = {
-  'Campelo':   { provider: 'anthropic', model: 'claude-sonnet-4-6',  temperature: 0.1, maxTokens: 2048 },
+  'Campelo':   { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.1, maxTokens: 2048 },
   'Rodrigo':   { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.1, maxTokens: 1024 },
   'Sneijder':  { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.2, maxTokens: 1024 },
   'Sofia':     { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.2, maxTokens: 1024 },
@@ -110,7 +110,7 @@ function getOpenAIClient(provider) {
 // Log de inicialização
 const providers = [];
 if (anthropic) providers.push('Anthropic (Campelo)');
-if (grok) providers.push('xAI Grok (Rodrigo/Sneijder/Sofia)');
+if (grok) providers.push('xAI Grok (Campelo/Rodrigo/Sneijder/Sofia)');
 if (deepseek) providers.push('DeepSeek (Luna/Fallback)');
 if (minimax) providers.push('MiniMax (legado)');
 console.log(`[LLM] Provedores: ${providers.join(', ') || 'NENHUM!'}`);

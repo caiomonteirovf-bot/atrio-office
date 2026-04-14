@@ -1,347 +1,267 @@
 import { useState, useEffect } from 'react'
 
-const CATEGORIES = [
-  { id: 'general', label: 'Geral', icon: '📝' },
-  { id: 'clients', label: 'Clientes', icon: '👤' },
-  { id: 'procedures', label: 'Procedimentos', icon: '📋' },
-  { id: 'rules', label: 'Regras', icon: '⚖️' },
-  { id: 'context', label: 'Contexto', icon: '🧠' },
+const CATS = [
+  { id: 'general', label: 'Geral', icon: '' },
+  { id: 'fiscal_rule', label: 'Fiscal', icon: '' },
+  { id: 'financial', label: 'Financeiro', icon: '' },
+  { id: 'corporate', label: 'Societrio', icon: '' },
+  { id: 'client', label: 'Clientes', icon: '' },
+  { id: 'process', label: 'Processos', icon: '' },
 ]
 
+const fmt = (d) => {
+  if (!d) return ''
+  try { return new Date(d).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) }
+  catch(e) { return '' }
+}
+
 export default function MemoryBrowser() {
-  const [agents, setAgents] = useState([])
-  const [selectedAgent, setSelectedAgent] = useState(null)
+  const [tab, setTab] = useState('knowledge')
   const [memories, setMemories] = useState([])
+  const [suggestions, setSuggestions] = useState([])
+  const [audit, setAudit] = useState([])
+  const [agents, setAgents] = useState([])
+  const [stats, setStats] = useState({ active: '0', pending_review: '0', total: '0' })
+  const [selAgent, setSelAgent] = useState(null)
+  const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(false)
-  const [categoryFilter, setCategoryFilter] = useState('')
-  const [editing, setEditing] = useState(null)
-  const [showCreate, setShowCreate] = useState(false)
-  const [newMemory, setNewMemory] = useState({ category: 'general', title: '', content: '', pinned: false })
+  const [reviewFilter, setReviewFilter] = useState('pending')
+  const [newMem, setNewMem] = useState({ title: '', content: '', category: 'general', summary: '', agent_id: null })
 
   useEffect(() => {
     fetch('/api/agents').then(r => r.json()).then(d => {
-      const list = d.agents || d || []
-      setAgents(list)
-      if (list.length > 0) setSelectedAgent(list[0])
-    })
+      if (Array.isArray(d)) setAgents(d)
+      else if (d && Array.isArray(d.agents)) setAgents(d.agents)
+      else setAgents([])
+    }).catch(() => setAgents([]))
   }, [])
 
-  const fetchMemories = (agentId, cat) => {
-    if (!agentId) return
+  useEffect(() => {
     setLoading(true)
-    const params = cat ? `?category=${cat}` : ''
-    fetch(`/api/agents/${agentId}/memory${params}`)
+    const p = new URLSearchParams({ status: 'approved', limit: '100' })
+    if (selAgent) p.set('agent', selAgent)
+    if (search) p.set('search', search)
+    fetch('/api/memory?' + p.toString())
       .then(r => r.json())
-      .then(d => { setMemories(d.memories || []); setLoading(false) })
-      .catch(() => setLoading(false))
-  }
+      .then(d => {
+        setMemories(Array.isArray(d.memories) ? d.memories : [])
+        if (d.stats) setStats(d.stats)
+        setLoading(false)
+      })
+      .catch(() => { setMemories([]); setLoading(false) })
+  }, [selAgent, search])
 
   useEffect(() => {
-    if (selectedAgent) fetchMemories(selectedAgent.id, categoryFilter)
-  }, [selectedAgent, categoryFilter])
+    if (tab !== 'review') return
+    fetch('/api/memory/suggestions?status=' + reviewFilter + '&limit=50')
+      .then(r => r.json())
+      .then(d => setSuggestions(Array.isArray(d.suggestions) ? d.suggestions : []))
+      .catch(() => setSuggestions([]))
+  }, [tab, reviewFilter])
 
-  const handleCreate = async () => {
-    if (!newMemory.content || !selectedAgent) return
-    await fetch(`/api/agents/${selectedAgent.id}/memory`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newMemory)
-    })
-    setShowCreate(false)
-    setNewMemory({ category: 'general', title: '', content: '', pinned: false })
-    fetchMemories(selectedAgent.id, categoryFilter)
+  useEffect(() => {
+    if (tab !== 'history') return
+    fetch('/api/memory/audit?limit=100')
+      .then(r => r.json())
+      .then(d => setAudit(Array.isArray(d.audit) ? d.audit : []))
+      .catch(() => setAudit([]))
+  }, [tab])
+
+  const handleTeach = () => {
+    if (!newMem.title || !newMem.content) return
+    fetch('/api/memory/teach', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newMem)
+    }).then(() => {
+      setNewMem({ title: '', content: '', category: 'general', summary: '', agent_id: null })
+      setTab('knowledge')
+    }).catch(() => {})
   }
 
-  const handleUpdate = async (mem) => {
-    await fetch(`/api/agents/${selectedAgent.id}/memory/${mem.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: mem.content, title: mem.title, category: mem.category, pinned: mem.pinned })
-    })
-    setEditing(null)
-    fetchMemories(selectedAgent.id, categoryFilter)
+  const handleApprove = (id) => {
+    fetch('/api/memory/suggestions/' + id + '/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(() => { setTab('review') }).catch(() => {})
   }
 
-  const handleDelete = async (memId) => {
-    await fetch(`/api/agents/${selectedAgent.id}/memory/${memId}`, { method: 'DELETE' })
-    fetchMemories(selectedAgent.id, categoryFilter)
+  const handleReject = (id) => {
+    fetch('/api/memory/suggestions/' + id + '/reject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(() => { setTab('review') }).catch(() => {})
   }
 
-  const handleTogglePin = async (mem) => {
-    await fetch(`/api/agents/${selectedAgent.id}/memory/${mem.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pinned: !mem.pinned })
-    })
-    fetchMemories(selectedAgent.id, categoryFilter)
+  const pill = (active) => ({
+    padding: '6px 14px', borderRadius: 20, fontSize: 12, cursor: 'pointer', fontWeight: 500, display: 'inline-block',
+    background: active ? 'rgba(196,149,106,0.18)' : 'rgba(255,255,255,0.04)',
+    color: active ? '#C4956A' : 'rgba(255,255,255,0.55)',
+    border: '1px solid ' + (active ? 'rgba(196,149,106,0.3)' : 'rgba(255,255,255,0.08)'),
+  })
+
+  const card = {
+    padding: '16px 20px', borderRadius: 12, marginBottom: 10,
+    background: 'linear-gradient(135deg, rgba(19,22,32,0.7) 0%, rgba(19,22,32,0.5) 100%)',
+    border: '1px solid rgba(255,255,255,0.06)',
   }
 
-  const formatDate = (d) => new Date(d).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' })
+  const tabStyle = (active) => ({
+    padding: '10px 18px', cursor: 'pointer', fontSize: 13, fontWeight: active ? 600 : 400,
+    color: active ? '#C4956A' : 'rgba(255,255,255,0.5)',
+    background: 'none', border: 'none',
+    borderBottom: active ? '2px solid #C4956A' : '2px solid transparent',
+  })
+
+  const inp = {
+    width: '100%', padding: '10px 14px', borderRadius: 8, fontSize: 13, boxSizing: 'border-box',
+    background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)',
+    color: 'rgba(255,255,255,0.85)', outline: 'none',
+  }
+
+  const tag = { padding: '2px 10px', borderRadius: 10, fontSize: 11, fontWeight: 500, background: 'rgba(196,149,106,0.12)', color: '#C4956A', display: 'inline-block', marginRight: 6 }
 
   return (
-    <div style={{ padding: '24px 32px', maxWidth: 1200, margin: '0 auto' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-        <div>
-          <h2 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 20, fontWeight: 700, margin: 0 }}>
-            🧠 Memória dos Agentes
-          </h2>
-          <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, margin: '4px 0 0' }}>
-            Navegue e edite o conhecimento de cada agente
-          </p>
-        </div>
-        <button onClick={() => setShowCreate(true)} style={{
-          padding: '8px 16px', borderRadius: 8, border: '1px solid rgba(196,149,106,0.3)',
-          background: 'rgba(196,149,106,0.12)', color: '#C4956A', fontSize: 13, cursor: 'pointer', fontWeight: 600,
-        }}>
-          + Nova Memória
-        </button>
+    <div style={{ padding: '28px 32px', maxWidth: 1100 }}>
+      <h1 style={{ color: 'rgba(255,255,255,0.92)', fontSize: 22, fontWeight: 700, margin: 0 }}>Conhecimento da Equipe</h1>
+      <p style={{ color: 'rgba(255,255,255,0.45)', fontSize: 13, margin: '4px 0 0' }}>Tudo que os agentes aprenderam e usam no dia a dia</p>
+
+      <div style={{ display: 'flex', gap: 16, margin: '20px 0' }}>
+        {[
+          { v: stats.active, l: 'Conhecimentos ativos', c: '#4ade80' },
+          { v: stats.pending_review, l: 'Aguardando sua revisao', c: 'rgba(255,255,255,0.5)' },
+          { v: stats.total, l: 'Total registrado', c: 'rgba(255,255,255,0.5)' },
+        ].map((s, i) => (
+          <div key={i} style={{ flex: 1, padding: '18px 20px', borderRadius: 12, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+            <div style={{ fontSize: 28, fontWeight: 700, color: s.c, lineHeight: 1 }}>{s.v}</div>
+            <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.45)', marginTop: 6 }}>{s.l}</div>
+          </div>
+        ))}
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: 20 }}>
-        {/* Agent sidebar */}
-        <div>
-          <div style={{
-            background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
-            backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.06)',
-            borderRadius: 12, padding: 12,
-          }}>
-            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', padding: '4px 8px', marginBottom: 4 }}>
-              Agentes
-            </div>
-            {agents.map(a => (
-              <div
-                key={a.id}
-                onClick={() => { setSelectedAgent(a); setEditing(null) }}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 10, padding: '10px 10px',
-                  borderRadius: 8, cursor: 'pointer', marginBottom: 2,
-                  background: selectedAgent?.id === a.id ? 'rgba(196,149,106,0.12)' : 'transparent',
-                  transition: 'all 0.15s',
-                }}
-              >
-                <div style={{
-                  width: 32, height: 32, borderRadius: 8,
-                  background: selectedAgent?.id === a.id ? 'rgba(196,149,106,0.2)' : 'rgba(255,255,255,0.06)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 13, fontWeight: 700,
-                  color: selectedAgent?.id === a.id ? '#C4956A' : 'rgba(255,255,255,0.5)',
-                }}>
-                  {a.name[0]}
-                </div>
-                <div>
-                  <div style={{ fontSize: 13, color: selectedAgent?.id === a.id ? '#C4956A' : 'rgba(255,255,255,0.75)', fontWeight: 600 }}>
-                    {a.name}
-                  </div>
-                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)' }}>{a.role}</div>
-                </div>
-              </div>
-            ))}
-          </div>
+      <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid rgba(255,255,255,0.06)', marginBottom: 16 }}>
+        <button style={tabStyle(tab === 'knowledge')} onClick={() => setTab('knowledge')}>O que cada agente sabe</button>
+        <button style={tabStyle(tab === 'review')} onClick={() => setTab('review')}>Revisar</button>
+        <button style={tabStyle(tab === 'teach')} onClick={() => setTab('teach')}>+ Ensinar algo novo</button>
+        <button style={tabStyle(tab === 'history')} onClick={() => setTab('history')}>Historico</button>
+      </div>
 
-          {/* Category filter */}
-          <div style={{
-            background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
-            backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.06)',
-            borderRadius: 12, padding: 12, marginTop: 12,
-          }}>
-            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', padding: '4px 8px', marginBottom: 4 }}>
-              Categorias
-            </div>
-            <div
-              onClick={() => setCategoryFilter('')}
-              style={{
-                padding: '8px 10px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
-                color: !categoryFilter ? '#C4956A' : 'rgba(255,255,255,0.6)',
-                background: !categoryFilter ? 'rgba(196,149,106,0.1)' : 'transparent',
-                marginBottom: 2,
-              }}
-            >
-              📦 Todas
-            </div>
-            {CATEGORIES.map(c => (
-              <div
-                key={c.id}
-                onClick={() => setCategoryFilter(c.id)}
-                style={{
-                  padding: '8px 10px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
-                  color: categoryFilter === c.id ? '#C4956A' : 'rgba(255,255,255,0.6)',
-                  background: categoryFilter === c.id ? 'rgba(196,149,106,0.1)' : 'transparent',
-                  marginBottom: 2,
-                }}
-              >
-                {c.icon} {c.label}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Memory content */}
+      {tab === 'knowledge' && (
         <div>
-          {loading ? (
-            <div style={{ textAlign: 'center', padding: 40, color: 'rgba(255,255,255,0.5)' }}>Carregando...</div>
-          ) : memories.length === 0 ? (
-            <div style={{
-              textAlign: 'center', padding: 60,
-              background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
-              backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.06)',
-              borderRadius: 12, color: 'rgba(255,255,255,0.4)', fontSize: 14,
-            }}>
-              {selectedAgent ? `${selectedAgent.name} não possui memórias${categoryFilter ? ' nesta categoria' : ''}.` : 'Selecione um agente'}
-            </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {memories.map(mem => (
-                <div key={mem.id} style={{
-                  background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
-                  backdropFilter: 'blur(12px)',
-                  border: `1px solid ${mem.pinned ? 'rgba(196,149,106,0.15)' : 'rgba(255,255,255,0.06)'}`,
-                  borderRadius: 10, padding: 18,
-                }}>
-                  {editing === mem.id ? (
-                    /* Edit mode */
-                    <div>
-                      <input
-                        value={mem.title || ''}
-                        onChange={e => setMemories(ms => ms.map(m => m.id === mem.id ? { ...m, title: e.target.value } : m))}
-                        placeholder="Título"
-                        style={{
-                          width: '100%', padding: '8px 12px', borderRadius: 6, marginBottom: 8,
-                          background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                          color: 'rgba(255,255,255,0.85)', fontSize: 13, outline: 'none', boxSizing: 'border-box',
-                        }}
-                      />
-                      <textarea
-                        value={mem.content}
-                        onChange={e => setMemories(ms => ms.map(m => m.id === mem.id ? { ...m, content: e.target.value } : m))}
-                        rows={8}
-                        style={{
-                          width: '100%', padding: '8px 12px', borderRadius: 6, resize: 'vertical',
-                          background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                          color: 'rgba(255,255,255,0.85)', fontSize: 13, outline: 'none', fontFamily: 'monospace',
-                          lineHeight: 1.6, boxSizing: 'border-box',
-                        }}
-                      />
-                      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                        <button onClick={() => handleUpdate(mem)} style={{
-                          padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)',
-                          background: 'rgba(196,149,106,0.15)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600,
-                        }}>Salvar</button>
-                        <button onClick={() => { setEditing(null); fetchMemories(selectedAgent.id, categoryFilter) }} style={{
-                          padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.08)',
-                          background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.6)', fontSize: 12, cursor: 'pointer',
-                        }}>Cancelar</button>
-                      </div>
-                    </div>
-                  ) : (
-                    /* View mode */
-                    <div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                          {mem.pinned && <span style={{ fontSize: 12 }}>📌</span>}
-                          <span style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.85)' }}>
-                            {mem.title || 'Sem título'}
-                          </span>
-                          <span style={{
-                            padding: '2px 6px', borderRadius: 4, fontSize: 9, fontWeight: 600,
-                            textTransform: 'uppercase',
-                            background: 'rgba(196,149,106,0.1)', color: '#C4956A',
-                          }}>
-                            {mem.category}
-                          </span>
-                        </div>
-                        <div style={{ display: 'flex', gap: 4 }}>
-                          <button onClick={() => handleTogglePin(mem)} title={mem.pinned ? 'Desafixar' : 'Fixar'} style={{
-                            padding: '4px 8px', borderRadius: 4, border: 'none',
-                            background: 'rgba(255,255,255,0.04)', color: mem.pinned ? '#C4956A' : 'rgba(255,255,255,0.4)',
-                            fontSize: 12, cursor: 'pointer',
-                          }}>📌</button>
-                          <button onClick={() => setEditing(mem.id)} style={{
-                            padding: '4px 8px', borderRadius: 4, border: 'none',
-                            background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.5)',
-                            fontSize: 12, cursor: 'pointer',
-                          }}>✏️</button>
-                          <button onClick={() => handleDelete(mem.id)} style={{
-                            padding: '4px 8px', borderRadius: 4, border: 'none',
-                            background: 'rgba(255,255,255,0.04)', color: '#f87171',
-                            fontSize: 12, cursor: 'pointer',
-                          }}>🗑</button>
-                        </div>
-                      </div>
-                      <div style={{
-                        fontSize: 13, color: 'rgba(255,255,255,0.7)', lineHeight: 1.6,
-                        whiteSpace: 'pre-wrap', fontFamily: 'monospace',
-                        maxHeight: 200, overflow: 'auto',
-                      }}>
-                        {mem.content}
-                      </div>
-                      <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 8 }}>
-                        Atualizado: {formatDate(mem.updated_at)}
-                      </div>
-                    </div>
-                  )}
-                </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <span style={pill(!selAgent)} onClick={() => setSelAgent(null)}>Todos</span>
+              {agents.map(a => (
+                <span key={a.id} style={pill(selAgent === a.name)} onClick={() => setSelAgent(selAgent === a.name ? null : a.name)}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: a.status === 'online' ? '#4ade80' : '#666', display: 'inline-block', marginRight: 6 }}></span>
+                  {a.name}
+                </span>
               ))}
             </div>
-          )}
+            <input style={{ ...inp, width: 220 }} placeholder="Buscar..." value={search} onChange={e => setSearch(e.target.value)} />
+          </div>
+          {loading ? (
+            <div style={{ textAlign: 'center', padding: 48, color: 'rgba(255,255,255,0.3)' }}>Carregando...</div>
+          ) : memories.length === 0 ? (
+            <div style={{ ...card, textAlign: 'center', padding: '40px 20px' }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}></div>
+              <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 14 }}>Nenhum conhecimento registrado ainda</div>
+              <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 12, marginTop: 4 }}>Use a aba "+ Ensinar algo novo" para adicionar</div>
+            </div>
+          ) : memories.map(mem => (
+            <div key={mem.id} style={card}>
+              <p style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.88)', margin: 0 }}>{mem.title}</p>
+              {mem.summary && <div style={{ fontSize: 12, color: '#C4956A', marginTop: 4, fontStyle: 'italic' }}>{mem.summary}</div>}
+              <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.6)', margin: '8px 0 0', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
+                {mem.content && mem.content.length > 300 ? mem.content.substring(0, 300) + '...' : mem.content}
+              </div>
+              <div style={{ display: 'flex', gap: 6, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                {mem.agent_name && <span style={tag}> {mem.agent_name}</span>}
+                <span style={tag}>{mem.category}</span>
+                {mem.confidence_score && <span style={tag}> {Math.round(Number(mem.confidence_score) * 100)}%</span>}
+                <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>{fmt(mem.updated_at)}</span>
+                {mem.source_type && <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.25)' }}>via {mem.source_type}</span>}
+              </div>
+            </div>
+          ))}
         </div>
-      </div>
+      )}
 
-      {/* Create modal */}
-      {showCreate && (
-        <div onClick={() => setShowCreate(false)} style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 100,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          <div onClick={e => e.stopPropagation()} style={{
-            width: 500, background: '#131620', borderRadius: 12,
-            border: '1px solid rgba(255,255,255,0.08)', padding: 24,
-          }}>
-            <h3 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 16, fontWeight: 700, margin: '0 0 16px' }}>
-              Nova Memória — {selectedAgent?.name}
-            </h3>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ display: 'block', fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Categoria</label>
-              <select value={newMemory.category} onChange={e => setNewMemory(n => ({ ...n, category: e.target.value }))} style={{
-                width: '100%', padding: '8px 12px', borderRadius: 6,
-                background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                color: 'rgba(255,255,255,0.85)', fontSize: 12, outline: 'none',
-              }}>
-                {CATEGORIES.map(c => <option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}
-              </select>
+      {tab === 'review' && (
+        <div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+            <span style={pill(reviewFilter === 'pending')} onClick={() => setReviewFilter('pending')}>Pendentes</span>
+            <span style={pill(reviewFilter === 'approved')} onClick={() => setReviewFilter('approved')}>Aprovadas</span>
+            <span style={pill(reviewFilter === 'rejected')} onClick={() => setReviewFilter('rejected')}>Rejeitadas</span>
+          </div>
+          {suggestions.length === 0 ? (
+            <div style={{ ...card, textAlign: 'center', padding: '40px 20px' }}>
+              <div style={{ fontSize: 28, marginBottom: 8 }}></div>
+              <div style={{ color: 'rgba(255,255,255,0.4)' }}>Nada para revisar no momento</div>
             </div>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ display: 'block', fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Título</label>
-              <input value={newMemory.title} onChange={e => setNewMemory(n => ({ ...n, title: e.target.value }))} placeholder="Título da memória" style={{
-                width: '100%', padding: '8px 12px', borderRadius: 6,
-                background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                color: 'rgba(255,255,255,0.85)', fontSize: 13, outline: 'none', boxSizing: 'border-box',
-              }} />
+          ) : suggestions.map(sug => (
+            <div key={sug.id} style={card}>
+              <p style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.88)', margin: 0 }}>{sug.title}</p>
+              {sug.agent_name && <span style={{ fontSize: 11, color: '#C4956A' }}>Agente: {sug.agent_name}</span>}
+              <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.6)', margin: '8px 0', lineHeight: 1.5 }}>{sug.proposed_content || sug.reason}</div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <span style={tag}>{sug.trigger_type || 'manual'}</span>
+                <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>{fmt(sug.created_at)}</span>
+              </div>
+              {reviewFilter === 'pending' && (
+                <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                  <button onClick={() => handleApprove(sug.id)} style={{ padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer', background: 'rgba(74,222,128,0.12)', color: '#4ade80', border: '1px solid rgba(74,222,128,0.3)' }}> Aprovar</button>
+                  <button onClick={() => handleReject(sug.id)} style={{ padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer', background: 'rgba(239,68,68,0.08)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.2)' }}> Rejeitar</button>
+                </div>
+              )}
             </div>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ display: 'block', fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Conteúdo</label>
-              <textarea value={newMemory.content} onChange={e => setNewMemory(n => ({ ...n, content: e.target.value }))} rows={8} placeholder="Markdown ou texto livre..." style={{
-                width: '100%', padding: '8px 12px', borderRadius: 6, resize: 'vertical',
-                background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                color: 'rgba(255,255,255,0.85)', fontSize: 13, outline: 'none', fontFamily: 'monospace',
-                lineHeight: 1.6, boxSizing: 'border-box',
-              }} />
-            </div>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'rgba(255,255,255,0.6)', marginBottom: 16, cursor: 'pointer' }}>
-              <input type="checkbox" checked={newMemory.pinned} onChange={e => setNewMemory(n => ({ ...n, pinned: e.target.checked }))} />
-              Fixar no topo
-            </label>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={() => setShowCreate(false)} style={{
-                flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid rgba(255,255,255,0.08)',
-                background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.6)', fontSize: 12, cursor: 'pointer',
-              }}>Cancelar</button>
-              <button onClick={handleCreate} style={{
-                flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)',
-                background: 'rgba(196,149,106,0.15)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600,
-              }}>Criar Memória</button>
+          ))}
+        </div>
+      )}
+
+      {tab === 'teach' && (
+        <div style={{ maxWidth: 600, marginTop: 8 }}>
+          <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, margin: '0 0 16px' }}>Ensine algo novo para um agente ou para toda a equipe.</p>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Para quem?</label>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <span style={pill(!newMem.agent_id)} onClick={() => setNewMem({...newMem, agent_id: null})}>Todos os agentes</span>
+              {agents.map(a => (
+                <span key={a.id} style={pill(newMem.agent_id === a.id)} onClick={() => setNewMem({...newMem, agent_id: newMem.agent_id === a.id ? null : a.id})}>{a.name}</span>
+              ))}
             </div>
           </div>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Sobre o que?</label>
+            <select style={inp} value={newMem.category} onChange={e => setNewMem({...newMem, category: e.target.value})}>
+              {CATS.map(c => <option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}
+            </select>
+          </div>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Titulo</label>
+            <input style={inp} placeholder="Ex: Prazo do Simples Nacional" value={newMem.title} onChange={e => setNewMem({...newMem, title: e.target.value})} />
+          </div>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>O que o agente precisa saber?</label>
+            <textarea style={{ ...inp, minHeight: 120, resize: 'vertical' }} placeholder="Escreva aqui a informacao que o agente deve lembrar..." value={newMem.content} onChange={e => setNewMem({...newMem, content: e.target.value})} />
+          </div>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Resumo curto (opcional)</label>
+            <input style={inp} placeholder="Uma frase que resume a informacao" value={newMem.summary} onChange={e => setNewMem({...newMem, summary: e.target.value})} />
+          </div>
+          <button onClick={handleTeach} style={{ padding: '10px 24px', borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: 'pointer', background: 'rgba(196,149,106,0.15)', color: '#C4956A', border: '1px solid rgba(196,149,106,0.3)' }}>Ensinar</button>
+        </div>
+      )}
+
+      {tab === 'history' && (
+        <div>
+          {audit.length === 0 ? (
+            <div style={{ ...card, textAlign: 'center', padding: '40px 20px' }}>
+              <div style={{ color: 'rgba(255,255,255,0.4)' }}>Nenhuma acao registrada ainda</div>
+            </div>
+          ) : audit.map(a => (
+            <div key={a.id} style={{ ...card, padding: '12px 18px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.7)' }}>{a.action}{a.memory_title ? '  ' + a.memory_title : ''}</span>
+                <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>{fmt(a.created_at)}</span>
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>

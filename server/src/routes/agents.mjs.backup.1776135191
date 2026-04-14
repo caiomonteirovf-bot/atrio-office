@@ -1,0 +1,298 @@
+/**
+ * Trecho COMPLETO para adicionar em /opt/atrio-office/server/src/routes/agents.mjs
+ * 
+ * INSTRUÇÕES:
+ * 1. Adicione a função buscarPrestador() após os imports (linha ~10)
+ * 2. Modifique o case 'nfse_emitir' conforme indicado abaixo
+ */
+
+// =====================================
+// PARTE 1: ADICIONAR APÓS OS IMPORTS
+// =====================================
+
+// Campos obrigatórios para identificar o prestador
+const CAMPOS_PRESTADOR = ['prestador_cnpj', 'prestador_nome'];
+
+/**
+ * Busca prestador (empresa do cliente) pelo telefone do WhatsApp
+ * Estratégia: luna_v2.clients → clients (fallback) → perguntar
+ */
+async function buscarPrestador(phone) {
+  if (!phone) {
+    return { encontrado: false, mensagem: 'Telefone não informado.' };
+  }
+  
+  // Limar @c.us se existir
+  const phoneLimpo = phone.replace('@c.us', '');
+  
+  try {
+    // 1. Tentar buscar na tabela luna_v2.clients
+    const localClient = await query(
+      `SELECT id, nome_legal, cnpj, inscricao_estadual, endereco, contatos 
+       FROM luna_v2.clients 
+       WHERE contatos @> $1::jsonb 
+       LIMIT 1`,
+      [JSON.stringify([{ tipo: 'whatsapp', valor: phoneLimpo }])]
+    );
+    
+    if (localClient.rows.length > 0) {
+      const c = localClient.rows[0];
+      console.log(`[Campelo] Prestador encontrado no luna_v2: ${c.nome_legal}`);
+      return {
+        encontrado: true,
+        dados: {
+          prestador_cnpj: c.cnpj,
+          prestador_nome: c.nome_legal,
+          prestador_ie: c.inscricao_estadual || '',
+          prestador_endereco: c.endereco || ''
+        }
+      };
+    }
+    
+    // 2. Tentar na tabela clients (sem schema, formato antigo)
+    const fallbackClient = await query(
+      `SELECT id, nome, cnpj, telefone, celular 
+       FROM clients 
+       WHERE telefone = $1 OR celular = $1 
+       LIMIT 1`,
+      [phoneLimpo]
+    );
+    
+    if (fallbackClient.rows.length > 0) {
+      const c = fallbackClient.rows[0];
+      console.log(`[Campelo] Prestador encontrado na tabela clients: ${c.nome}`);
+      return {
+        encontrado: true,
+        dados: {
+          prestador_cnpj: c.cnpj,
+          prestador_nome: c.nome
+        }
+      };
+    }
+    
+    // 3. Buscar por regex no campo contatos (JSONB)
+    const regexClient = await query(
+      `SELECT id, nome_legal, cnpj, contatos 
+       FROM luna_v2.clients 
+       WHERE contatos::text LIKE $1 
+       LIMIT 1`,
+      [`%${phoneLimpo}%`]
+    );
+    
+    if (regexClient.rows.length > 0) {
+      const c = regexClient.rows[0];
+      console.log(`[Campelo] Prestador encontrado por regex: ${c.nome_legal}`);
+      return {
+        encontrado: true,
+        dados: {
+          prestador_cnpj: c.cnpj,
+          prestador_nome: c.nome_legal
+        }
+      };
+    }
+    
+    // 4. Não encontrou - retornar mensagem para coletar
+    console.log(`[Campelo] Prestador NÃO encontrado para: ${phoneLimpo}`);
+    return {
+      encontrado: false,
+      mensagem: 'Não encontrei seu cadastro em nossa base de dados. Para emitir a nota fiscal, preciso que me informe o CNPJ da sua empresa.',
+      faltando: ['prestador_cnpj', 'prestador_nome']
+    };
+    
+  } catch (error) {
+    console.error('[Campelo] Erro ao buscar prestador:', error);
+    return {
+      encontrado: false,
+      mensagem: 'Não consegui consultar seu cadastro no momento. Por favor, informe o CNPJ da sua empresa para prosseguir com a emissão.',
+      faltando: ['prestador_cnpj']
+    };
+  }
+}
+
+// =====================================
+// PARTE 2: MODIFICAR O SWITCH CASE
+// =====================================
+
+// No método POST /delegate, dentro do switch(task_type), 
+// SUBSTITUA o case 'nfse_emitir' por este:
+
+case 'nfse_emitir': {
+  console.log(`[Campelo] Processando emissão de NFSe para task ${task.id}`);
+  
+  const payload = typeof task.payload === 'string' 
+    ? JSON.parse(task.payload) 
+    : (task.payload || {});
+  
+  // Verificar se tem dados do tomador (deve vir do cliente)
+  if (!payload.cnpj_tomador || !payload.valor || !payload.descricao) {
+    return res.status(400).json({
+      error: 'Dados incompletos',
+      mensagem: 'Para emitir a nota fiscal, preciso: CNPJ do tomador, valor e descrição do serviço.'
+    });
+  }
+  
+  // Verificar se já tem dados do prestador
+  const temPrestador = CAMPOS_PRESTADOR.every(campo => 
+    payload[campo] && String(payload[campo]).trim() !== ''
+  );
+  
+  if (!temPrestador) {
+    // Tentar buscar prestador automaticamente pelo telefone
+    const busca = await buscarPrestador(payload.phone || task.phone);
+    
+    if (busca.encontrado) {
+      // Completar payload com dados encontrados
+      Object.assign(payload, busca.dados);
+      console.log(`[Campelo] Prestador auto-completado: ${busca.dados.prestador_nome}`);
+      
+      // Atualizar task no banco
+      await query(
+        'UPDATE luna_v2.tasks SET payload = $1::jsonb WHERE id = $2',
+        [JSON.stringify(payload), task.id]
+      );
+      
+    } else {
+      // Não achou - retornar para coletar dados
+      console.log(`[Campelo] Aguardando dados do prestador`);
+      return res.json({
+        success: true,
+        task_id: task.id,
+        status: 'aguardando_dados',
+        agent: 'campelo',
+        tipo: 'dados_prestador',
+        mensagem: busca.mensagem,
+        campos_faltando: busca.faltando,
+        proximo_passo: 'cliente_deve_informar_cnpj_prestador'
+      });
+    }
+  }
+  
+  // Agora tem todos os dados - prosseguir com emissão
+  try {
+    const resultado = await emitirNfseReal(payload, task);
+    
+    return res.json({
+      success: true,
+      task_id: task.id,
+      status: 'completed',
+      resultado: resultado,
+      message: 'NFSe emitida com sucesso'
+    });
+    
+  } catch (error) {
+    console.error('[Campelo] Erro ao emitir NFSe:', error);
+    return res.status(500).json({
+      error: 'Erro na emissão',
+      detail: error.message
+    });
+  }
+}
+
+// =====================================
+// PARTE 3: FUNÇÃO DE EMISSÃO REAL (helper)
+// =====================================
+
+/**
+ * Emissão real da NFSe via API
+ * Chama NFS-e System + Nuvem Fiscal
+ */
+async function emitirNfseReal(payload, task) {
+  const {
+    cnpj_tomador,
+    valor,
+    descricao,
+    prestador_cnpj,
+    prestador_nome,
+    prestador_ie = ''
+  } = payload;
+  
+  console.log(`[Campelo] Emitindo NFSe:`);
+  console.log(`  Prestador: ${prestador_nome} (${prestador_cnpj})`);
+  console.log(`  Tomador: ${cnpj_tomador}`);
+  console.log(`  Valor: R$ ${valor}`);
+  
+  // TODO: Implementar chamada real ao NFS-e System
+  // const nfse = await nfseSystem.emitir({ ... });
+  
+  // Mock temporário (substituir pela implementação real)
+  const nfseId = `NF-${Date.now()}`;
+  
+  // Criar notificação para equipe
+  await query(
+    `INSERT INTO luna_v2.notifications 
+     (client_id, type, title, message, status) 
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      task.client_id,
+      'nfse_emitida',
+      'NFSe Emitida',
+      `NFSe ${nfseId} emitida para ${cnpj_tomador} - R$ ${valor}`,
+      'unread'
+    ]
+  );
+  
+  return {
+    nfse_id: nfseId,
+    prestador: prestador_nome,
+    tomador: cnpj_tomador,
+    valor: valor,
+    emissao: new Date().toISOString()
+  };
+}
+
+// =====================================
+// PARTE 4: ROTA PARA COMPLETAR DADOS (nova)
+// =====================================
+
+// Adicionar nova rota POST /tasks/:id/completar-dados
+// Isso permite o cliente enviar dados faltantes depois
+
+router.post('/tasks/:id/completar-dados', async (req, res) => {
+  const { id } = req.params;
+  const { cnpj, nome } = req.body;
+  
+  try {
+    // Buscar task
+    const taskResult = await query(
+      'SELECT * FROM luna_v2.tasks WHERE id = $1',
+      [id]
+    );
+    
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task não encontrada' });
+    }
+    
+    const task = taskResult.rows[0];
+    
+    // Atualizar payload com dados do prestador
+    const payload = typeof task.payload === 'string' 
+      ? JSON.parse(task.payload) 
+      : (task.payload || {});
+    
+    payload.prestador_cnpj = cnpj;
+    payload.prestador_nome = nome || 'Cliente';
+    
+    await query(
+      'UPDATE luna_v2.tasks SET payload = $1::jsonb WHERE id = $2',
+      [JSON.stringify(payload), id]
+    );
+    
+    // Reprocessar task
+    // Aqui você chamaria novamente o processamento da task
+    // Ou pode deixar o cron/scheduler reprocessar
+    
+    res.json({
+      success: true,
+      message: 'Dados atualizados. Reprocessando...',
+      task_id: id
+    });
+    
+  } catch (error) {
+    console.error('[Tasks] Erro ao completar dados:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =====================================
+// FIM DO ARQUIVO DE INTEGRAÇÃO
+// =====================================

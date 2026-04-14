@@ -35,14 +35,14 @@ export function useAgents() {
       ])
       // Mapeia agent_id → team_member_id
       const teamByAgentId = {}
-      for (const tm of teamData) {
+      for (const tm of teamData || []) {
         if (tm.agent_id) teamByAgentId[tm.agent_id] = tm.id
       }
       // Enriquece cada agente com estado de atividade real
       const enriched = agentsData.map(agent => ({
         ...agent,
         teamMemberId: teamByAgentId[agent.id] || null,
-        ...resolveActivity(teamByAgentId[agent.id], allTasks),
+        ...resolveActivity(teamByAgentId[agent.id], allTasks || []),
       }))
       setAgents(enriched)
     } catch (err) {

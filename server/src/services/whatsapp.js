@@ -9,6 +9,7 @@ import { addAnalysis } from './daily-report.js';
 import { query } from '../db/pool.js';
 import { findClientByPhone } from './gesthub.js';
 import { createNotification } from './notifications.js';
+import { handleWhatsAppMessage } from './whatsapp/webhook-handler.mjs';
 
 // ============================================
 // ESTADO
@@ -491,6 +492,118 @@ export async function initialize() {
 // ============================================
 // MENSAGEM RECEBIDA
 // ============================================
+
+// =========================================
+// LUNA V2 - Wrapper para OpenClaw
+// =========================================
+async function handleLunaV2(msg, clientInfo, conversationInfo) {
+  try {
+    const result = await handleWhatsAppMessage(msg, clientInfo, conversationInfo);
+
+    switch (result.action) {
+      case 'send_message':
+        await botSend(msg.from, result.content);
+        break;
+
+      case 'delegate':
+        if (result.ack) {
+          await botSend(msg.from, result.ack);
+        }
+        // Chamar endpoint de delegacao
+        try {
+          const resp = await fetch('http://localhost:3010/api/luna/delegate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agent_target: result.agent,
+              task_type: result.task,
+              conversation_id: conversationInfo.id,
+              client_id: clientInfo.id,
+              payload: result.payload
+            })
+          });
+          const data = await resp.json();
+          log(`[Luna v2] Task delegada: ${data.task_id} -> ${result.agent}`);
+        } catch (err) {
+          log(`[Luna v2] Erro ao delegar: ${err.message}`);
+        }
+        break;
+
+      case 'coletar_dados':
+        await botSend(msg.from, result.pergunta);
+        break;
+
+      case 'escalate':
+        log(`[Luna v2] Escalando para humano: ${result.reason}`);
+        return false; // Deixa o legado processar
+
+      case 'error':
+        if (result.fallback) {
+          return false; // Deixa o legado processar
+        }
+        await botSend(msg.from, result.message || 'Desculpe, tive um problema.');
+        break;
+
+      default:
+        return false; // Acao desconhecida, usa legado
+    }
+
+    return true; // Luna v2 processou com sucesso
+
+  } catch (error) {
+    console.error('[Luna v2] Erro:', error.message);
+    return false; // Fallback para legado
+  }
+}
+
+// Helper: busca info do cliente pelo telefone
+async function getClientInfo(phone) {
+  try {
+    const result = await query(
+      'SELECT id, name, trade_name, phone FROM clients WHERE phone = $1',
+      [phone]
+    );
+    return result.rows[0] || { id: null, name: 'Cliente', trade_name: null, phone: null };
+  } catch (err) {
+    log(`[Luna v2] Erro getClientInfo: ${err.message}`);
+    return { id: null, name: 'Cliente', trade_name: null, phone: null };
+  }
+}
+
+// Helper: busca/cria conversa Luna v2
+async function getConversationInfo(chatId) {
+  try {
+    const phone = chatId.replace('@c.us', '');
+    const result = await query(
+      `SELECT id, phone, client_id, status, stage, contexto, classificacao, agente_atual, mensagens_count
+       FROM luna_v2.conversations
+       WHERE phone = $1 AND status = 'active'
+       ORDER BY started_at DESC LIMIT 1`,
+      [phone]
+    );
+    if (result.rows[0]) {
+      // Incrementar msg_count
+      await query(
+        'UPDATE luna_v2.conversations SET mensagens_count = mensagens_count + 1, last_message_at = NOW() WHERE id = $1',
+        [result.rows[0].id]
+      );
+      return result.rows[0];
+    }
+    // Criar nova conversa Luna v2
+    const newConv = await query(
+      `INSERT INTO luna_v2.conversations (phone, status, mensagens_count)
+       VALUES ($1, 'active', 1)
+       RETURNING id, phone, status, mensagens_count`,
+      [phone]
+    );
+    return newConv.rows[0] || { id: null };
+  } catch (err) {
+    log(`[Luna v2] Erro getConversationInfo: ${err.message}`);
+    return { id: null };
+  }
+}
+
+
 async function handleIncoming(msg) {
   const from = msg.from;
 
@@ -508,6 +621,22 @@ async function handleIncoming(msg) {
   const realPhone = contact?.id?.user || contact?.number || phone;
 
   log(`${name} (${phone}): ${body.substring(0, 80)}`);
+
+    // ====== NOVO: Tentar Luna v2 primeiro ======
+    try {
+      const clientInfo = await getClientInfo(phone);
+      const conversationInfo = await getConversationInfo(from);
+      const processedByLunaV2 = await handleLunaV2(msg, clientInfo, conversationInfo);
+      if (processedByLunaV2) {
+        log(`[Luna v2] Mensagem processada por Luna v2 para ${name}`);
+        return; // Luna v2 processou, nao continuar com legado
+      }
+    } catch (lunaErr) {
+      log(`[Luna v2] Erro, usando legado: ${lunaErr.message}`);
+    }
+    // =============================================
+
+
 
   // Notifica dashboard
   broadcastFn?.({

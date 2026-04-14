@@ -38,7 +38,7 @@ export default function VirtualOffice({ onSelectAgent }) {
   useEffect(() => {
     if (!agents.length) return
     const state = stateRef.current
-    agents.forEach(agent => {
+    (agents || []).forEach(agent => {
       const pos = AVATAR_POSITIONS[agent.name]
       if (pos && !state.avatars[agent.name]) {
         state.avatars[agent.name] = {

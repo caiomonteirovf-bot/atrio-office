@@ -6,16 +6,22 @@ export default function ActivityHeatmap() {
 
   useEffect(() => {
     fetch('/api/analytics/activity')
-      .then(r => r.json())
-      .then(setData)
-      .catch(console.error)
+      .then(r => {
+        if (!r.ok) throw new Error('API error')
+        return r.json()
+      })
+      .then(d => {
+        if (d && Array.isArray(d.heatmap)) setData(d)
+      })
+      .catch(() => {})
   }, [])
 
   // Build 52 weeks x 7 days grid
   const today = new Date()
   const grid = []
   const dataMap = {}
-  data.heatmap.forEach(d => { dataMap[d.date] = d.count })
+  const heatmap = data.heatmap || []
+  heatmap.forEach(d => { dataMap[d.date] = d.count })
 
   // Start from 364 days ago (52 weeks)
   const start = new Date(today)
@@ -23,83 +29,53 @@ export default function ActivityHeatmap() {
   // Align to Sunday
   start.setDate(start.getDate() - start.getDay())
 
-  for (let w = 0; w < 53; w++) {
-    const week = []
-    for (let d = 0; d < 7; d++) {
-      const date = new Date(start)
-      date.setDate(date.getDate() + w * 7 + d)
-      const key = date.toISOString().split('T')[0]
-      const count = dataMap[key] || 0
-      const isFuture = date > today
-      week.push({ date: key, count, isFuture })
+  let currentDate = new Date(start)
+  let currentWeek = []
+
+  while (currentDate <= today || currentWeek.length > 0) {
+    const dateStr = currentDate.toISOString().split('T')[0]
+    const isFuture = currentDate > today
+    currentWeek.push({
+      date: dateStr,
+      count: dataMap[dateStr] || 0,
+      isFuture,
+    })
+
+    if (currentWeek.length === 7) {
+      grid.push(currentWeek)
+      currentWeek = []
+      if (isFuture) break
     }
-    grid.push(week)
+
+    currentDate.setDate(currentDate.getDate() + 1)
   }
 
-  const maxCount = Math.max(...data.heatmap.map(d => d.count), 1)
-
-  function getColor(count, isFuture) {
+  const getColor = (count, isFuture) => {
     if (isFuture) return 'transparent'
     if (count === 0) return 'rgba(255,255,255,0.03)'
-    const intensity = Math.min(count / maxCount, 1)
-    // Gold scale: from dim to saturated
-    if (intensity < 0.25) return 'rgba(196,149,106,0.15)'
-    if (intensity < 0.5) return 'rgba(196,149,106,0.35)'
-    if (intensity < 0.75) return 'rgba(196,149,106,0.6)'
+    if (count <= 2) return 'rgba(196,149,106,0.15)'
+    if (count <= 5) return 'rgba(196,149,106,0.35)'
+    if (count <= 10) return 'rgba(196,149,106,0.6)'
     return 'rgba(196,149,106,0.9)'
   }
 
-  const days = ['Dom','','Ter','','Qui','','Sab']
-
-  const totalActivity = data.heatmap.reduce((sum, d) => sum + d.count, 0)
+  const todayData = data.today || {}
 
   return (
-    <div style={{
-      background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
-      backdropFilter: 'blur(12px)',
-      border: '1px solid rgba(255,255,255,0.06)',
-      borderRadius: 12,
-      padding: '20px 24px',
-    }}>
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-        <div>
-          <h3 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 15, fontWeight: 600, margin: 0 }}>
-            Atividade da Equipe
-          </h3>
-          <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12, margin: '4px 0 0' }}>
-            {totalActivity} ações nos últimos 12 meses
-          </p>
-        </div>
-        <div style={{ display: 'flex', gap: 16, fontSize: 12 }}>
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ color: '#C4956A', fontSize: 18, fontWeight: 700 }}>{data.today.tasks_today || 0}</div>
-            <div style={{ color: 'rgba(255,255,255,0.5)' }}>Tasks hoje</div>
-          </div>
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ color: '#C4956A', fontSize: 18, fontWeight: 700 }}>{data.today.messages_today || 0}</div>
-            <div style={{ color: 'rgba(255,255,255,0.5)' }}>Msgs hoje</div>
-          </div>
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ color: '#22c55e', fontSize: 18, fontWeight: 700 }}>{data.today.completed_today || 0}</div>
-            <div style={{ color: 'rgba(255,255,255,0.5)' }}>Concluídas</div>
-          </div>
+    <div style={{ padding: '20px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+        <h3 style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.85)', margin: 0 }}>
+          Atividade
+        </h3>
+        <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>
+          <span>{todayData.tasks_today || 0} tasks hoje</span>
+          <span>{todayData.messages_today || 0} mensagens</span>
+          <span>{todayData.completed_today || 0} concludas</span>
         </div>
       </div>
 
-      {/* Grid */}
-      <div style={{ display: 'flex', gap: 2, position: 'relative' }}>
-        {/* Day labels */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginRight: 4, paddingTop: 16 }}>
-          {days.map((d, i) => (
-            <div key={i} style={{ height: 11, width: 24, fontSize: 9, color: 'rgba(255,255,255,0.35)', display: 'flex', alignItems: 'center' }}>
-              {d}
-            </div>
-          ))}
-        </div>
-
-        {/* Weeks */}
-        <div style={{ display: 'flex', gap: 2, flex: 1, overflow: 'hidden' }}>
+      <div style={{ overflowX: 'auto' }}>
+        <div style={{ display: 'flex', gap: 2 }}>
           {grid.map((week, wi) => (
             <div key={wi} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
               {week.map((day, di) => (
@@ -147,7 +123,7 @@ export default function ActivityHeatmap() {
           pointerEvents: 'none',
           whiteSpace: 'nowrap',
         }}>
-          <strong>{tooltip.count}</strong> ações em {tooltip.date}
+          <strong>{tooltip.count}</strong> aes em {tooltip.date}
         </div>
       )}
     </div>

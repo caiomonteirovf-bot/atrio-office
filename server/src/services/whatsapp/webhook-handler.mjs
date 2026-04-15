@@ -7,6 +7,10 @@
  */
 
 // axios removed - using native fetch
+import { buildContext, persistTurn, extractFactsAsync } from '../luna-memory.js';
+import { chatWithAgent, extractText } from '../claude.js';
+import { makeLunaExecutor } from '../luna-tools.js';
+import { query } from '../../db/pool.js';
 
 const OPENCLAW_GATEWAY = process.env.OPENCLAW_GATEWAY || 'http://localhost:18789';
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
@@ -14,14 +18,43 @@ const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
 /**
  * Handler principal - chamado pelo whatsapp.js quando recebe mensagem
  */
+function stripCtx(t){ const i = t.indexOf('---FIM CONTEXTO---'); return i>=0 ? t.slice(i+'---FIM CONTEXTO---'.length).replace(/^\s+/, '') : t; }
 async function handleWhatsAppMessage(message, clientInfo, conversationInfo) {
   // 1. Formatar payload para OpenClaw
   const payload = formatMessage(message, clientInfo, conversationInfo);
-  
+
+  // 1.b RAG: injeta contexto (perfil + memorias + historico) antes de chamar Luna
+  let ctx = { block: '', conversationId: null, clientId: null };
   try {
-    // 2. Enviar para Luna (OpenClaw)
+    ctx = await buildContext({ phone: payload.phone, clientInfo });
+    if (ctx.block) {
+      payload.mensagem = payload.mensagem || {};
+      payload.mensagem.conteudo = ctx.block + (payload.mensagem.conteudo || '');
+    }
+  } catch (e) {
+    console.error('[Webhook] buildContext erro (seguindo sem contexto):', e.message);
+  }
+
+  const userContent = stripCtx(payload.mensagem?.conteudo || '');
+
+
+  try {
+    // 2. Enviar para Luna (OpenClaw) — instrumenta latencia
+    const __t0 = Date.now();
     const result = await sendToOpenClaw(payload);
-    
+    const __latencyMs = Date.now() - __t0;
+
+    // 2.b Retroalimentacao: grava turno em luna_v2.messages
+    persistTurn({
+      conversationId: ctx.conversationId,
+      userContent,
+      assistantContent: result?.reply || result?.message || '',
+      llmLatencyMs: __latencyMs,
+      modelUsed: result?.provider || null,
+      toolCalls: result?.usage?.tool_calls || 0,
+    }).catch((e) => console.error('[Webhook] persistTurn:', e.message));
+    extractFactsAsync({ conversationId: ctx.conversationId, clientId: ctx.clientId, userContent, assistantContent: result?.reply }).catch(() => {});
+
     // 3. Processar resposta da Luna com validação obrigatória
     return await processLunaResponseComValidacao(result, payload, conversationInfo);
     
@@ -39,33 +72,31 @@ async function handleWhatsAppMessage(message, clientInfo, conversationInfo) {
  * Envia mensagem para OpenClaw
  */
 async function sendToOpenClaw(payload) {
-  const data = {
-    sessionKey: `luna:${payload.conversation_id}`,
-    agentId: 'luna-orchestrator',
-    task: `Processar mensagem de ${payload.cliente.name}`,
-    attachments: [{
-      name: 'whatsapp.json',
-      content: JSON.stringify(payload),
-      mimeType: 'application/json'
-    }],
-    timeoutSeconds: 60
-  };
-
-  const response = await fetch(
-    `${OPENCLAW_GATEWAY}/api/sessions/spawn`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(OPENCLAW_TOKEN && { 'Authorization': `Bearer ${OPENCLAW_TOKEN}` })
-      },
-      body: JSON.stringify(data),
-      signal: AbortSignal.timeout(65000)
-    }
+  // LLM direto + tool use loop via claude.js chatWithAgent.
+  const { rows } = await query(
+    "SELECT id, name, role, system_prompt, personality, tools, config FROM public.agents WHERE name = 'Luna' LIMIT 1"
   );
+  if (!rows[0]) throw new Error('Agente Luna nao encontrado em public.agents');
+  const lunaAgent = rows[0];
 
-  const resData = await response.json();
-  return resData;
+  const userContent = payload.mensagem?.conteudo || payload.message?.body || payload.message?.text || payload.text || '';
+  const executor = makeLunaExecutor({
+    conversationId: payload.__conversationId || null,
+    clientId: payload.__clientId || null,
+    phone: payload.phone || null,
+  });
+
+  const resp = await chatWithAgent(lunaAgent, [{ role: 'user', content: userContent }], executor);
+  if (!resp?.success) throw new Error('LLM Luna erro: ' + (resp?.error || 'desconhecido'));
+  const reply = (resp.text || '').trim() || '...';
+  return {
+    type: 'message',
+    message: reply,
+    success: true,
+    reply,
+    provider: resp.provider,
+    usage: resp.usage,
+  };
 }
 
 const CAMPOS_OBRIGATORIOS = {
@@ -247,7 +278,7 @@ function formatMessage(msg, client, conversation) {
   return {
     message_id: msg.id?.id || `msg_${Date.now()}`,
     conversation_id: conversation.id,
-    phone: msg.from?.replace('@c.us', '') || '',
+    phone: (client?.realPhone || msg.from?.replace(/@.*$/, '') || '').replace(/\D/g, ''),
     cliente: {
       id: client.id,
       nome: client.name || 'Cliente',

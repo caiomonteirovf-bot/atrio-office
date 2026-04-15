@@ -19,6 +19,8 @@ const MODEL_PRICING = {
   'deepseek-chat':          { input: 0.0005, output: 0.001 },
   // MiniMax (legacy)
   'MiniMax-Text-01':        { input: 0.001, output: 0.002 },
+  // OpenRouter (Kimi)
+  'moonshotai/kimi-k2.5':   { input: 0.0006, output: 0.0025 },
   // Default fallback
   _default:                 { input: 0.001, output: 0.002 },
 };
@@ -75,6 +77,10 @@ const deepseek = process.env.DEEPSEEK_API_KEY
   : null;
 
 // MiniMax (legado — manter durante transição de 14 dias)
+const openrouter = process.env.OPENROUTER_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENROUTER_API_KEY, baseURL: 'https://openrouter.ai/api/v1' })
+  : null;
+
 const minimax = process.env.MINIMAX_API_KEY
   ? new OpenAI({ apiKey: process.env.MINIMAX_API_KEY, baseURL: 'https://api.minimax.io/v1' })
   : null;
@@ -87,7 +93,7 @@ const AGENT_CONFIG = {
   'Rodrigo':   { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.1, maxTokens: 1024 },
   'Sneijder':  { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.2, maxTokens: 1024 },
   'Sofia':     { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.2, maxTokens: 1024 },
-  'Luna':      { provider: 'deepseek',  model: 'deepseek-chat',      temperature: 0.5, maxTokens: 512  },
+  'Luna':      { provider: 'openrouter', model: 'x-ai/grok-4-fast', temperature: 0.5, maxTokens: 1024 },
   'Valência':  { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.2, maxTokens: 1024 },
   'Maia':      { provider: 'grok',      model: 'grok-4-1-fast',      temperature: 0.2, maxTokens: 1024 },
   'Dara':      { provider: 'deepseek',  model: 'deepseek-chat',      temperature: 0.3, maxTokens: 512  },
@@ -103,6 +109,7 @@ function getOpenAIClient(provider) {
   if (provider === 'grok' && grok) return grok;
   if (provider === 'deepseek' && deepseek) return deepseek;
   if (provider === 'minimax' && minimax) return minimax;
+  if (provider === 'openrouter' && openrouter) return openrouter;
   // Fallback chain: grok → deepseek → minimax
   return grok || deepseek || minimax;
 }
@@ -113,6 +120,7 @@ if (anthropic) providers.push('Anthropic (Campelo)');
 if (grok) providers.push('xAI Grok (Campelo/Rodrigo/Sneijder/Sofia)');
 if (deepseek) providers.push('DeepSeek (Luna/Fallback)');
 if (minimax) providers.push('MiniMax (legado)');
+if (openrouter) providers.push('OpenRouter (Luna/Kimi)');
 console.log(`[LLM] Provedores: ${providers.join(', ') || 'NENHUM!'}`);
 
 // ============================================
@@ -378,6 +386,7 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
 
   const agentForRequest = toolExecutor ? agent : { ...agent, tools: [] };
   let iterations = 0;
+  const _toolCallHistory = new Map(); // tool+args hash -> count
 
   while (iterations < 10) {
     const response = await sendToOpenAI(agentForRequest, currentMessages);
@@ -415,7 +424,17 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
       for (const toolCall of toolCalls) {
         const fnName = toolCall.function.name;
         const fnArgs = JSON.parse(toolCall.function.arguments || '{}');
-        const result = await toolExecutor(fnName, fnArgs);
+        const sig = fnName + ':' + JSON.stringify(fnArgs);
+        const prev = _toolCallHistory.get(sig) || 0;
+        _toolCallHistory.set(sig, prev + 1);
+        let result;
+        if (prev >= 1) {
+          // Chamada duplicada — injeta aviso em vez de reexecutar
+          result = { ok: false, erro: 'tool-call duplicada detectada. Voce ja chamou ' + fnName + ' com os mesmos argumentos nessa conversa — NAO repita. Use o resultado anterior ou siga pro proximo passo.', duplicata: true };
+          console.log('[chatWithAgent] dedup: ' + fnName + ' chamada ' + (prev + 1) + 'x, bloqueando');
+        } else {
+          result = await toolExecutor(fnName, fnArgs);
+        }
         currentMessages.push({
           role: 'tool',
           content: typeof result === 'string' ? result : JSON.stringify(result),

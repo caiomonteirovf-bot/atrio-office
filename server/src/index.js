@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { query } from './db/pool.js';
 import { chatWithAgent, extractText } from './services/claude.js';
+import { startWatchdog } from './services/luna-watchdog.js';
 import { executeToolCall, setOnTaskCreated } from './tools/registry.js';
 import { processTask, processPendingTasks, setBroadcast, setLogChat } from './services/orchestrator.js';
 import { createNotification } from './services/notifications.js';
@@ -28,7 +29,13 @@ const clientDistOptions = [
 ];
 import fs from 'fs';
 const clientDist = clientDistOptions.find(p => fs.existsSync(p)) || clientDistOptions[0];
-app.use(express.static(clientDist));
+app.use(express.static(clientDist, {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('index.html')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
+  }
+}));
 
 // ============================================
 // HEALTH CHECK
@@ -1340,7 +1347,59 @@ app.post('/api/memory/triggers/run', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+app.get('/api/memory/luna-facts', async (req, res) => {
+  try {
+    const { client, search, status, area, areas, tipos, limit = 200 } = req.query;
+    let sql = `SELECT m.id, m.tipo, m.titulo, m.conteudo, m.agent_id, m.client_id, m.area,
+                      m.tags, m.prioridade, m.confianca, m.uso_count, m.status,
+                      m.is_rag_enabled, m.trigger_type, m.trigger_ref,
+                      m.created_at, m.updated_at, m.last_used_at,
+                      COALESCE(c.nome_fantasia, c.nome_legal, c2.nome_fantasia, c2.nome_legal) AS client_name,
+                      COALESCE(c.cnpj, c2.cnpj) AS client_cnpj,
+                      conv.phone AS conversation_phone,
+                      conv.id AS conversation_id
+               FROM luna_v2.memories m
+               LEFT JOIN luna_v2.clients c ON c.id = m.client_id
+               LEFT JOIN luna_v2.conversations conv ON conv.id::text = m.trigger_ref
+               LEFT JOIN luna_v2.clients c2 ON c2.id = conv.client_id
+               WHERE 1=1`;
+    const params=[];
+    if (client) { params.push(client); sql += ` AND COALESCE(c.nome_fantasia, c.nome_legal) ILIKE '%'||$${params.length}||'%'`; }
+    if (search) { params.push(`%${search}%`); sql += ` AND (m.titulo ILIKE $${params.length} OR m.conteudo ILIKE $${params.length})`; }
+    if (status && status !== 'all') { params.push(status); sql += ` AND m.status = $${params.length}`; }
+    const areaList = areas ? String(areas).split(',').filter(Boolean) : (area ? [area] : []);
+    if (areaList.length) { params.push(areaList); sql += ` AND m.area = ANY($${params.length}::text[])`; }
+    const tipoList = tipos ? String(tipos).split(',').filter(Boolean) : [];
+    if (tipoList.length) { params.push(tipoList); sql += ` AND m.tipo = ANY($${params.length}::text[])`; }
+    params.push(parseInt(limit));
+    sql += ` ORDER BY m.updated_at DESC LIMIT $${params.length}`;
+    const r = await query(sql, params);
+    const stats = await query(`SELECT
+      COUNT(*) FILTER (WHERE status='ativa') AS ativa,
+      COUNT(*) FILTER (WHERE status='pending') AS pending,
+      COUNT(*) FILTER (WHERE last_used_at IS NULL AND created_at < now() - interval '30 days') AS stale,
+      COUNT(DISTINCT client_id) AS clients,
+      COUNT(*) AS total FROM luna_v2.memories`);
+    res.json({ facts: r.rows, stats: stats.rows[0] });
+  } catch (e) { console.error('[LunaFacts]', e); res.status(500).json({ error: e.message }); }
+});
 app.use('/api/luna', agentsRouter);
+
+import { registerCostsOpenRouter } from './routes/costs-openrouter.js';
+app.use(express.text({ type: 'text/csv', limit: '50mb' }));
+registerCostsOpenRouter(app);
+import { registerMemoryCrud } from './routes/memory-crud.js';
+registerMemoryCrud(app);
+import { registerAdminCleanup } from './routes/admin-cleanup.js';
+import { registerDatalake } from './routes/datalake.js';
+import { registerMemoryReflect } from './routes/memory-reflect.js';
+import { registerSentiment } from './routes/sentiment.js';
+import { registerLunaHealth } from './routes/luna-health.js';
+registerAdminCleanup(app);
+registerDatalake(app);
+registerMemoryReflect(app);
+registerSentiment(app);
+registerLunaHealth(app);
 
 // ============================================
 // SPA FALLBACK — Serve index.html para rotas do frontend
@@ -1385,6 +1444,7 @@ app.post('/api/orchestrator/run', async (req, res) => {
 // ============================================
 // STARTUP
 // ============================================
+startWatchdog();
 server.listen(PORT, () => {
   // Conecta orchestrator ao broadcast e ao registry
   setBroadcast(broadcast);

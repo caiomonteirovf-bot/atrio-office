@@ -241,6 +241,156 @@ function isHorarioComercial() {
   return { open, isLunch, reason };
 }
 
+// ============================================
+// Buffer de inbound — agrupa mensagens do mesmo contato em 10s
+// antes de enviar pra Luna (evita respostas duplicadas)
+// ============================================
+const __lunaInboundBuffer = new Map();
+const LUNA_DEBOUNCE_MS = Number(process.env.LUNA_DEBOUNCE_MS || 2500);
+
+async function __persistBuffer(phone, entry) {
+  try {
+    const flushAt = new Date(Date.now() + LUNA_DEBOUNCE_MS);
+    await query(`
+      INSERT INTO luna_v2.inbound_buffer (phone, msgs, latest_msg, client_info, conversation_info, flush_at)
+      VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb, $6)
+      ON CONFLICT (phone) DO UPDATE SET
+        msgs = EXCLUDED.msgs,
+        latest_msg = EXCLUDED.latest_msg,
+        client_info = EXCLUDED.client_info,
+        conversation_info = EXCLUDED.conversation_info,
+        flush_at = EXCLUDED.flush_at
+    `, [phone, JSON.stringify(entry.msgs), JSON.stringify(entry.latestMsg || {}),
+        JSON.stringify(entry.clientInfo || {}), JSON.stringify(entry.conversationInfo || {}), flushAt]);
+  } catch (e) { console.error('[Buffer] persist erro:', e.message); }
+}
+
+function scheduleLunaProcess(phone, msg, clientInfo, conversationInfo, processFn) {
+  const existing = __lunaInboundBuffer.get(phone);
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.msgs.push(msg.body || '');
+    existing.latestMsg = msg;
+    existing.clientInfo = clientInfo;
+    existing.conversationInfo = conversationInfo;
+    existing.timer = setTimeout(() => __lunaFlush(phone, processFn), LUNA_DEBOUNCE_MS);
+    __persistBuffer(phone, existing);
+    log('[Buffer] +1 msg p/ ' + phone + ' (total: ' + existing.msgs.length + ') — timer resetado');
+    return;
+  }
+  // Flush rapido (1.5s) pra mensagens que parecem completas: terminam com pontuacao
+  // final ou sao saudacoes curtas isoladas (oi/ola/bom dia/etc)
+  const body = (msg.body || '').trim();
+  const looksComplete = /[.!?]$/.test(body) || /^(oi|ola|olá|bom dia|boa tarde|boa noite|hey|hi|e ai|eai)[.!?\s]*$/i.test(body);
+  const waitMs = looksComplete ? 1500 : LUNA_DEBOUNCE_MS;
+  const entry = {
+    msgs: [msg.body || ''],
+    latestMsg: msg,
+    clientInfo,
+    conversationInfo,
+    timer: setTimeout(() => __lunaFlush(phone, processFn), waitMs),
+  };
+  __lunaInboundBuffer.set(phone, entry);
+  __persistBuffer(phone, entry);
+  log('[Buffer] buffer iniciado p/ ' + phone + ' — aguarda ' + waitMs + 'ms' + (looksComplete ? ' (flush rapido)' : ''));
+}
+
+async function __lunaFlush(phone, processFn) {
+  const entry = __lunaInboundBuffer.get(phone);
+  if (!entry) return;
+  __lunaInboundBuffer.delete(phone);
+  const combinedBody = entry.msgs.filter(Boolean).join('\n');
+  const msg = entry.latestMsg;
+  const proxyMsg = new Proxy(msg, {
+    get(t, k) { return k === 'body' ? combinedBody : t[k]; }
+  });
+
+  // REGRA: Se humano assumiu a conversa, Luna NAO responde.
+  // Humano "dono" quando last_human_reply_at existe e nenhuma das condicoes de retomada bate:
+  //  - cliente mandou mensagem e humano nao respondeu em > HANDOFF_REENGAGE_MIN minutos
+  //  - OU a ultima resposta do humano foi muito curta/vaga (< 8 chars) E cliente voltou a escrever
+  try {
+    const HANDOFF_REENGAGE_MIN = Number(process.env.LUNA_REENGAGE_MIN || 30);
+    const { rows } = await query(`
+      SELECT c.last_human_reply_at, c.last_inbound_at, c.id,
+             (SELECT content FROM luna_v2.messages m
+                WHERE m.conversation_id = c.id AND m.direction='outbound'
+                ORDER BY created_at DESC LIMIT 1) AS last_outbound_body
+      FROM luna_v2.conversations c WHERE c.phone = $1
+      ORDER BY c.last_message_at DESC LIMIT 1
+    `, [phone]);
+    const r = rows[0];
+    if (r && r.last_human_reply_at) {
+      const humanAt = new Date(r.last_human_reply_at).getTime();
+      const inboundAt = r.last_inbound_at ? new Date(r.last_inbound_at).getTime() : 0;
+      const minutesSinceHuman = (Date.now() - humanAt) / 60000;
+      const lastOutShort = String(r.last_outbound_body || '').trim().length < 8;
+      const humanOwns = humanAt > inboundAt - 1000; // humano respondeu depois (ou junto) do ultimo inbound
+
+      // Se humano foi o ultimo a falar E resposta dele nao foi vaga E nao passou o limite — Luna fica quieta
+      if (humanOwns && !lastOutShort && minutesSinceHuman < HANDOFF_REENGAGE_MIN) {
+        log('[Handoff] ' + phone + ' — humano ativo (ultima resposta ha ' + Math.round(minutesSinceHuman) + 'min), Luna em pausa');
+        return;
+      }
+      // Caso precise retomar: marca motivo e segue
+      if (humanOwns && minutesSinceHuman >= HANDOFF_REENGAGE_MIN) {
+        log('[Handoff] ' + phone + ' — humano inativo ha ' + Math.round(minutesSinceHuman) + 'min, Luna retoma + alerta');
+        try {
+          await query(`INSERT INTO public.tasks (title, status, result, created_at)
+                       VALUES ($1, 'pending', $2::jsonb, now())`,
+            ['[ALERTA] Atendimento humano em inercia — ' + phone,
+             JSON.stringify({ type: 'handoff_inertia', conversation_id: r.id, phone, minutos_sem_resposta: Math.round(minutesSinceHuman) })]);
+        } catch (_) {}
+      }
+      if (humanOwns && lastOutShort) {
+        log('[Handoff] ' + phone + ' — resposta humana vaga, Luna retoma + alerta');
+        try {
+          await query(`INSERT INTO public.tasks (title, status, result, created_at)
+                       VALUES ($1, 'pending', $2::jsonb, now())`,
+            ['[ALERTA] Resposta humana vaga — ' + phone,
+             JSON.stringify({ type: 'handoff_vague', conversation_id: r.id, phone, ultima_resposta: r.last_outbound_body })]);
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    console.error('[Handoff] check falhou:', e.message);
+  }
+
+  log('[Buffer] flush ' + phone + ' — ' + entry.msgs.length + ' msg(s) combinadas');
+  // Deleta ANTES de processar — evita re-flush duplicado se servidor reiniciar no meio
+  try { await query('DELETE FROM luna_v2.inbound_buffer WHERE phone = $1', [phone]); } catch (_) {}
+  try { await processFn(proxyMsg, entry.clientInfo, entry.conversationInfo); }
+  catch (e) { log('[Buffer] processFn erro: ' + e.message); }
+}
+
+// Rehidratacao de buffers persistidos apos restart
+export async function rehydrateLunaBuffer(processFn) {
+  try {
+    const { rows } = await query('SELECT phone, msgs, latest_msg, client_info, conversation_info, flush_at FROM luna_v2.inbound_buffer');
+    if (!rows.length) return;
+    const now = Date.now();
+    log('[Buffer] rehidratando ' + rows.length + ' buffer(s) do PG');
+    for (const r of rows) {
+      const entry = {
+        msgs: r.msgs || [],
+        latestMsg: r.latest_msg || {},
+        clientInfo: r.client_info || {},
+        conversationInfo: r.conversation_info || {},
+        timer: null,
+      };
+      const remaining = new Date(r.flush_at).getTime() - now;
+      if (remaining <= 0) {
+        // flush imediato
+        __lunaInboundBuffer.set(r.phone, entry);
+        __lunaFlush(r.phone, processFn).catch(e => log('[Buffer] rehydrate flush erro: ' + e.message));
+      } else {
+        entry.timer = setTimeout(() => __lunaFlush(r.phone, processFn), remaining);
+        __lunaInboundBuffer.set(r.phone, entry);
+      }
+    }
+  } catch (e) { log('[Buffer] rehidratar erro: ' + e.message); }
+}
+
 function normalizePhone(from) {
   // Remove qualquer sufixo (@c.us, @lid, @s.whatsapp.net, etc)
   return from.replace(/@.*$/, '');
@@ -403,6 +553,13 @@ export async function initialize() {
     qrCodeData = null;
     broadcastFn?.({ type: 'whatsapp_ready', phone: client.info?.wid?.user });
 
+    // Rehydrate buffer persistido no PG (post-restart)
+    try {
+      await rehydrateLunaBuffer(async (aggMsg, cInfo, convInfo) => {
+        await handleLunaV2(aggMsg, cInfo, convInfo);
+      });
+    } catch (e) { log('rehydrate buffer: ' + e.message); }
+
     // Restaura conversas ativas do banco e retoma fluxos pendentes
     const restored = await dbLoadActiveConversations();
     if (restored > 0) {
@@ -459,6 +616,11 @@ export async function initialize() {
     conv.messages.push({ body: msg.body, from: 'team', at: new Date().toISOString() });
     dbSaveMessage(conv, 'team', msg.body);
     markAsReplied(msg.to);
+    // Watchdog hook: humano respondeu — marca luna_v2.conversations
+    try {
+      const _ph = normalizePhone(msg.to);
+      await query(`UPDATE luna_v2.conversations SET last_human_reply_at = NOW(), last_outbound_at = NOW() WHERE phone = $1`, [_ph]);
+    } catch (e) { log('watchdog hook human reply: ' + e.message); }
     log(`Humano respondeu para ${conv.name}`);
 
     // Agenda análise 2min depois
@@ -499,9 +661,11 @@ export async function initialize() {
 async function handleLunaV2(msg, clientInfo, conversationInfo) {
   try {
     const result = await handleWhatsAppMessage(msg, clientInfo, conversationInfo);
+    let replyText = '';
 
     switch (result.action) {
       case 'send_message':
+        replyText = result.content;
         await botSend(msg.from, result.content);
         break;
 
@@ -530,50 +694,116 @@ async function handleLunaV2(msg, clientInfo, conversationInfo) {
         break;
 
       case 'coletar_dados':
+        replyText = result.pergunta;
         await botSend(msg.from, result.pergunta);
         break;
 
       case 'escalate':
         log(`[Luna v2] Escalando para humano: ${result.reason}`);
-        return false; // Deixa o legado processar
+        return { handled: false };
 
       case 'error':
         if (result.fallback) {
-          return false; // Deixa o legado processar
+          return { handled: false };
         }
-        await botSend(msg.from, result.message || 'Desculpe, tive um problema.');
+        replyText = result.message || 'Desculpe, tive um problema.';
+        await botSend(msg.from, replyText);
         break;
 
       default:
-        return false; // Acao desconhecida, usa legado
+        return { handled: false };
     }
 
-    return true; // Luna v2 processou com sucesso
+    return { handled: true, reply: replyText, action: result.action };
 
   } catch (error) {
     console.error('[Luna v2] Erro:', error.message);
-    return false; // Fallback para legado
+    return { handled: false };
   }
 }
 
 // Helper: busca info do cliente pelo telefone
+async function upsertLunaClient(g) {
+  // Espelha empresa do Gesthub em luna_v2.clients (chave: CNPJ). Retorna uuid local.
+  if (!g) return null;
+  const cnpj = g.cnpj ? String(g.cnpj).replace(/\D/g, '') : null;
+  const nomeLegal = g.razao_social || g.nome_fantasia || g.name || 'Cliente';
+  const nomeFantasia = g.nome_fantasia || null;
+  const regime = g.regime || g.regime_tributario || null;
+  try {
+    if (cnpj) {
+      // Formato esperado 14 digitos ou XX.XXX.XXX/XXXX-XX; a coluna aceita varchar(18)
+      const formatted = cnpj.length === 14
+        ? `${cnpj.slice(0,2)}.${cnpj.slice(2,5)}.${cnpj.slice(5,8)}/${cnpj.slice(8,12)}-${cnpj.slice(12,14)}`
+        : cnpj;
+      const { rows } = await query(
+        `INSERT INTO luna_v2.clients (cnpj, nome_legal, nome_fantasia, regime_tributario, sync_gesthub_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (cnpj) DO UPDATE
+           SET nome_legal = EXCLUDED.nome_legal,
+               nome_fantasia = COALESCE(EXCLUDED.nome_fantasia, luna_v2.clients.nome_fantasia),
+               regime_tributario = COALESCE(EXCLUDED.regime_tributario, luna_v2.clients.regime_tributario),
+               sync_gesthub_at = NOW()
+         RETURNING id`,
+        [formatted, nomeLegal, nomeFantasia, regime]
+      );
+      return rows[0]?.id || null;
+    }
+    // Sem CNPJ: tenta upsert pelo par (nome_legal, gesthub_id NULL) — menos confiavel, so para nao perder o cliente
+    const { rows } = await query(
+      `INSERT INTO luna_v2.clients (nome_legal, nome_fantasia, regime_tributario, sync_gesthub_at)
+       VALUES ($1, $2, $3, NOW()) RETURNING id`,
+      [nomeLegal, nomeFantasia, regime]
+    );
+    return rows[0]?.id || null;
+  } catch (err) {
+    log(`[Luna v2] upsertLunaClient erro: ${err.message}`);
+    return null;
+  }
+}
+
 async function getClientInfo(phone) {
+  // 1) Gesthub e o master: procura empresa cujo CONTATO da carteira tem esse numero
+  try {
+    const g = await findClientByPhone(phone);
+    if (g) {
+      const lunaUuid = await upsertLunaClient(g);
+      return {
+        id: lunaUuid,
+        gesthub_id: g.id || null,
+        name: g.nome_fantasia || g.razao_social || g.name || 'Cliente',
+        trade_name: g.nome_fantasia || g.trade_name || null,
+        nome_fantasia: g.nome_fantasia || null,
+        razao_social: g.razao_social || null,
+        cnpj: g.cnpj || null,
+        regime: g.regime || g.regime_tributario || null,
+        municipio: g.municipio || g.cidade || null,
+        phone: g.phone || null,
+        contato: g._contato || null,
+        source: 'gesthub',
+      };
+    }
+  } catch (err) {
+    log(`[Luna v2] Gesthub findClientByPhone falhou: ${err.message}`);
+  }
+  // 2) Fallback: tabela local
   try {
     const result = await query(
       'SELECT id, name, trade_name, phone FROM clients WHERE phone = $1',
       [phone]
     );
-    return result.rows[0] || { id: null, name: 'Cliente', trade_name: null, phone: null };
+    if (result.rows[0]) return { ...result.rows[0], source: 'local' };
   } catch (err) {
-    log(`[Luna v2] Erro getClientInfo: ${err.message}`);
-    return { id: null, name: 'Cliente', trade_name: null, phone: null };
+    log(`[Luna v2] Erro getClientInfo local: ${err.message}`);
   }
+  return { id: null, name: 'Cliente', trade_name: null, phone: null, source: 'unknown' };
 }
 
 // Helper: busca/cria conversa Luna v2
-async function getConversationInfo(chatId) {
+async function getConversationInfo(chatId, clientInfo) {
   try {
-    const phone = chatId.replace('@c.us', '');
+    const phone = chatId.replace('@c.us', '').replace('@lid', '').replace('@s.whatsapp.net', '');
+    const clientId = clientInfo?.id || null;
     const result = await query(
       `SELECT id, phone, client_id, status, stage, contexto, classificacao, agente_atual, mensagens_count
        FROM luna_v2.conversations
@@ -582,19 +812,21 @@ async function getConversationInfo(chatId) {
       [phone]
     );
     if (result.rows[0]) {
-      // Incrementar msg_count
       await query(
-        'UPDATE luna_v2.conversations SET mensagens_count = mensagens_count + 1, last_message_at = NOW() WHERE id = $1',
-        [result.rows[0].id]
+        `UPDATE luna_v2.conversations
+         SET mensagens_count = mensagens_count + 1,
+             last_message_at = NOW(),
+             client_id = COALESCE(client_id, $2)
+         WHERE id = $1`,
+        [result.rows[0].id, clientId]
       );
-      return result.rows[0];
+      return { ...result.rows[0], client_id: result.rows[0].client_id || clientId };
     }
-    // Criar nova conversa Luna v2
     const newConv = await query(
-      `INSERT INTO luna_v2.conversations (phone, status, mensagens_count)
-       VALUES ($1, 'active', 1)
-       RETURNING id, phone, status, mensagens_count`,
-      [phone]
+      `INSERT INTO luna_v2.conversations (phone, status, mensagens_count, client_id)
+       VALUES ($1, 'active', 1, $2)
+       RETURNING id, phone, status, mensagens_count, client_id`,
+      [phone, clientId]
     );
     return newConv.rows[0] || { id: null };
   } catch (err) {
@@ -625,12 +857,35 @@ async function handleIncoming(msg) {
     // ====== NOVO: Tentar Luna v2 primeiro ======
     try {
       const clientInfo = await getClientInfo(phone);
-      const conversationInfo = await getConversationInfo(from);
-      const processedByLunaV2 = await handleLunaV2(msg, clientInfo, conversationInfo);
-      if (processedByLunaV2) {
-        log(`[Luna v2] Mensagem processada por Luna v2 para ${name}`);
-        return; // Luna v2 processou, nao continuar com legado
-      }
+      const conversationInfo = await getConversationInfo(from, clientInfo);
+      // Buffer 10s: agrupa mensagens rapidas do mesmo contato
+      scheduleLunaProcess(phone, msg,
+        { ...(clientInfo||{}), pushname: name, realPhone, displayPhone: formatPhone(realPhone) },
+        conversationInfo,
+        async (aggMsg, cInfo, convInfo) => {
+          const processedByLunaV2 = await handleLunaV2(aggMsg, cInfo, convInfo);
+          if (processedByLunaV2?.handled) {
+            try {
+              let conv = conversations.get(phone);
+              if (!conv) {
+                conv = { name, chatId: from, realPhone, displayPhone: formatPhone(realPhone),
+                  messages: [], receivedAt: new Date().toISOString(),
+                  escalationLevel: -1, timers: [], greetingTimer: null, analysisTimer: null,
+                  humanReplied: false, resolved: false, greeted: true };
+                conversations.set(phone, conv);
+                await dbSaveConversation(phone, conv);
+              }
+              conv.messages.push({ body: aggMsg.body, from: 'client', at: new Date().toISOString() });
+              await dbSaveMessage(conv, 'client', aggMsg.body);
+              if (processedByLunaV2.reply) {
+                conv.messages.push({ body: processedByLunaV2.reply, from: 'bot', at: new Date().toISOString() });
+                await dbSaveMessage(conv, 'bot', processedByLunaV2.reply);
+              }
+              broadcastFn?.({ type: "conversation_updated", phone, conv });
+            } catch (e) { log('[Buffer] persist erro: ' + e.message); }
+          }
+        });
+      return; // nao prossegue no fluxo legado — buffer vai responder
     } catch (lunaErr) {
       log(`[Luna v2] Erro, usando legado: ${lunaErr.message}`);
     }

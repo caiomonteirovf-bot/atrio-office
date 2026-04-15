@@ -84,26 +84,26 @@ export default function NotificationDropdown() {
       {open && (
         <div className="absolute right-0 top-11 w-[380px] rounded-xl overflow-hidden z-50"
           style={{
-            background: 'linear-gradient(135deg, rgba(19,22,32,0.97) 0%, rgba(19,22,32,0.95) 100%)',
-            border: '1px solid rgba(255,255,255,0.08)',
-            boxShadow: '0 20px 50px rgba(0,0,0,0.5), 0 0 30px rgba(196,149,106,0.05)',
+            background: 'var(--ao-popup-bg)',
+            border: '1px solid var(--ao-border)',
+            boxShadow: '0 24px 60px var(--ao-shadow), 0 8px 24px var(--ao-shadow), 0 0 0 1px rgba(196,149,106,0.08)',
             backdropFilter: 'blur(16px)',
           }}>
 
           {/* Header */}
-          <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+          <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: '1px solid var(--ao-border)' }}>
             <span className="text-[13px] font-semibold" style={{ color: 'var(--ao-text-primary)', fontFamily: 'Outfit' }}>
               Notificacoes
             </span>
             <div className="flex gap-2">
               {unreadCount > 0 && (
                 <button onClick={markAllRead} className="text-[10px] font-medium px-2 py-1 rounded-md transition-colors cursor-pointer"
-                  style={{ color: '#C4956A', background: 'rgba(196,149,106,0.1)' }}>
+                  style={{ color: '#C4956A', background: 'rgba(196,149,106,0.12)', border: '1px solid rgba(196,149,106,0.2)' }}>
                   Marcar todas lidas
                 </button>
               )}
               <button onClick={clearRead} className="text-[10px] font-medium px-2 py-1 rounded-md transition-colors cursor-pointer"
-                style={{ color: 'var(--ao-text-dim)', background: 'rgba(255,255,255,0.04)' }}>
+                style={{ color: 'var(--ao-text-secondary)', background: 'var(--ao-input-bg)', border: '1px solid var(--ao-border)' }}>
                 Limpar
               </button>
             </div>
@@ -122,8 +122,8 @@ export default function NotificationDropdown() {
                 <button key={n.id}
                   className="w-full flex items-start gap-3 px-4 py-3 text-left transition-all duration-150 cursor-pointer"
                   style={{
-                    background: n.read ? 'transparent' : 'rgba(196,149,106,0.04)',
-                    borderBottom: '1px solid rgba(255,255,255,0.03)',
+                    background: n.read ? 'transparent' : 'rgba(196,149,106,0.08)',
+                    borderBottom: '1px solid var(--ao-separator)',
                     borderLeft: n.read ? '3px solid transparent' : `3px solid ${cfg.color}`,
                   }}
                   onClick={() => !n.read && markRead(n.id)}

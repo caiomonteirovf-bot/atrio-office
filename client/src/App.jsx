@@ -1,4 +1,5 @@
 import { useState, useEffect, createContext, useContext } from 'react'
+import { MessageCircle, X as XIcon } from 'lucide-react'
 import { useAgents } from './hooks/useAgents'
 import { useWebSocket } from './hooks/useWebSocket'
 import TopBar from './components/TopBar'
@@ -16,6 +17,9 @@ import CostAnalytics from './components/CostAnalytics'
 import SessionHistory from './components/SessionHistory'
 import WeeklyCalendar from './components/WeeklyCalendar'
 import MemoryBrowser from './components/MemoryBrowser'
+import HybridMemory from './components/HybridMemory'
+import ErrorBoundary from './components/ErrorBoundary'
+import DatalakeViewer from './components/DatalakeViewer'
 import PortalLogin from './portal/PortalLogin'
 import PortalDashboard from './portal/PortalDashboard'
 
@@ -46,6 +50,10 @@ function AdminDashboard() {
   const [selectedAgent, setSelectedAgent] = useState(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [currentPage, setCurrentPage] = useState('home')
+  const [chatOpen, setChatOpen] = useState(false)
+  // Paginas largas (datalake, memory) nao mostram chat fixo — usa floating
+  const WIDE_PAGES = ['datalake', 'memory', 'crons', 'custos', 'sessions']
+  const isWidePage = WIDE_PAGES.includes(currentPage)
 
   // Global search shortcut (Cmd+K / Ctrl+K)
   useEffect(() => {
@@ -84,7 +92,7 @@ function AdminDashboard() {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden" style={{ background: 'var(--ao-bg)', color: 'var(--ao-text)', transition: 'background 0.3s, color 0.3s' }}>
+    <div className="flex h-[calc(100vh-28px)] overflow-hidden" style={{ background: 'var(--ao-bg)', color: 'var(--ao-text)', transition: 'background 0.3s, color 0.3s' }}>
       <div className="flex-1 flex flex-col overflow-hidden">
         <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} currentPage={currentPage} onNavigate={setCurrentPage} />
 
@@ -129,14 +137,47 @@ function AdminDashboard() {
             {currentPage === 'custos' && <CostAnalytics />}
             {currentPage === 'sessions' && <SessionHistory />}
             {currentPage === 'calendar' && <WeeklyCalendar />}
-            {currentPage === 'memory' && <MemoryBrowser />}
+            {currentPage === 'memory' && <ErrorBoundary label='HybridMemory'><HybridMemory /></ErrorBoundary>}
+            {currentPage === 'datalake' && <DatalakeViewer />}
           </div>
 
-          {/* RIGHT COLUMN — Agent Chat (tall panel, always visible) */}
-          <div className="w-[400px] xl:w-[440px] shrink-0 h-full flex flex-col p-3 pl-0"
-            style={{ borderLeft: `1px solid var(--ao-border)` }}>
-            <AgentChat lastMessage={lastMessage} />
-          </div>
+          {/* RIGHT COLUMN — Agent Chat (oculto em paginas largas) */}
+          {!isWidePage && (
+            <div className="w-[400px] xl:w-[440px] shrink-0 h-full flex flex-col p-3 pl-0"
+              style={{ borderLeft: `1px solid var(--ao-border)` }}>
+              <AgentChat lastMessage={lastMessage} />
+            </div>
+          )}
+
+          {/* Floating Assistant — aparece em paginas largas */}
+          {isWidePage && (
+            <>
+              <button
+                onClick={() => setChatOpen(v => !v)}
+                className="fixed bottom-6 right-6 z-40 rounded-full shadow-lg flex items-center justify-center transition-all hover:scale-105"
+                style={{
+                  width: 52, height: 52,
+                  background: 'linear-gradient(135deg, #C4956A 0%, #a07a52 100%)',
+                  color: '#fff',
+                  boxShadow: '0 6px 20px rgba(196,149,106,0.4)',
+                }}
+                aria-label="Assistente"
+              >
+                {chatOpen ? <XIcon size={22} strokeWidth={2.4}/> : <MessageCircle size={22} strokeWidth={2.2}/>}
+              </button>
+              {chatOpen && (
+                <div className="fixed bottom-24 right-6 z-40 rounded-2xl overflow-hidden flex flex-col"
+                  style={{
+                    width: 380, height: 'min(600px, 75vh)',
+                    background: 'var(--ao-card)',
+                    border: '1px solid var(--ao-border)',
+                    boxShadow: '0 12px 40px rgba(0,0,0,0.45)',
+                  }}>
+                  <AgentChat lastMessage={lastMessage} />
+                </div>
+              )}
+            </>
+          )}
         </div>
       </div>
 

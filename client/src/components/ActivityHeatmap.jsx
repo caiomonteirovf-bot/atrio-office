@@ -52,7 +52,7 @@ export default function ActivityHeatmap() {
 
   const getColor = (count, isFuture) => {
     if (isFuture) return 'transparent'
-    if (count === 0) return 'rgba(255,255,255,0.03)'
+    if (count === 0) return 'var(--ao-border)'
     if (count <= 2) return 'rgba(196,149,106,0.15)'
     if (count <= 5) return 'rgba(196,149,106,0.35)'
     if (count <= 10) return 'rgba(196,149,106,0.6)'
@@ -64,13 +64,13 @@ export default function ActivityHeatmap() {
   return (
     <div style={{ padding: '20px 0' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <h3 style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.85)', margin: 0 }}>
+        <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--ao-text-primary)', margin: 0 }}>
           Atividade
         </h3>
-        <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>
-          <span>{todayData.tasks_today || 0} tasks hoje</span>
+        <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'var(--ao-text-muted)' }}>
+          <span>{todayData.tasks_today || 0} tarefas hoje</span>
           <span>{todayData.messages_today || 0} mensagens</span>
-          <span>{todayData.completed_today || 0} concludas</span>
+          <span>{todayData.completed_today || 0} concluídas</span>
         </div>
       </div>
 
@@ -100,11 +100,11 @@ export default function ActivityHeatmap() {
 
       {/* Legend */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4, marginTop: 8 }}>
-        <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginRight: 4 }}>Menos</span>
+        <span style={{ fontSize: 10, color: 'var(--ao-text-dim)', marginRight: 4 }}>Menos</span>
         {[0, 0.15, 0.35, 0.6, 0.9].map((a, i) => (
-          <div key={i} style={{ width: 11, height: 11, borderRadius: 2, background: i === 0 ? 'rgba(255,255,255,0.03)' : `rgba(196,149,106,${a})` }} />
+          <div key={i} style={{ width: 11, height: 11, borderRadius: 2, background: i === 0 ? 'var(--ao-border)' : `rgba(196,149,106,${a})` }} />
         ))}
-        <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginLeft: 4 }}>Mais</span>
+        <span style={{ fontSize: 10, color: 'var(--ao-text-dim)', marginLeft: 4 }}>Mais</span>
       </div>
 
       {/* Tooltip */}
@@ -118,7 +118,7 @@ export default function ActivityHeatmap() {
           borderRadius: 6,
           padding: '6px 10px',
           fontSize: 11,
-          color: 'rgba(255,255,255,0.85)',
+          color: 'var(--ao-text-primary)',
           zIndex: 9999,
           pointerEvents: 'none',
           whiteSpace: 'nowrap',

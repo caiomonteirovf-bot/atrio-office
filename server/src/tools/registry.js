@@ -3,6 +3,7 @@ import { tools as campeloTools } from './campelo.js';
 import { tools as sneijderTools } from './sneijder.js';
 import { tools as lunaTools } from './luna.js';
 import { tools as sofiaTools } from './sofia.js';
+import { tools as datalakeTools } from './datalake.js';
 
 // Registro central de todas as 32 tools
 const registry = {
@@ -11,6 +12,7 @@ const registry = {
   ...sneijderTools,
   ...lunaTools,
   ...sofiaTools,
+  ...datalakeTools,
 };
 
 // Tools que criam tasks para agentes IA — disparam orquestração

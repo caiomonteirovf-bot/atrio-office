@@ -38,10 +38,10 @@ export default function CostAnalytics() {
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
         <div>
-          <h2 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 20, fontWeight: 700, margin: 0 }}>
+          <h2 style={{ color: 'var(--ao-text-primary)', fontSize: 20, fontWeight: 700, margin: 0 }}>
             Custos IA
           </h2>
-          <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, margin: '4px 0 0' }}>
+          <p style={{ color: 'var(--ao-text-muted)', fontSize: 13, margin: '4px 0 0' }}>
             Monitoramento de tokens e custos por agente
           </p>
         </div>
@@ -53,9 +53,9 @@ export default function CostAnalytics() {
               style={{
                 padding: '6px 14px',
                 borderRadius: 6,
-                border: `1px solid ${days === d ? 'rgba(196,149,106,0.3)' : 'rgba(255,255,255,0.08)'}`,
-                background: days === d ? 'rgba(196,149,106,0.12)' : 'rgba(255,255,255,0.04)',
-                color: days === d ? '#C4956A' : 'rgba(255,255,255,0.6)',
+                border: `1px solid ${days === d ? 'rgba(196,149,106,0.3)' : 'var(--ao-border)'}`,
+                background: days === d ? 'rgba(196,149,106,0.12)' : 'var(--ao-input-bg)',
+                color: days === d ? '#C4956A' : 'var(--ao-text-muted)',
                 fontSize: 12,
                 cursor: 'pointer',
                 transition: 'all 0.15s',
@@ -72,17 +72,17 @@ export default function CostAnalytics() {
         {[
           { label: 'Custo Hoje', value: formatUSD(t.cost_today), color: '#C4956A' },
           { label: 'Custo Mês', value: formatUSD(t.cost_month), color: '#60a5fa' },
-          { label: 'Projetado/Mês', value: formatUSD(projectedMonth), color: parseFloat(projectedMonth) > budget ? '#f87171' : '#22c55e' },
-          { label: 'Total Tokens', value: formatTokens(t.total_tokens), color: '#a78bfa' },
+          { label: 'Projeção mês', value: formatUSD(projectedMonth), color: parseFloat(projectedMonth) > budget ? '#f87171' : '#22c55e' },
+          { label: 'Tokens', value: formatTokens(t.total_tokens), color: '#a78bfa' },
         ].map((kpi, i) => (
           <div key={i} style={{
-            background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
+            background: 'var(--ao-card)',
             backdropFilter: 'blur(12px)',
-            border: '1px solid rgba(255,255,255,0.06)',
+            border: '1px solid var(--ao-border)',
             borderRadius: 12,
             padding: '18px 20px',
           }}>
-            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', marginBottom: 6 }}>
+            <div style={{ fontSize: 11, color: 'var(--ao-text-muted)', textTransform: 'uppercase', marginBottom: 6 }}>
               {kpi.label}
             </div>
             <div style={{ fontSize: 22, fontWeight: 700, color: kpi.color }}>
@@ -94,20 +94,20 @@ export default function CostAnalytics() {
 
       {/* Budget Bar */}
       <div style={{
-        background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
+        background: 'var(--ao-card)',
         backdropFilter: 'blur(12px)',
-        border: '1px solid rgba(255,255,255,0.06)',
+        border: '1px solid var(--ao-border)',
         borderRadius: 12,
         padding: '16px 20px',
         marginBottom: 24,
       }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-          <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)' }}>Orçamento Mensal</span>
-          <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)' }}>
+          <span style={{ fontSize: 12, color: 'var(--ao-text-muted)' }}>Orçamento Mensal</span>
+          <span style={{ fontSize: 12, color: 'var(--ao-text-muted)' }}>
             {formatUSD(t.cost_month)} / ${budget.toFixed(2)}
           </span>
         </div>
-        <div style={{ height: 8, background: 'rgba(255,255,255,0.06)', borderRadius: 4, overflow: 'hidden' }}>
+        <div style={{ height: 8, background: 'var(--ao-border)', borderRadius: 4, overflow: 'hidden' }}>
           <div style={{
             height: '100%',
             width: `${budgetPct}%`,
@@ -121,17 +121,17 @@ export default function CostAnalytics() {
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
         {/* Daily Cost Chart */}
         <div style={{
-          background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
+          background: 'var(--ao-card)',
           backdropFilter: 'blur(12px)',
-          border: '1px solid rgba(255,255,255,0.06)',
+          border: '1px solid var(--ao-border)',
           borderRadius: 12,
           padding: 20,
         }}>
-          <h3 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: 600, margin: '0 0 16px' }}>
-            Custo Diário
+          <h3 style={{ color: 'var(--ao-text-primary)', fontSize: 14, fontWeight: 600, margin: '0 0 16px' }}>
+            Custo por dia
           </h3>
           {data.daily.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 40, color: 'rgba(255,255,255,0.35)', fontSize: 13 }}>
+            <div style={{ textAlign: 'center', padding: 40, color: 'var(--ao-text-dim)', fontSize: 13 }}>
               Sem dados de custo no período
             </div>
           ) : (
@@ -161,28 +161,28 @@ export default function CostAnalytics() {
 
         {/* Agent Breakdown */}
         <div style={{
-          background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
+          background: 'var(--ao-card)',
           backdropFilter: 'blur(12px)',
-          border: '1px solid rgba(255,255,255,0.06)',
+          border: '1px solid var(--ao-border)',
           borderRadius: 12,
           padding: 20,
         }}>
-          <h3 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: 600, margin: '0 0 16px' }}>
-            Por Agente
+          <h3 style={{ color: 'var(--ao-text-primary)', fontSize: 14, fontWeight: 600, margin: '0 0 16px' }}>
+            Por agente
           </h3>
           {agentsSorted.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 40, color: 'rgba(255,255,255,0.35)', fontSize: 13 }}>
+            <div style={{ textAlign: 'center', padding: 40, color: 'var(--ao-text-dim)', fontSize: 13 }}>
               Sem dados
             </div>
           ) : agentsSorted.map((agent, i) => (
             <div key={i} style={{ marginBottom: 12 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.7)' }}>{agent.name}</span>
+                <span style={{ fontSize: 12, color: 'var(--ao-text-primary)' }}>{agent.name}</span>
                 <span style={{ fontSize: 11, color: '#C4956A', fontFamily: 'monospace' }}>
                   {formatUSD(agent.cost)}
                 </span>
               </div>
-              <div style={{ height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ height: 6, background: 'var(--ao-border)', borderRadius: 3, overflow: 'hidden' }}>
                 <div style={{
                   height: '100%',
                   width: `${(agent.cost / maxAgentCost) * 100}%`,
@@ -191,7 +191,7 @@ export default function CostAnalytics() {
                   transition: 'width 0.3s ease',
                 }} />
               </div>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginTop: 2 }}>
+              <div style={{ fontSize: 10, color: 'var(--ao-text-dim)', marginTop: 2 }}>
                 {formatTokens(agent.input + agent.output)} tokens · {agent.requests} req
               </div>
             </div>

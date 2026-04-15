@@ -428,3 +428,149 @@ body {
   animation: stagger-in 0.3s ease-out forwards;
   opacity: 0;
 }
+
+/* ============================================
+   FORM CONTROLS — unified dark dropdown / inputs
+   ============================================ */
+select, input, textarea {
+  color-scheme: dark;
+}
+[data-theme="light"] select,
+[data-theme="light"] input,
+[data-theme="light"] textarea {
+  color-scheme: light;
+}
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%23C4956A' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M3 4.5l3 3 3-3'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 30px !important;
+}
+select option {
+  background: var(--ao-popup-bg);
+  color: var(--ao-text);
+  padding: 8px;
+}
+input::placeholder, textarea::placeholder { color: var(--ao-text-dim); }
+
+/* Focus ring consistente (accent gold) */
+select:focus, input:focus, textarea:focus, button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(196, 149, 106, 0.35);
+  border-color: rgba(196, 149, 106, 0.6) !important;
+}
+
+/* ============================================
+   MODAL — glass consistente
+   ============================================ */
+.ao-modal-backdrop {
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.ao-modal {
+  background: var(--ao-card);
+  border: 1px solid var(--ao-border);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(196, 149, 106, 0.08);
+}
+
+/* ============================================
+   ACTION BAR — openclaw-style top action row
+   ============================================ */
+.ao-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--ao-border);
+  background: linear-gradient(180deg, var(--ao-surface) 0%, var(--ao-bg) 100%);
+}
+.ao-action-bar h1 {
+  font-family: 'Outfit', sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.ao-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  background: linear-gradient(135deg, #C4956A 0%, #A67B52 100%);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 2px 8px rgba(196, 149, 106, 0.25);
+}
+.ao-btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(196, 149, 106, 0.35); }
+.ao-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  background: var(--ao-input-bg);
+  border: 1px solid var(--ao-border);
+  color: var(--ao-text);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.ao-btn-ghost:hover { background: var(--ao-hover-bg); border-color: var(--ao-border-hover); }
+
+/* ============================================
+   STAT CARD — gradient accent na esquerda
+   ============================================ */
+.ao-stat {
+  position: relative;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--ao-card);
+  border: 1px solid var(--ao-border);
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+.ao-stat:hover { border-color: var(--ao-border-hover); }
+.ao-stat::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--ao-stat-accent, #C4956A);
+  opacity: 0.6;
+}
+
+/* ============================================
+   CONTRAST BOOST — light theme readability
+   ============================================ */
+[data-theme="light"] {
+  --ao-text:            #1a1a24;                      /* principal bem escuro */
+  --ao-text-primary:    rgba(0, 0, 0, 0.94);
+  --ao-text-secondary:  rgba(0, 0, 0, 0.78);
+  --ao-text-muted:      rgba(0, 0, 0, 0.66);
+  --ao-text-dim:        rgba(0, 0, 0, 0.68);
+  --ao-text-xs:         rgba(0, 0, 0, 0.62);
+  --ao-border:          rgba(0, 0, 0, 0.14);
+  --ao-border-hover:    rgba(0, 0, 0, 0.22);
+  --ao-shadow:          rgba(0, 0, 0, 0.18);
+}
+
+/* Sombras mais pronunciadas em cards/popups (ambos temas) */
+.glass-card, .ao-modal, .ao-stat {
+  box-shadow: 0 2px 6px var(--ao-shadow), 0 8px 24px var(--ao-shadow);
+}
+
+[data-theme="light"] .glass-card {
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 8px 24px rgba(0,0,0,0.10);
+}
+
+/* Popups e menus ganham sombra forte */
+.ao-popup, [class*="z-50"], [class*="z-[9999]"] {
+  /* só uma dica visual via filter drop-shadow para dropdowns inline */
+}

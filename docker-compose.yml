@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     restart: unless-stopped
     environment:
       POSTGRES_DB: atrio_office
@@ -31,13 +31,20 @@ services:
       DATABASE_URL: postgresql://atrio:${DB_PASSWORD:-AtrioDB2026!}@db:5432/atrio_office
       MINIMAX_API_KEY: ${MINIMAX_API_KEY}
       MINIMAX_MODEL: ${MINIMAX_MODEL:-MiniMax-M2.5}
-      GESTHUB_API_URL: ${GESTHUB_API_URL:-https://gesthub-xlvb.onrender.com}
+      GESTHUB_API_URL: ${GESTHUB_API_URL:-http://31.97.175.200}
       PORT: 3010
       OPENCLAW_GATEWAY: http://172.18.0.1:18789
       NODE_ENV: production
       CORS_ORIGIN: "*"
       XAI_API_KEY: ${XAI_API_KEY}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SLA_TOLERANCE_SECONDS: ${SLA_TOLERANCE_SECONDS:-600}
+      REFLECTION_ENABLED: ${REFLECTION_ENABLED:-true}
+    volumes:
+      - ./client/dist:/app/client/dist:ro
+      - ./server/src:/app/src:ro
 
 volumes:
   pgdata:

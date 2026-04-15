@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-const GESTHUB_URL = process.env.GESTHUB_API_URL || 'https://gesthub-xlvb.onrender.com';
+const GESTHUB_URL = process.env.GESTHUB_API_URL || 'http://31.97.175.200';
 const GESTHUB_API_KEY = process.env.GESTHUB_API_KEY || '';
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 

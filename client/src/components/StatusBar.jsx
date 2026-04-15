@@ -72,7 +72,7 @@ export default function StatusBar() {
           fontFamily: 'Space Grotesk',
           fontWeight: 600,
         }}>
-          {health.status === 'ok' ? '\u25CF ALL SYSTEMS OPERATIONAL' : '\u25CF DEGRADED'}
+          {health.status === 'ok' ? '\u25CF TUDO OPERACIONAL' : '\u25CF COM INSTABILIDADE'}
         </span>
       </div>
     </div>

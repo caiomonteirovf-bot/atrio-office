@@ -24,7 +24,7 @@ const ACTIVITY_CONFIG = {
     opacity: '',
   },
   standby: {
-    label: 'Stand-by',
+    label: 'Em espera',
     dotClass: 'bg-gray-400/20',
     dotGlow: 'none',
     showVistaBar: false,
@@ -76,8 +76,7 @@ export default function AgentCard({ agent, isSelected, onClick }) {
   return (
     <button
       onClick={onClick}
-      className={`group relative text-left rounded-xl p-3.5 transition-all duration-300 cursor-pointer overflow-hidden
-        ${act.opacity}`}
+      className={`group relative text-left rounded-xl p-3.5 transition-all duration-300 cursor-pointer overflow-hidden`}
       style={{
         background: isSelected
           ? `linear-gradient(135deg, ${color}12 0%, ${color}06 100%)`
@@ -132,10 +131,10 @@ export default function AgentCard({ agent, isSelected, onClick }) {
         {/* Info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="text-[13px] font-bold truncate" style={{ fontFamily: 'Outfit', color: 'var(--ao-text-primary)' }}>{agent.name}</h3>
+            <h3 className="text-[14.5px] truncate" style={{ fontFamily: 'Outfit', color: 'var(--ao-text)', fontWeight: 800, letterSpacing: '-0.01em', textShadow: '0 1px 0 var(--ao-shadow)' }}>{agent.name}</h3>
             <span className="text-[10px] font-semibold" style={{ color: LABEL_COLORS[activityKey] || 'var(--ao-text-dim)' }}>{act.label}</span>
           </div>
-          <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--ao-text-dim)' }}>{agent.role}</p>
+          <p className="text-[11.5px] mt-0.5 truncate" style={{ color: 'var(--ao-text-secondary)', fontWeight: 500 }}>{agent.role}</p>
 
           {/* Department + Task */}
           <div className="flex items-center gap-2 mt-2">

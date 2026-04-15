@@ -81,7 +81,7 @@ CADDY
 cat > .env << 'ENV'
 MINIMAX_API_KEY=sk-api-ygSY27o4Bg2i6q7Uu7UA0qgVlzYKL4CSQo2R8-gAntBEUbXjyn0lhfURJJBgGcLG8W5s9qx0f-WhNAiG1RbwGIa6vI7rpc28H3QgSWjYt-aD2oAlo_6LRvk
 MINIMAX_MODEL=MiniMax-M2.5
-GESTHUB_API_URL=https://gesthub-xlvb.onrender.com
+GESTHUB_API_URL=http://31.97.175.200
 DB_PASSWORD=AtrioDB2026!
 ENV
 

@@ -3,6 +3,7 @@ import AgentCard from '../components/AgentCard'
 import ChatPanel from '../components/ChatPanel'
 import TaskBoard from '../components/TaskBoard'
 import StatsBar from '../components/StatsBar'
+import LunaHealthStrip from '../components/LunaHealthStrip'
 import AttendanceQueue from '../components/AttendanceQueue'
 import { useAgents } from '../hooks/useAgents'
 
@@ -23,6 +24,7 @@ export default function Office() {
       <div className={`flex-1 overflow-y-auto p-6 space-y-6 ${selectedAgent ? 'max-w-[calc(100%-400px)]' : ''}`}>
         {/* Stats */}
         <StatsBar />
+        <LunaHealthStrip />
 
         {/* Attendance queue — WhatsApp conversations */}
         <AttendanceQueue />

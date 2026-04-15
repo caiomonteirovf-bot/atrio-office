@@ -102,18 +102,18 @@ export default function WeeklyCalendar() {
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
         <div>
-          <h2 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 20, fontWeight: 700, margin: 0 }}>
+          <h2 style={{ color: 'var(--ao-text)', fontSize: 20, fontWeight: 700, margin: 0, fontFamily: 'Outfit', letterSpacing: '-0.01em' }}>
             📅 Calendário Semanal
           </h2>
-          <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, margin: '4px 0 0' }}>
+          <p style={{ color: 'var(--ao-text-muted)', fontSize: 13, margin: '4px 0 0' }}>
             Prazos fiscais, tarefas e eventos
           </p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button onClick={() => setWeekOffset(w => w - 1)} style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.7)', fontSize: 13, cursor: 'pointer' }}>←</button>
+          <button onClick={() => setWeekOffset(w => w - 1)} style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid var(--ao-border)', background: 'var(--ao-input-bg)', color: 'var(--ao-text-primary)', fontSize: 13, cursor: 'pointer' }}>←</button>
           <button onClick={() => setWeekOffset(0)} style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.2)', background: 'rgba(196,149,106,0.08)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>Hoje</button>
-          <button onClick={() => setWeekOffset(w => w + 1)} style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.7)', fontSize: 13, cursor: 'pointer' }}>→</button>
-          <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: 13, marginLeft: 8, fontWeight: 500 }}>{weekLabel}</span>
+          <button onClick={() => setWeekOffset(w => w + 1)} style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid var(--ao-border)', background: 'var(--ao-input-bg)', color: 'var(--ao-text-primary)', fontSize: 13, cursor: 'pointer' }}>→</button>
+          <span style={{ color: 'var(--ao-text)', fontSize: 13, marginLeft: 8, fontWeight: 600, fontFamily: 'Outfit' }}>{weekLabel}</span>
           <button onClick={() => setShowCreate(true)} style={{ marginLeft: 12, padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)', background: 'rgba(196,149,106,0.12)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>+ Evento</button>
         </div>
       </div>
@@ -123,7 +123,7 @@ export default function WeeklyCalendar() {
         display: 'grid', gridTemplateColumns: '50px repeat(7, 1fr)', gap: 1,
         marginBottom: 2,
       }}>
-        <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', padding: '4px 0', textAlign: 'center' }}>dia todo</div>
+        <div style={{ fontSize: 10, color: 'var(--ao-text-dim)', padding: '4px 0', textAlign: 'center' }}>dia todo</div>
         {weekDays.map((day, i) => {
           const dayEvents = getEventsForDay(day).filter(e => e.all_day)
           return (
@@ -145,25 +145,25 @@ export default function WeeklyCalendar() {
 
       {/* Calendar grid */}
       <div style={{
-        background: 'linear-gradient(135deg, rgba(19,22,32,0.8) 0%, rgba(19,22,32,0.6) 100%)',
+        background: 'var(--ao-card)',
         backdropFilter: 'blur(12px)',
-        border: '1px solid rgba(255,255,255,0.06)',
+        border: '1px solid var(--ao-border)',
         borderRadius: 12, overflow: 'hidden',
       }}>
         {/* Day headers */}
-        <div style={{ display: 'grid', gridTemplateColumns: '50px repeat(7, 1fr)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '50px repeat(7, 1fr)', borderBottom: '1px solid var(--ao-border)' }}>
           <div />
           {weekDays.map((day, i) => {
             const isToday = day.getTime() === today.getTime()
             return (
               <div key={i} style={{
                 padding: '10px 8px', textAlign: 'center',
-                borderLeft: '1px solid rgba(255,255,255,0.04)',
+                borderLeft: '1px solid var(--ao-input-bg)',
               }}>
-                <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase' }}>{DAY_NAMES[day.getDay()]}</div>
+                <div style={{ fontSize: 10, color: 'var(--ao-text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', fontWeight: 600 }}>{DAY_NAMES[day.getDay()]}</div>
                 <div style={{
-                  fontSize: 18, fontWeight: 700, marginTop: 2,
-                  color: isToday ? '#C4956A' : 'rgba(255,255,255,0.7)',
+                  fontSize: 18, fontWeight: 700, marginTop: 2, fontFamily: 'Space Grotesk',
+                  color: isToday ? '#C4956A' : 'var(--ao-text-primary)',
                   ...(isToday ? { background: 'rgba(196,149,106,0.15)', borderRadius: '50%', width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '2px auto 0' } : {}),
                 }}>
                   {day.getDate()}
@@ -180,14 +180,14 @@ export default function WeeklyCalendar() {
             <div key={hour} style={{
               position: 'absolute', top: i * 48, left: 0, right: 0,
               display: 'grid', gridTemplateColumns: '50px repeat(7, 1fr)',
-              borderBottom: '1px solid rgba(255,255,255,0.03)',
+              borderBottom: '1px solid var(--ao-separator)',
               height: 48,
             }}>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', textAlign: 'right', paddingRight: 8, paddingTop: 2 }}>
+              <div style={{ fontSize: 10, color: 'var(--ao-text-dim)', textAlign: 'right', paddingRight: 8, paddingTop: 2 }}>
                 {`${hour}:00`}
               </div>
               {weekDays.map((_, di) => (
-                <div key={di} style={{ borderLeft: '1px solid rgba(255,255,255,0.04)' }} />
+                <div key={di} style={{ borderLeft: '1px solid var(--ao-input-bg)' }} />
               ))}
             </div>
           ))}
@@ -220,7 +220,7 @@ export default function WeeklyCalendar() {
                   <div style={{ fontSize: 11, fontWeight: 600, color, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {event.title}
                   </div>
-                  <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', marginTop: 1 }}>
+                  <div style={{ fontSize: 9, color: 'var(--ao-text-dim)', marginTop: 1 }}>
                     {new Date(event.start_time).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
                   </div>
                 </div>
@@ -237,12 +237,13 @@ export default function WeeklyCalendar() {
           display: 'flex', alignItems: 'center', justifyContent: 'center',
         }}>
           <div onClick={e => e.stopPropagation()} style={{
-            width: 400, background: '#131620', borderRadius: 12,
-            border: '1px solid rgba(255,255,255,0.08)', padding: 24,
+            width: 400, background: 'var(--ao-card)', borderRadius: 12,
+            border: '1px solid var(--ao-border)', padding: 24,
+            boxShadow: '0 24px 60px var(--ao-shadow), 0 0 0 1px rgba(196,149,106,0.08)',
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
               <div>
-                <h3 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 16, fontWeight: 700, margin: 0 }}>
+                <h3 style={{ color: 'var(--ao-text)', fontSize: 16, fontWeight: 700, margin: 0, fontFamily: 'Outfit', letterSpacing: '-0.01em' }}>
                   {selectedEvent.title}
                 </h3>
                 <div style={{
@@ -255,19 +256,19 @@ export default function WeeklyCalendar() {
                 </div>
               </div>
               <button onClick={() => setSelectedEvent(null)} style={{
-                background: 'none', border: 'none', color: 'rgba(255,255,255,0.4)', fontSize: 18, cursor: 'pointer',
+                background: 'none', border: 'none', color: 'var(--ao-text-dim)', fontSize: 18, cursor: 'pointer',
               }}>×</button>
             </div>
             {selectedEvent.description && (
-              <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 13, margin: '0 0 12px', lineHeight: 1.5 }}>
+              <p style={{ color: 'var(--ao-text-secondary)', fontSize: 13, margin: '0 0 12px', lineHeight: 1.5 }}>
                 {selectedEvent.description}
               </p>
             )}
-            <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>
+            <div style={{ fontSize: 12, color: 'var(--ao-text-muted)', marginBottom: 4 }}>
               📅 {new Date(selectedEvent.start_time).toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })}
             </div>
             {!selectedEvent.all_day && (
-              <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: 'var(--ao-text-muted)', marginBottom: 12 }}>
                 🕐 {new Date(selectedEvent.start_time).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
                 {selectedEvent.end_time && ` — ${new Date(selectedEvent.end_time).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`}
               </div>
@@ -290,10 +291,11 @@ export default function WeeklyCalendar() {
           display: 'flex', alignItems: 'center', justifyContent: 'center',
         }}>
           <div onClick={e => e.stopPropagation()} style={{
-            width: 420, background: '#131620', borderRadius: 12,
-            border: '1px solid rgba(255,255,255,0.08)', padding: 24,
+            width: 420, background: 'var(--ao-card)', borderRadius: 12,
+            border: '1px solid var(--ao-border)', padding: 24,
+            boxShadow: '0 24px 60px var(--ao-shadow), 0 0 0 1px rgba(196,149,106,0.08)',
           }}>
-            <h3 style={{ color: 'rgba(255,255,255,0.85)', fontSize: 16, fontWeight: 700, margin: '0 0 16px' }}>
+            <h3 style={{ color: 'var(--ao-text)', fontSize: 16, fontWeight: 700, margin: '0 0 16px', fontFamily: 'Outfit', letterSpacing: '-0.01em' }}>
               Novo Evento
             </h3>
             {[
@@ -301,15 +303,15 @@ export default function WeeklyCalendar() {
               { label: 'Data/Hora', key: 'start_time', type: 'datetime-local' },
             ].map(f => (
               <div key={f.key} style={{ marginBottom: 12 }}>
-                <label style={{ display: 'block', fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>{f.label}</label>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--ao-text-muted)', marginBottom: 4 }}>{f.label}</label>
                 <input
                   type={f.type}
                   value={newEvent[f.key]}
                   onChange={e => setNewEvent(n => ({ ...n, [f.key]: e.target.value }))}
                   style={{
                     width: '100%', padding: '8px 12px', borderRadius: 6,
-                    background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                    color: 'rgba(255,255,255,0.85)', fontSize: 13, outline: 'none',
+                    background: 'var(--ao-border)', border: '1px solid var(--ao-border)',
+                    color: 'var(--ao-text)', fontSize: 13, outline: 'none',
                     boxSizing: 'border-box',
                   }}
                 />
@@ -317,11 +319,11 @@ export default function WeeklyCalendar() {
             ))}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
               <div>
-                <label style={{ display: 'block', fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Tipo</label>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--ao-text-muted)', marginBottom: 4 }}>Tipo</label>
                 <select value={newEvent.type} onChange={e => setNewEvent(n => ({ ...n, type: e.target.value }))} style={{
                   width: '100%', padding: '8px 12px', borderRadius: 6,
-                  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                  color: 'rgba(255,255,255,0.85)', fontSize: 12, outline: 'none',
+                  background: 'var(--ao-border)', border: '1px solid var(--ao-border)',
+                  color: 'var(--ao-text)', fontSize: 12, outline: 'none',
                 }}>
                   <option value="task">Tarefa</option>
                   <option value="prazo_fiscal">Prazo Fiscal</option>
@@ -329,11 +331,11 @@ export default function WeeklyCalendar() {
                 </select>
               </div>
               <div>
-                <label style={{ display: 'block', fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Categoria</label>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--ao-text-muted)', marginBottom: 4 }}>Categoria</label>
                 <select value={newEvent.category} onChange={e => setNewEvent(n => ({ ...n, category: e.target.value }))} style={{
                   width: '100%', padding: '8px 12px', borderRadius: 6,
-                  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-                  color: 'rgba(255,255,255,0.85)', fontSize: 12, outline: 'none',
+                  background: 'var(--ao-border)', border: '1px solid var(--ao-border)',
+                  color: 'var(--ao-text)', fontSize: 12, outline: 'none',
                 }}>
                   <option value="fiscal">Fiscal</option>
                   <option value="pessoal">Pessoal</option>
@@ -343,14 +345,14 @@ export default function WeeklyCalendar() {
                 </select>
               </div>
             </div>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'rgba(255,255,255,0.6)', marginBottom: 16, cursor: 'pointer' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--ao-text-secondary)', marginBottom: 16, cursor: 'pointer' }}>
               <input type="checkbox" checked={newEvent.all_day} onChange={e => setNewEvent(n => ({ ...n, all_day: e.target.checked }))} />
               Dia inteiro
             </label>
             <div style={{ display: 'flex', gap: 8 }}>
               <button onClick={() => setShowCreate(false)} style={{
-                flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid rgba(255,255,255,0.08)',
-                background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.6)', fontSize: 12, cursor: 'pointer',
+                flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid var(--ao-border)',
+                background: 'var(--ao-input-bg)', color: 'var(--ao-text-secondary)', fontSize: 12, cursor: 'pointer',
               }}>Cancelar</button>
               <button onClick={handleCreate} style={{
                 flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)',

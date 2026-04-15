@@ -27,22 +27,15 @@ function AnimatedNumber({ value, duration = 800 }) {
   return <span>{typeof value === 'number' ? display : '\u2014'}</span>
 }
 
-function NpsIndicator({ nps, negativos }) {
-  if (nps === null && !negativos) return <span className="text-3xl font-extrabold" style={{ fontFamily: 'Outfit', color: 'var(--ao-text-xs)' }}>{'\u2014'}</span>
-
-  const color = nps >= 8 ? '#22c55e' : nps >= 6 ? '#f59e0b' : nps !== null ? '#ef4444' : '#64748b'
-  const label = nps >= 8 ? 'Bom' : nps >= 6 ? 'Atencao' : nps !== null ? 'Critico' : ''
-
+function ScoreIndicator({ score, label, criticos }) {
+  if (score === null || score === undefined) return <span className="text-3xl font-extrabold" style={{ fontFamily: 'Outfit', color: 'var(--ao-text-xs)' }}>{'\u2014'}</span>
+  const color = score >= 85 ? '#22c55e' : score >= 70 ? '#84cc16' : score >= 50 ? '#f59e0b' : '#ef4444'
   return (
     <div className="flex items-baseline gap-2">
-      {nps !== null ? (
-        <span className="text-3xl font-extrabold tabular-nums" style={{ fontFamily: 'Outfit', color }}>{nps.toFixed(1)}</span>
-      ) : (
-        <span className="text-3xl font-extrabold" style={{ fontFamily: 'Outfit', color: 'var(--ao-text-xs)' }}>{'\u2014'}</span>
-      )}
-      {label && <span className="text-[11px] font-semibold" style={{ color }}>{label}</span>}
-      {negativos > 0 && (
-        <span className="text-[11px] text-red-400 font-semibold ml-1">({negativos} negativo{negativos > 1 ? 's' : ''})</span>
+      <span className="text-3xl font-extrabold tabular-nums" style={{ fontFamily: 'Outfit', color }}>{score}</span>
+      <span className="text-[11px] font-semibold" style={{ color }}>{label}</span>
+      {criticos > 0 && (
+        <span className="text-[11px] text-red-400 font-semibold ml-1">({criticos} critico{criticos > 1 ? 's' : ''})</span>
       )}
     </div>
   )
@@ -79,11 +72,15 @@ function StatIcon({ type }) {
 
 export default function StatsBar() {
   const [stats, setStats] = useState(null)
+  const [sent, setSent] = useState(null)
 
   useEffect(() => {
+    const loadSent = () => fetch('/api/dashboard/sentiment?days=7').then(r => r.json()).then(setSent).catch(() => {})
     api.getStats().then(setStats).catch(() => {})
+    loadSent()
     const interval = setInterval(() => {
       api.getStats().then(setStats).catch(() => {})
+      loadSent()
     }, 15000)
     return () => clearInterval(interval)
   }, [])
@@ -134,7 +131,7 @@ export default function StatsBar() {
     {
       id: 'sentimento',
       label: 'Sentimento',
-      sublabel: 'NPS medio (7 dias)',
+      sublabel: 'Score atendimentos (7d)',
       icon: 'sentimento',
       gradient: 'stat-gradient-emerald',
       iconColor: '#22c55e',
@@ -160,7 +157,7 @@ export default function StatsBar() {
 
           {/* Value */}
           {card.isNps ? (
-            <NpsIndicator nps={sentimento?.nps_medio ?? null} negativos={sentimento?.negativos ?? 0} />
+            <ScoreIndicator score={sent?.score ?? null} label={sent?.label ?? ''} criticos={sent?.erros?.criticos ?? 0} />
           ) : (
             <p className="text-3xl font-extrabold tabular-nums" style={{ fontFamily: 'Outfit', color: card.color }}>
               <AnimatedNumber value={card.value} />

@@ -1,43 +1,44 @@
-import { useState, useEffect, useContext } from 'react'
+import { useState, useEffect, useContext, useRef } from 'react'
 import { ThemeContext } from '../App'
 import NotificationDropdown from './NotificationDropdown'
 
-const LINKS = [
-  { label: 'Escritorio', type: 'internal', id: 'home' },
-  { label: 'Crons', type: 'internal', id: 'crons' },
-  { label: 'Custos IA', type: 'internal', id: 'custos' },
-  { label: 'Sessões', type: 'internal', id: 'sessions' },
-  { label: 'Calendário', type: 'internal', id: 'calendar' },
-  { label: 'Memória', type: 'internal', id: 'memory' },
-  { label: 'Gesthub', type: 'external', url: 'https://gesthub-xlvb.onrender.com' },
-  { label: 'Banking', type: 'external', url: 'http://31.97.175.200:3000' },
-  { label: 'NFS-e System', type: 'external', url: 'http://31.97.175.200:3020' },
-  { label: 'Relatorio', type: 'action', id: 'relatorio' },
+const INTERNAL = [
+  { label: 'Escritorio', id: 'home' },
+  { label: 'Rotinas', id: 'crons' },
+  { label: 'Calendário', id: 'calendar' },
+  { label: 'Memória', id: 'memory' },
+  { label: 'Datalake', id: 'datalake' },
+]
+const SISTEMAS = [
+  { label: 'Gesthub',      url: 'http://31.97.175.200' },
+  { label: 'Banking',      url: 'http://31.97.175.200:3000' },
+  { label: 'NFS-e System', url: 'http://31.97.175.200:3020' },
+]
+const ACTIONS = [ // desativado temporariamente - sem uso
+  // { label: 'Relatorio', id: 'relatorio' }, // desabilitado
 ]
 
 export default function TopBar({ agents, connected, onAction, onSearchOpen, currentPage, onNavigate }) {
   const { theme, toggle: toggleTheme } = useContext(ThemeContext)
   const [time, setTime] = useState(new Date())
+  const [sistOpen, setSistOpen] = useState(false)
+  const sistRef = useRef(null)
 
   useEffect(() => {
     const t = setInterval(() => setTime(new Date()), 1000)
     return () => clearInterval(t)
   }, [])
 
+  useEffect(() => {
+    function onDocClick(e) { if (sistRef.current && !sistRef.current.contains(e.target)) setSistOpen(false) }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [])
+
   const onlineCount = agents?.filter(a => a.status === 'online').length || 0
 
-  function handleClick(link) {
-    if (link.type === 'external') {
-      window.open(link.url, '_blank', 'noopener')
-    } else if (link.type === 'action') {
-      onAction?.(link.id)
-    } else if (link.type === 'internal') {
-      onNavigate?.(link.id)
-    }
-  }
-
   return (
-    <div className="relative flex items-center h-[52px] shrink-0" style={{
+    <div className="relative flex items-center h-[52px] shrink-0 z-[100]" style={{
       background: `linear-gradient(180deg, var(--ao-topbar) 0%, var(--ao-topbar) 100%)`,
       backdropFilter: 'blur(16px)',
       WebkitBackdropFilter: 'blur(16px)',
@@ -60,34 +61,69 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
 
       {/* Links */}
       <div className="flex items-center h-full flex-1">
-        {LINKS.map(link => (
+        {INTERNAL.map(link => {
+          const active = currentPage === link.id
+          return (
+            <button
+              key={link.id}
+              onClick={() => onNavigate?.(link.id)}
+              className="relative flex items-center gap-1.5 h-full px-4 text-[12.5px] font-medium transition-all duration-200 cursor-pointer"
+              style={{ color: active ? 'var(--ao-text-primary)' : 'var(--ao-text-secondary)' }}
+            >
+              {link.label}
+              {active && (
+                <span className="absolute bottom-0 left-4 right-4 h-[2px] rounded-t-full" style={{
+                  background: 'linear-gradient(90deg, #C4956A, #C4956A80)',
+                  boxShadow: '0 0 8px rgba(196, 149, 106, 0.3)',
+                }} />
+              )}
+            </button>
+          )
+        })}
+
+        {/* Sistemas dropdown */}
+        <div className="relative h-full" ref={sistRef}>
           <button
-            key={link.label}
-            onClick={() => handleClick(link)}
-            className="relative flex items-center gap-1.5 h-full px-4 text-[12.5px] font-medium transition-all duration-200 cursor-pointer"
-            style={{ color: (link.type === 'internal' && currentPage === link.id) ? 'var(--ao-text-primary)' : link.type === 'internal' ? 'var(--ao-text-secondary)' : 'var(--ao-text-dim)' }}
-            onMouseEnter={(e) => { if (!(link.type === 'internal' && currentPage === link.id)) e.target.style.color = 'var(--ao-text-secondary)' }}
-            onMouseLeave={(e) => { if (link.type === 'internal' && currentPage === link.id) e.target.style.color = 'var(--ao-text-primary)'; else if (link.type === 'internal') e.target.style.color = 'var(--ao-text-secondary)'; else e.target.style.color = 'var(--ao-text-dim)' }}
+            onClick={() => setSistOpen(v => !v)}
+            className="flex items-center gap-1.5 h-full px-4 text-[12.5px] font-medium cursor-pointer"
+            style={{ color: sistOpen ? 'var(--ao-text-primary)' : 'var(--ao-text-dim)' }}
           >
-            {link.label}
-            {link.type === 'external' && (
-              <svg className="w-3 h-3 opacity-40" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-                <path d="M4.5 1.5H2a.5.5 0 00-.5.5v8a.5.5 0 00.5.5h8a.5.5 0 00.5-.5V7.5M7 1.5h3.5V5M6 6l4.5-4.5" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-            )}
-            {link.type === 'internal' && currentPage === link.id && (
-              <span className="absolute bottom-0 left-4 right-4 h-[2px] rounded-t-full" style={{
-                background: 'linear-gradient(90deg, #C4956A, #C4956A80)',
-                boxShadow: '0 0 8px rgba(196, 149, 106, 0.3)',
-              }} />
-            )}
+            Sistemas
+            <svg className="w-3 h-3 opacity-60" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="M3 4.5l3 3 3-3" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
+          {sistOpen && (
+            <div className="absolute top-full left-2 mt-1 min-w-[200px] rounded-lg overflow-hidden z-[9999]"
+              style={{ background:'#0f1115', backgroundColor:'#0f1115', border:'1px solid var(--ao-border)', boxShadow:'0 16px 48px rgba(0,0,0,0.85)' }}>
+              {SISTEMAS.map(s => (
+                <button key={s.label}
+                  onClick={() => { window.open(s.url, '_blank', 'noopener'); setSistOpen(false) }}
+                  className="w-full flex items-center justify-between px-3 py-2.5 text-left text-[12.5px] hover:bg-white/5 transition-colors"
+                  style={{ color:'var(--ao-text-secondary)' }}
+                >
+                  <span>{s.label}</span>
+                  <svg className="w-3 h-3 opacity-50" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <path d="M4.5 1.5H2a.5.5 0 00-.5.5v8a.5.5 0 00.5.5h8a.5.5 0 00.5-.5V7.5M7 1.5h3.5V5M6 6l4.5-4.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {ACTIONS.map(a => (
+          <button key={a.id}
+            onClick={() => onAction?.(a.id)}
+            className="flex items-center gap-1.5 h-full px-4 text-[12.5px] font-medium cursor-pointer"
+            style={{ color: 'var(--ao-text-dim)' }}>
+            {a.label}
           </button>
         ))}
       </div>
 
       {/* Right side */}
       <div className="flex items-center gap-3 px-5 h-full" style={{ borderLeft: `1px solid var(--ao-border)` }}>
-        {/* Search button */}
         <button
           onClick={onSearchOpen}
           title="Busca global (Ctrl+K)"
@@ -104,10 +140,8 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
           <span className="text-[11px]" style={{ fontFamily: 'Space Grotesk', color: 'var(--ao-text-dim)' }}>Ctrl+K</span>
         </button>
 
-        {/* Notifications */}
         <NotificationDropdown />
 
-        {/* Theme toggle */}
         <button
           onClick={toggleTheme}
           title={theme === 'dark' ? 'Modo claro' : 'Modo escuro'}
@@ -129,7 +163,6 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
           )}
         </button>
 
-        {/* Connection status */}
         <div className="flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full transition-all duration-500 ${connected ? 'bg-emerald-400' : 'bg-red-400'}`}
             style={connected ? { boxShadow: '0 0 8px rgba(52, 211, 153, 0.5)' } : {}} />
@@ -138,7 +171,6 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
           </span>
         </div>
 
-        {/* Time */}
         <div className="flex flex-col items-end">
           <span className="text-[13px] tabular-nums font-medium" style={{ fontFamily: 'Space Grotesk', color: 'var(--ao-text-muted)' }}>
             {time.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
@@ -149,7 +181,6 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
         </div>
       </div>
 
-      {/* Bottom gradient line */}
       {connected && (
         <div className="absolute bottom-0 left-0 right-0 vista-bar" />
       )}

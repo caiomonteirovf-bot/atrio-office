@@ -2,6 +2,7 @@
  * Luna Memory - RAG + retroalimentacao + extracao de fatos (aprendizagem)
  */
 import { query } from '../db/pool.js';
+import { searchMemories } from './embeddings.js';
 
 function stripCtx(t) {
   const i = String(t || '').indexOf('---FIM CONTEXTO---');
@@ -128,10 +129,18 @@ export async function buildContext({ phone, clientInfo }) {
     }
   }
 
-  const [history, memories, soul] = await Promise.all([
-    fetchRecentMessages(conversationId, 6),
+  // Busca ultima mensagem inbound para usar como query na busca semantica
+  const history = await fetchRecentMessages(conversationId, 6);
+  const lastInbound = [...history].reverse().find(h => h.direction === 'inbound');
+  const queryText = lastInbound ? String(lastInbound.content || '').slice(0, 500) : null;
+
+  const [memories, soul, semanticHits] = await Promise.all([
     fetchMemories({ clientId: effectiveClientId, conversationId, limit: 5 }),
     fetchSoul(),
+    queryText
+      ? searchMemories(queryText, { limit: 5 }).then(arr => arr.filter(m => (m.similarity || 0) >= 0.6).slice(0, 3))
+          .catch(err => { console.error('[buildContext] searchMemories:', err.message); return []; })
+      : Promise.resolve([]),
   ]);
 
   const parts = [];
@@ -173,6 +182,14 @@ export async function buildContext({ phone, clientInfo }) {
   if (memories.length) {
     parts.push(`\n## Memorias relevantes`);
     memories.forEach((m, i) => parts.push(`${i + 1}. [${m.tipo || 'fato'}] ${m.titulo || ''} — ${m.conteudo}`));
+  }
+  if (semanticHits && semanticHits.length) {
+    parts.push(`\n## Conhecimento relacionado (busca semantica)`);
+    semanticHits.forEach((m, i) => {
+      const sim = Math.round((m.similarity || 0) * 100);
+      const body = String(m.summary || m.content || m.conteudo || '').slice(0, 220);
+      parts.push(`${i + 1}. [${m.category || m.tipo || 'memoria'}] ${m.title || m.titulo || ''} (rel. ${sim}%) — ${body}`);
+    });
   }
   if (history.length) {
     parts.push(`\n## Ultimas mensagens`);

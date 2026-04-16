@@ -715,6 +715,9 @@ const ACTION_META = {
   edit_and_approved: { label: 'Editou e aprovou', color: '#22c55e', icon: '✓' },
   merged: { label: 'Mesclou', color: '#60a5fa', icon: '⊕' },
   superseded: { label: 'Substituiu', color: 'var(--ao-text-xs)', icon: '↺' },
+  auto_extracted: { label: 'Extraído', color: '#a78bfa', icon: '✨' },
+  consolidated: { label: 'Consolidou', color: '#60a5fa', icon: '⊙' },
+  decayed: { label: 'Expirou', color: 'var(--ao-text-xs)', icon: '⌛' },
 }
 
 function HistoryView() {
@@ -724,15 +727,30 @@ function HistoryView() {
   useEffect(() => {
     fetch('/api/memory/audit?limit=100')
       .then(r => r.json())
-      .then(data => { setLogs(data || []); setLoading(false) })
+      .then(data => {
+        const arr = Array.isArray(data) ? data : (data?.audit || [])
+        setLogs(arr); setLoading(false)
+      })
       .catch(() => setLoading(false))
   }, [])
 
   const getTitle = (log) => {
+    if (log.memory_title) return log.memory_title
     const data = log.after_json || log.before_json
     if (!data) return null
     const parsed = typeof data === 'string' ? (() => { try { return JSON.parse(data) } catch { return null } })() : data
     return parsed?.title || parsed?.proposed_content?.substring(0, 80) || null
+  }
+  const getDetails = (log) => {
+    const data = log.after_json
+    if (!data) return null
+    const parsed = typeof data === 'string' ? (() => { try { return JSON.parse(data) } catch { return null } })() : data
+    if (!parsed) return null
+    const bits = []
+    if (parsed.tool) bits.push(parsed.tool)
+    if (parsed.category) bits.push(parsed.category)
+    if (parsed.confidence != null) bits.push(`conf ${Math.round(parsed.confidence * 100)}%`)
+    return bits.length ? bits.join(' · ') : null
   }
 
   // Group by date
@@ -802,8 +820,29 @@ function HistoryView() {
                     {title || log.entity_id?.substring(0, 8)}
                   </span>
 
+                  {/* Details */}
+                  {getDetails(log) && (
+                    <span style={{
+                      fontSize: 10, color: 'var(--ao-text-xs)', fontFamily: "'Space Grotesk', monospace",
+                      padding: '2px 6px', background: 'var(--ao-surface-elevated)', borderRadius: 4, flexShrink: 0,
+                    }}>
+                      {getDetails(log)}
+                    </span>
+                  )}
+
+                  {/* Client */}
+                  {(() => {
+                    const after = typeof log.after_json === 'string' ? (() => { try { return JSON.parse(log.after_json) } catch { return null } })() : log.after_json
+                    const cn = log.client_name || after?.client_name
+                    return cn ? (
+                      <span style={{ fontSize: 10, color: 'var(--ao-text-xs)', flexShrink: 0, maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {cn}
+                      </span>
+                    ) : null
+                  })()}
+
                   {/* Actor */}
-                  <span style={{ fontSize: 10, color: 'var(--ao-text-xs)', flexShrink: 0 }}>
+                  <span style={{ fontSize: 10, color: 'var(--ao-text-xs)', flexShrink: 0 }} title={log.actor_name || log.actor_type}>
                     {log.actor_type === 'human' ? '👤' : log.actor_type === 'system' ? '⚙' : '🤖'}
                   </span>
                 </div>

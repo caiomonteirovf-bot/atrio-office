@@ -230,6 +230,37 @@ async function persistMemory({ fact, toolName, ctx }) {
     embedMemory(id).catch(err =>
       console.error(`[luna-observer] embed fail ${id}:`, err.message)
     );
+    // 3.5g — audit feed: registra extracao automatica
+    (async () => {
+      let clientName = null;
+      if (scope_type === 'client' && scope_id) {
+        const cn = await query(
+          `SELECT COALESCE(NULLIF(nome_fantasia, ''), nome_legal, 'Sem nome') AS n FROM luna_v2.clients WHERE id = $1::uuid`,
+          [scope_id]
+        ).catch(() => null);
+        clientName = cn?.rows?.[0]?.n || null;
+      }
+      await query(
+        `INSERT INTO memory_audit_log
+           (entity_type, entity_id, action, actor_type, actor_id, reason, source_ref, after_json)
+         VALUES ('memory', $1, 'auto_extracted', 'agent', $2, $3, $4, $5::jsonb)`,
+        [
+          id, agentId,
+          `Extraido de ${toolName}`,
+          source_ref,
+          JSON.stringify({
+            tool: toolName,
+            category: fact.category,
+            confidence: fact.confidence,
+            title: fact.title,
+            scope_id,
+            client_name: clientName,
+            metadata: fact.metadata || {},
+            fact_paths: Object.keys(fact.structured_facts || {}),
+          }),
+        ]
+      );
+    })().catch(err => console.error('[luna-observer] audit fail:', err.message));
   }
   return id;
 }

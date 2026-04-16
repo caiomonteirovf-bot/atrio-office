@@ -1291,8 +1291,9 @@ app.post('/api/memory/suggestions/:id/approve', async (req, res) => {
     
     // Audit log
     await query(
-      `INSERT INTO memory_audit_log (memory_id, action, performed_by, details) VALUES ($1, 'created_from_suggestion', 'admin', $2)`,
-      [memResult.rows[0].id, JSON.stringify({ suggestion_id: id })]
+      `INSERT INTO memory_audit_log (entity_type, entity_id, action, actor_type, reason, source_ref, after_json)
+       VALUES ('memory', $1, 'approved', 'human', 'Sugestao promovida', $2, $3::jsonb)`,
+      [memResult.rows[0].id, `suggestion:${id}`, JSON.stringify({ suggestion_id: id, title: memResult.rows[0].title })]
     ).catch(() => {});
     
     res.json({ success: true, memory: memResult.rows[0] });
@@ -1381,23 +1382,35 @@ app.delete('/api/memory/:id', async (req, res) => {
   }
 });
 
-// GET /api/memory/audit - Audit log of memory changes
+// GET /api/memory/audit - Feed de eventos da memoria
 app.get('/api/memory/audit', async (req, res) => {
   try {
-    const { limit = 100 } = req.query;
+    const { limit = 100, action, entity_id, since } = req.query;
+    const where = [`mal.entity_type = 'memory'`];
+    const params = [];
+    let idx = 0;
+    if (action) { where.push(`mal.action = $${++idx}`); params.push(String(action)); }
+    if (entity_id) { where.push(`mal.entity_id = $${++idx}::uuid`); params.push(String(entity_id)); }
+    if (since) { where.push(`mal.created_at >= $${++idx}::timestamptz`); params.push(String(since)); }
+    params.push(Math.min(parseInt(limit) || 100, 500));
     const result = await query(
-      `SELECT mal.*, m.title as memory_title, a.name as agent_name
-       FROM memory_audit_log mal 
-       LEFT JOIN memories m ON mal.memory_id = m.id
-       LEFT JOIN agents a ON m.agent_id = a.id
-       ORDER BY mal.created_at DESC LIMIT $1`,
-      [parseInt(limit)]
+      `SELECT mal.id, mal.entity_id, mal.action, mal.actor_type, mal.actor_id,
+              mal.reason, mal.source_ref, mal.before_json, mal.after_json, mal.created_at,
+              m.title AS memory_title, m.category AS memory_category,
+              a.name AS actor_name, lc.nome_fantasia AS client_name
+         FROM memory_audit_log mal
+         LEFT JOIN memories m ON mal.entity_id = m.id
+         LEFT JOIN agents a ON mal.actor_id = a.id
+         LEFT JOIN luna_v2.clients lc ON m.scope_id = lc.id AND m.scope_type = 'client'::memory_scope
+        WHERE ${where.join(' AND ')}
+        ORDER BY mal.created_at DESC
+        LIMIT $${++idx}`,
+      params
     );
-    res.json({ audit: result.rows });
+    res.json(result.rows);
   } catch (error) {
     console.error('[Memory] Erro audit:', error);
-    // Return empty if table structure differs
-    res.json({ audit: [] });
+    res.json([]);
   }
 });
 

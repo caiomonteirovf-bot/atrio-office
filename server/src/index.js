@@ -1137,16 +1137,22 @@ app.post('/api/whatsapp/reconnect', async (req, res) => {
 // GET /api/memory - List all approved memories
 app.get('/api/memory', async (req, res) => {
   try {
-    const { status = 'approved', agent, category, search, limit = 100 } = req.query;
-    let sql = `SELECT m.*, a.name as agent_name, a.role as agent_role 
+    const { status = 'approved', agent, agent_id, category, search,
+            client_id, scope_type, limit = 100 } = req.query;
+    let sql = `SELECT m.*, a.name as agent_name, a.role as agent_role,
+                      COALESCE(NULLIF(lc.nome_fantasia, ''), lc.nome_legal, 'Sem nome') AS client_name
                FROM memories m 
                LEFT JOIN agents a ON m.agent_id = a.id 
+               LEFT JOIN luna_v2.clients lc ON lc.id = m.scope_id AND m.scope_type = 'client'
                WHERE 1=1`;
     const params = [];
     
     if (status && status !== 'all') { params.push(status); sql += ` AND m.status = $${params.length}::memory_status`; }
-    if (agent) { params.push(agent); sql += ` AND a.name ILIKE $${params.length}`; }
+    if (agent_id) { params.push(agent_id); sql += ` AND m.agent_id = $${params.length}::uuid`; }
+    else if (agent) { params.push(agent); sql += ` AND a.name ILIKE $${params.length}`; }
     if (category) { params.push(category); sql += ` AND m.category = $${params.length}::memory_category`; }
+    if (scope_type) { params.push(scope_type); sql += ` AND m.scope_type = $${params.length}::memory_scope`; }
+    if (client_id) { params.push(client_id); sql += ` AND m.scope_id = $${params.length}::uuid AND m.scope_type = 'client'::memory_scope`; }
     if (search) { params.push(`%${search}%`); sql += ` AND (m.title ILIKE $${params.length} OR m.content ILIKE $${params.length} OR m.summary ILIKE $${params.length})`; }
     
     params.push(parseInt(limit));
@@ -1170,6 +1176,69 @@ app.get('/api/memory', async (req, res) => {
   } catch (error) {
     console.error('[Memory] Erro ao listar:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/memory/stats - Counters for HybridMemory sidebar
+app.get('/api/memory/stats', async (req, res) => {
+  try {
+    const mem = await query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'approved') AS approved,
+        COUNT(*) FILTER (WHERE status = 'approved' AND is_rag_enabled = true) AS rag_enabled,
+        COUNT(*) FILTER (WHERE status IN ('draft','pending_review')) AS pending_review,
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE embedding IS NOT NULL) AS embedded,
+        COUNT(*) FILTER (WHERE scope_type = 'client') AS with_client
+      FROM memories`);
+    const sug = await query(`
+      SELECT COUNT(*) AS pending
+      FROM memory_suggestions WHERE status = 'pending'`).catch(() => ({ rows: [{ pending: 0 }] }));
+    const out = mem.rows[0] || {};
+    res.json({
+      memories: {
+        approved: Number(out.approved) || 0,
+        rag_enabled: Number(out.rag_enabled) || 0,
+        pending_review: Number(out.pending_review) || 0,
+        total: Number(out.total) || 0,
+        embedded: Number(out.embedded) || 0,
+        with_client: Number(out.with_client) || 0,
+      },
+      suggestions: { pending: Number(sug.rows[0]?.pending) || 0 },
+    });
+  } catch (e) {
+    console.error('[Memory stats]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/memory/clients-with-memories - clients that have at least one memory
+app.get('/api/memory/clients-with-memories', async (req, res) => {
+  try {
+    const r = await query(`
+      SELECT lc.id,
+             COALESCE(NULLIF(lc.nome_fantasia, ''), lc.nome_legal, 'Sem nome') AS nome,
+             lc.cnpj,
+             COUNT(m.id) AS total,
+             COUNT(m.id) FILTER (WHERE m.status = 'approved') AS approved,
+             COUNT(m.id) FILTER (WHERE m.is_rag_enabled = true AND m.status = 'approved') AS rag_enabled
+      FROM luna_v2.clients lc
+      JOIN memories m ON m.scope_id = lc.id AND m.scope_type = 'client'
+      GROUP BY lc.id, lc.nome_fantasia, lc.nome_legal, lc.cnpj
+      HAVING COUNT(m.id) > 0
+      ORDER BY COUNT(m.id) DESC, nome ASC
+      LIMIT 200`);
+    res.json(r.rows.map(row => ({
+      id: row.id,
+      nome: row.nome,
+      cnpj: row.cnpj,
+      total: Number(row.total) || 0,
+      approved: Number(row.approved) || 0,
+      rag_enabled: Number(row.rag_enabled) || 0,
+    })));
+  } catch (e) {
+    console.error('[Memory clients-with-memories]', e);
+    res.status(500).json({ error: e.message });
   }
 });
 

@@ -102,13 +102,16 @@ export default function HybridMemory() {
   const [view, setView] = useState('knowledge')
   const [stats, setStats] = useState(null)
   const [agents, setAgents] = useState([])
+  const [clients, setClients] = useState([])
   const [selectedAgent, setSelectedAgent] = useState(null)
+  const [selectedClient, setSelectedClient] = useState(null)
   const [selectedCategory, setSelectedCategory] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [showCreate, setShowCreate] = useState(false)
 
   useEffect(() => {
     fetch('/api/agents').then(r => r.json()).then(d => setAgents(Array.isArray(d) ? d : d.agents || []))
+    fetch('/api/memory/clients-with-memories').then(r => r.json()).then(d => setClients(Array.isArray(d) ? d : [])).catch(() => setClients([]))
     refreshStats()
   }, [])
 
@@ -169,6 +172,25 @@ export default function HybridMemory() {
 
         <div style={{ height: 1, background: 'var(--ao-border)', margin: '8px 14px' }} />
 
+        {/* Client filters */}
+        <SidebarSection label={`CLIENTES${clients.length ? ` (${clients.length})` : ''}`}>
+          <SidebarItem active={selectedClient === null} onClick={() => setSelectedClient(null)}
+            icon={<span style={{ width: 8, height: 8, borderRadius: 2, background: 'var(--ao-text-dim)' }} />}
+            label="Todos" />
+          {clients.length === 0 ? (
+            <div style={{ fontSize: 11, color: 'var(--ao-text-dim)', padding: '4px 20px' }}>
+              Nenhuma memoria por cliente ainda
+            </div>
+          ) : clients.map(c => (
+            <SidebarItem key={c.id} active={selectedClient === c.id}
+              onClick={() => setSelectedClient(selectedClient === c.id ? null : c.id)}
+              icon={<span style={{ width: 8, height: 8, borderRadius: '50%', background: c.rag_enabled > 0 ? '#22c55e' : 'var(--ao-text-dim)' }} />}
+              label={c.nome} count={c.total} />
+          ))}
+        </SidebarSection>
+
+        <div style={{ height: 1, background: 'var(--ao-border)', margin: '8px 14px' }} />
+
         {/* Category filters */}
         <SidebarSection label="CATEGORIAS">
           <SidebarItem active={selectedCategory === null} onClick={() => setSelectedCategory(null)}
@@ -222,7 +244,8 @@ export default function HybridMemory() {
         {/* Content area */}
         <div style={{ flex: 1, overflowY: 'auto', padding: 0 }}>
           {view === 'knowledge' && (
-            <KnowledgeView agents={agents} selectedAgent={selectedAgent} selectedCategory={selectedCategory}
+            <KnowledgeView agents={agents} clients={clients}
+              selectedAgent={selectedAgent} selectedClient={selectedClient} selectedCategory={selectedCategory}
               searchQuery={searchQuery} onRefresh={refreshStats} />
           )}
           {view === 'review' && (
@@ -300,7 +323,7 @@ function IconClock() {
 }
 
 // ─── KNOWLEDGE VIEW ──────────────────────────────────────────
-function KnowledgeView({ agents, selectedAgent, selectedCategory, searchQuery, onRefresh }) {
+function KnowledgeView({ agents, clients = [], selectedAgent, selectedClient, selectedCategory, searchQuery, onRefresh }) {
   const [memories, setMemories] = useState([])
   const [loading, setLoading] = useState(true)
   const [selectedMem, setSelectedMem] = useState(null)
@@ -310,13 +333,14 @@ function KnowledgeView({ agents, selectedAgent, selectedCategory, searchQuery, o
     try {
       const params = new URLSearchParams({ status: 'approved', limit: '200' })
       if (selectedAgent) params.set('agent_id', selectedAgent)
+      if (selectedClient) params.set('client_id', selectedClient)
       if (selectedCategory) params.set('category', selectedCategory)
       const res = await fetch(`/api/memory?${params}`)
       const data = await res.json()
       setMemories(data.memories || [])
     } catch (e) { console.error(e) }
     setLoading(false)
-  }, [selectedAgent, selectedCategory])
+  }, [selectedAgent, selectedClient, selectedCategory])
 
   useEffect(() => { fetchMemories() }, [fetchMemories])
 

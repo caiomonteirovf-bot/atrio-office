@@ -50,12 +50,34 @@ export async function searchMemories(queryText, filter = {}) {
   if (filter.scope_id) { where.push(`scope_id = $${++idx}`); params.push(filter.scope_id); }
   if (filter.category) { where.push(`category = $${++idx}::memory_category`); params.push(filter.category); }
 
+  // 3.5c — filtros adicionais para uso Atrio Office
+  if (filter.client_id) {
+    where.push(`scope_id = $${++idx}::uuid AND scope_type = 'client'::memory_scope`);
+    params.push(filter.client_id);
+  }
+  if (filter.source_type) {
+    where.push(`metadata->>'source_type' = $${++idx}`);
+    params.push(filter.source_type);
+  }
+  if (filter.tool_origin) {
+    where.push(`metadata->>'tool_origin' = $${++idx}`);
+    params.push(filter.tool_origin);
+  }
+  if (filter.entity_type) {
+    where.push(`metadata->>'entity_type' = $${++idx}`);
+    params.push(filter.entity_type);
+  }
+  if (filter.metadata && typeof filter.metadata === 'object') {
+    where.push(`metadata @> $${++idx}::jsonb`);
+    params.push(JSON.stringify(filter.metadata));
+  }
+
   const limit = Math.min(filter.limit || 5, 20);
   params.push(vecLit);
   const vecParam = ++idx;
 
   const sql = `
-    SELECT id, title, summary, content, category, agent_id, scope_type, scope_id,
+    SELECT id, title, summary, content, category, agent_id, scope_type, scope_id, metadata, structured_facts,
       confidence_score, use_count, (embedding <=> $${vecParam}::vector) AS distance
     FROM memories WHERE ${where.join(' AND ')}
     ORDER BY embedding <=> $${vecParam}::vector LIMIT ${limit}`;

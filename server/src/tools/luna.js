@@ -1,6 +1,8 @@
 import { query } from '../db/pool.js';
 import * as gesthub from '../services/gesthub.js';
 import { consultarCliente } from './shared.js';
+import { searchMemories } from '../services/embeddings.js';
+import { getContext } from '../services/luna-observer.js';
 
 const AGENT_IDS = {
   rodrigo: 'a0000001-0000-0000-0000-000000000001',
@@ -192,5 +194,98 @@ export const tools = {
       disponivel: false,
       mensagem: 'Integração de email em desenvolvimento.',
     };
+  },
+
+  // 3.5d — busca semantica (vector) sobre a memoria da Atrio Office
+  async buscar_memorias({ query: q, limit = 5, source_type, tool_origin, entity_type, categoria, apenas_cliente_atual = true }) {
+    if (!q || String(q).trim().length < 2) {
+      return { erro: 'query obrigatoria (minimo 2 chars)' };
+    }
+    const ctx = getContext() || {};
+    const filter = {
+      limit: Math.min(Number(limit) || 5, 20),
+    };
+    if (apenas_cliente_atual && ctx.clientId) filter.client_id = ctx.clientId;
+    if (source_type) filter.source_type = String(source_type);
+    if (tool_origin) filter.tool_origin = String(tool_origin);
+    if (entity_type) filter.entity_type = String(entity_type);
+    if (categoria) filter.category = String(categoria);
+
+    try {
+      const hits = await searchMemories(String(q), filter);
+      return {
+        encontradas: hits.length,
+        memorias: hits.map(h => ({
+          titulo: h.title,
+          resumo: h.summary,
+          conteudo: (h.content || '').slice(0, 400),
+          categoria: h.category,
+          similaridade: Math.round((h.similarity || 0) * 100) / 100,
+          metadata: h.metadata || {},
+          structured_facts: h.structured_facts || {},
+        })),
+      };
+    } catch (e) {
+      return { erro: String(e.message || e).slice(0, 300) };
+    }
+  },
+
+  // 3.5e — consulta exata em structured_facts (JSONB). Ex: buscar pelo CNPJ de um tomador.
+  async consultar_fatos_estruturados({ path, valor, cliente_atual_apenas = true, limit = 10 }) {
+    if (!path || typeof path !== 'string') {
+      return { erro: 'path obrigatorio. Ex: "tomador.cnpj", "nfse.numero"' };
+    }
+    // Converte 'tomador.cnpj' em operador JSONB #>> '{tomador,cnpj}'
+    const parts = path.split('.').map(p => p.replace(/[^a-zA-Z0-9_]/g, ''));
+    if (parts.length === 0 || parts.some(p => !p)) {
+      return { erro: 'path invalido. Use letras/digitos/underscore separados por ponto.' };
+    }
+    const pgPath = '{' + parts.join(',') + '}';
+
+    const ctx = getContext() || {};
+    const params = [pgPath];
+    const where = ["structured_facts #>> $1 IS NOT NULL", "status = 'approved'::memory_status"];
+    let idx = 1;
+
+    if (valor != null && valor !== '') {
+      idx += 1;
+      where.push(`structured_facts #>> $1 = $${idx}`);
+      params.push(String(valor));
+    }
+    if (cliente_atual_apenas && ctx.clientId) {
+      idx += 1;
+      where.push(`scope_id = $${idx}::uuid AND scope_type = 'client'::memory_scope`);
+      params.push(ctx.clientId);
+    }
+
+    const lim = Math.min(Number(limit) || 10, 50);
+    idx += 1;
+    params.push(lim);
+
+    try {
+      const { rows } = await query(
+        `SELECT id, title, summary, category,
+                structured_facts, metadata, created_at,
+                structured_facts #>> $1 AS valor_encontrado
+         FROM memories
+         WHERE ${where.join(' AND ')}
+         ORDER BY created_at DESC
+         LIMIT $${idx}`,
+        params
+      );
+      return {
+        encontradas: rows.length,
+        resultados: rows.map(r => ({
+          titulo: r.title,
+          resumo: r.summary,
+          categoria: r.category,
+          valor_no_path: r.valor_encontrado,
+          structured_facts: r.structured_facts,
+          criada_em: r.created_at,
+        })),
+      };
+    } catch (e) {
+      return { erro: String(e.message || e).slice(0, 300) };
+    }
   },
 };

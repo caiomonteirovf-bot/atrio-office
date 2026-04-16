@@ -1202,7 +1202,7 @@ app.get('/api/memory/stats', async (req, res) => {
       FROM memories`);
     const sug = await query(`
       SELECT COUNT(*) AS pending
-      FROM memory_suggestions WHERE status = 'pending'`).catch(() => ({ rows: [{ pending: 0 }] }));
+      FROM memory_suggestions WHERE review_status = 'pending'::suggestion_status`).catch(() => ({ rows: [{ pending: 0 }] }));
     const out = mem.rows[0] || {};
     res.json({
       memories: {

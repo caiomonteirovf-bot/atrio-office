@@ -1,6 +1,7 @@
-// Luna conversation reflector:
-// Le uma conversa encerrada/inativa, extrai regras/erros/preferencias/oportunidades
-// e cria memorias com status='pending' para o Caio aprovar em Memoria > Sugestoes.
+// Luna conversation reflector (Passo 4):
+// Le uma conversa encerrada/inativa, extrai regras/erros/preferencias/oportunidades via LLM
+// e cria memory_suggestions (pending) para Caio aprovar em Memoria > Sugestoes.
+// Aprovacao promove para public.memories com embedding automatico (RAG-ready).
 import { query } from '../db/pool.js';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -34,6 +35,22 @@ REGRAS:
 - tipo=regra quando cliente definiu algo recorrente ("emita DAS dia 10").
 - NAO duplique aprendizados obvios do cadastro (nome/empresa ja no Gesthub).`;
 
+// Mapeamento tipo LLM -> memory_category enum
+const CATEGORY_MAP = {
+  regra: 'process_rule',
+  preferencia: 'preference',
+  erro: 'correction',
+  servico: 'learned_pattern',
+  dado_cadastral: 'client_fact',
+};
+// Area-specific override para regras fiscais
+function mapCategory(tipo, area) {
+  const t = String(tipo || '').toLowerCase();
+  const a = String(area || '').toLowerCase();
+  if (t === 'regra' && a === 'fiscal') return 'fiscal_rule';
+  return CATEGORY_MAP[t] || 'general';
+}
+
 async function callLLM(prompt) {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new Error('OPENROUTER_API_KEY ausente');
@@ -61,6 +78,14 @@ async function callLLM(prompt) {
   const content = data.choices?.[0]?.message?.content || '{}';
   try { return JSON.parse(content); }
   catch { return { resumo: 'parse fail', aprendizados: [], melhorias_luna: [], acoes_pendentes: [] }; }
+}
+
+let _lunaAgentId = null;
+async function getLunaAgentId() {
+  if (_lunaAgentId) return _lunaAgentId;
+  const { rows } = await query(`SELECT id FROM agents WHERE name ILIKE 'Luna' LIMIT 1`).catch(() => ({ rows: [] }));
+  _lunaAgentId = rows[0]?.id || null;
+  return _lunaAgentId;
 }
 
 export async function reflectConversation(conversationId) {
@@ -94,42 +119,87 @@ export async function reflectConversation(conversationId) {
   // 4. Chama LLM
   const result = await callLLM(prompt);
 
-  // 5. Insere aprendizados como memorias pending
+  // 5. Insere aprendizados em memory_suggestions (pending)
+  const agentId = await getLunaAgentId();
+  const scope_type = conv.client_id ? 'client' : 'global';
+  const scope_id = conv.client_id || null;
+  const trigger_ref = `conv:${conversationId}`;
+
   const inserted = [];
   for (const a of (result.aprendizados || [])) {
     if (!a.titulo || !a.conteudo) continue;
     try {
+      const category = mapCategory(a.tipo, a.area);
+      const priority = Math.max(0, Math.min(10, Number(a.prioridade) || 5)) / 10;
+      const evidence = {
+        conversation_id: conversationId,
+        resumo: result.resumo,
+        sentimento: result.sentimento_cliente,
+        tipo_origem: a.tipo,
+        area_origem: a.area,
+        justificativa: a.justificativa,
+        melhorias_luna: result.melhorias_luna || [],
+        acoes_pendentes: result.acoes_pendentes || [],
+      };
       const { rows } = await query(
-        `INSERT INTO luna_v2.memories
-           (tipo, titulo, conteudo, area, agent_id, client_id, prioridade, confianca,
-            status, is_rag_enabled, trigger_type, trigger_ref)
-         VALUES ($1,$2,$3,$4,'luna',$5,$6,0.85,'pending',false,'reflection',$7)
+        `INSERT INTO memory_suggestions
+           (agent_id, scope_type, scope_id, category, title, proposed_content,
+            proposed_summary, reason, trigger_type, trigger_ref, evidence_json,
+            confidence_score, priority_score, review_status, tags)
+         VALUES ($1, $2::memory_scope, $3, $4::memory_category, $5, $6, $7, $8,
+                 'conversation_insight'::trigger_type, $9, $10::jsonb,
+                 0.85, $11, 'pending'::suggestion_status, $12)
          RETURNING id`,
         [
-          String(a.tipo || 'preferencia').toLowerCase(),
-          String(a.titulo).slice(0, 200),
+          agentId, scope_type, scope_id, category,
+          String(a.titulo).slice(0, 255),
           String(a.conteudo).slice(0, 2000),
-          String(a.area || 'geral').toLowerCase(),
-          conv.client_id, Number(a.prioridade) || 5, conversationId,
-        ]);
+          String(a.conteudo).slice(0, 500),
+          a.justificativa || `Extraido de conversa (${result.sentimento_cliente || 'neutro'})`,
+          trigger_ref,
+          JSON.stringify(evidence),
+          priority,
+          [a.tipo, a.area].filter(Boolean).map(x => String(x).toLowerCase()),
+        ]
+      );
       inserted.push(rows[0].id);
     } catch (e) {
-      console.error('[luna-reflector] insert memory falhou:', e.message);
+      console.error('[luna-reflector] insert suggestion falhou:', e.message);
     }
   }
 
-  // 6. Marca reflection_done na conversa
-  try {
-    await query(`UPDATE luna_v2.conversations SET reflection_at = NOW() WHERE id = $1`, [conversationId]);
-  } catch (_) {}
+  // 6. Audit consolidado
+  if (inserted.length && agentId) {
+    await query(
+      `INSERT INTO memory_audit_log
+         (entity_type, entity_id, action, actor_type, actor_id, reason, source_ref, after_json)
+       VALUES ('conversation', $1, 'consolidated', 'agent', $2, $3, $4, $5::jsonb)`,
+      [
+        conversationId, agentId,
+        `Reflexao extraiu ${inserted.length} aprendizado(s)`,
+        trigger_ref,
+        JSON.stringify({
+          conversation_id: conversationId,
+          resumo: result.resumo,
+          sentimento: result.sentimento_cliente,
+          suggestions_count: inserted.length,
+          suggestion_ids: inserted,
+          client_name: clientLabel,
+        }),
+      ]
+    ).catch(err => console.error('[luna-reflector] audit fail:', err.message));
+  }
+
+  // 7. Marca reflection_at
+  await query(`UPDATE luna_v2.conversations SET reflection_at = NOW() WHERE id = $1`, [conversationId]).catch(() => {});
 
   return {
     ok: true,
     conversation_id: conversationId,
     resumo: result.resumo,
     sentimento: result.sentimento_cliente,
-    aprendizados_count: inserted.length,
-    aprendizados_ids: inserted,
+    suggestions_count: inserted.length,
+    suggestion_ids: inserted,
     melhorias_luna: result.melhorias_luna || [],
     acoes_pendentes: result.acoes_pendentes || [],
   };

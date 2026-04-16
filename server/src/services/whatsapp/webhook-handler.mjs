@@ -8,6 +8,7 @@
 
 // axios removed - using native fetch
 import { buildContext, persistTurn, extractFactsAsync } from '../luna-memory.js';
+import { runWithContext } from '../luna-observer.js';
 import { chatWithAgent, extractText } from '../claude.js';
 import { makeLunaExecutor } from '../luna-tools.js';
 import { query } from '../../db/pool.js';
@@ -41,7 +42,10 @@ async function handleWhatsAppMessage(message, clientInfo, conversationInfo) {
   try {
     // 2. Enviar para Luna (OpenClaw) — instrumenta latencia
     const __t0 = Date.now();
-    const result = await sendToOpenClaw(payload);
+    const result = await runWithContext(
+      { conversationId: ctx.conversationId, clientId: ctx.clientId },
+      () => sendToOpenClaw(payload)
+    );
     const __latencyMs = Date.now() - __t0;
 
     // 2.b Retroalimentacao: grava turno em luna_v2.messages

@@ -4,6 +4,7 @@ import { tools as sneijderTools } from './sneijder.js';
 import { tools as lunaTools } from './luna.js';
 import { tools as sofiaTools } from './sofia.js';
 import { tools as datalakeTools } from './datalake.js';
+import { observeToolCall } from '../services/luna-observer.js';
 
 // Registro central de todas as 32 tools
 const registry = {
@@ -43,6 +44,7 @@ export async function executeToolCall(toolName, args) {
   try {
     const result = await handler(args || {});
     console.log(`[Tools] ${toolName} → sucesso`);
+    observeToolCall(toolName, args || {}, result).catch(() => {});
 
     // Se a tool criou uma task, dispara orquestração assíncrona
     if (TASK_CREATING_TOOLS.has(toolName) && result?.sucesso && result?.tarefa?.id) {

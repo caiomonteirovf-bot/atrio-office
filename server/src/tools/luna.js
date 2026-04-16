@@ -1,7 +1,7 @@
 import { query } from '../db/pool.js';
 import * as gesthub from '../services/gesthub.js';
 import { consultarCliente } from './shared.js';
-import { searchMemories } from '../services/embeddings.js';
+import { searchMemories, searchMemoriesHybrid } from '../services/embeddings.js';
 import { getContext } from '../services/luna-observer.js';
 
 const AGENT_IDS = {
@@ -196,8 +196,8 @@ export const tools = {
     };
   },
 
-  // 3.5d — busca semantica (vector) sobre a memoria da Atrio Office
-  async buscar_memorias({ query: q, limit = 5, source_type, tool_origin, entity_type, categoria, apenas_cliente_atual = true }) {
+  // 3.5d + 3.5f — busca hibrida (RRF de vector + full-text) por padrao
+  async buscar_memorias({ query: q, limit = 5, source_type, tool_origin, entity_type, categoria, apenas_cliente_atual = true, modo = 'hibrido' }) {
     if (!q || String(q).trim().length < 2) {
       return { erro: 'query obrigatoria (minimo 2 chars)' };
     }
@@ -211,16 +211,22 @@ export const tools = {
     if (entity_type) filter.entity_type = String(entity_type);
     if (categoria) filter.category = String(categoria);
 
+    const fn = modo === 'vetorial' ? searchMemories : searchMemoriesHybrid;
     try {
-      const hits = await searchMemories(String(q), filter);
+      const hits = await fn(String(q), filter);
       return {
+        modo,
         encontradas: hits.length,
         memorias: hits.map(h => ({
           titulo: h.title,
           resumo: h.summary,
           conteudo: (h.content || '').slice(0, 400),
           categoria: h.category,
-          similaridade: Math.round((h.similarity || 0) * 100) / 100,
+          similaridade: h.similarity != null ? Math.round(h.similarity * 100) / 100 : null,
+          rrf_score: h.rrf_score != null ? Math.round(h.rrf_score * 10000) / 10000 : null,
+          fontes: h.sources || (h.similarity != null ? ['vector'] : ['text']),
+          vector_rank: h.vector_rank ?? null,
+          text_rank: h.text_rank != null && typeof h.text_rank === 'number' && h.text_rank <= 50 ? h.text_rank : null,
           metadata: h.metadata || {},
           structured_facts: h.structured_facts || {},
         })),

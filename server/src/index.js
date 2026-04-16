@@ -1395,11 +1395,13 @@ import { registerDatalake } from './routes/datalake.js';
 import { registerMemoryReflect } from './routes/memory-reflect.js';
 import { registerSentiment } from './routes/sentiment.js';
 import { registerLunaHealth } from './routes/luna-health.js';
+import { registerRagRoutes } from './routes/rag.js';
 registerAdminCleanup(app);
 registerDatalake(app);
 registerMemoryReflect(app);
 registerSentiment(app);
 registerLunaHealth(app);
+registerRagRoutes(app);
 
 // ============================================
 // SPA FALLBACK — Serve index.html para rotas do frontend

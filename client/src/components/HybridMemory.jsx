@@ -98,6 +98,15 @@ function ConfidenceBar({ value = 100, width = 48 }) {
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────
+const MEMORY_TABS = [
+  { id: 'todos',       label: 'Todos',             icon: 'TD' },
+  { id: 'fatos',       label: 'Fatos de Cliente',  icon: 'FC', category: 'client_fact' },
+  { id: 'transacoes',  label: 'Transacoes',        icon: 'TR', category: 'tool_result' },
+  { id: 'alertas',     label: 'Alertas',           icon: '!',  entity_type: 'alerta_sentimento' },
+  { id: 'regras',      label: 'Regras',            icon: 'RG', categories: 'fiscal_rule,process_rule,workflow_tip' },
+  { id: 'aprendizados',label: 'Aprendizados',      icon: 'AP', categories: 'learned_pattern,correction' },
+];
+
 export default function HybridMemory() {
   const [view, setView] = useState('knowledge')
   const [stats, setStats] = useState(null)
@@ -107,6 +116,7 @@ export default function HybridMemory() {
   const [selectedClient, setSelectedClient] = useState(null)
   const [selectedCategory, setSelectedCategory] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
+  const [selectedTab, setSelectedTab] = useState('todos')
   const [showCreate, setShowCreate] = useState(false)
 
   useEffect(() => {
@@ -228,10 +238,29 @@ export default function HybridMemory() {
           padding: '14px 24px', borderBottom: '1px solid var(--ao-border)',
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-            <h2 style={{ fontSize: 16, fontWeight: 700, color: 'var(--ao-text-primary)', margin: 0 }}>
-              {view === 'knowledge' ? 'Conhecimento da Equipe' : view === 'review' ? 'Sugestões para Revisar' : 'Histórico de Alterações'}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16, flex: 1, minWidth: 0 }}>
+            <h2 style={{ fontSize: 16, fontWeight: 700, color: 'var(--ao-text-primary)', margin: 0, flexShrink: 0 }}>
+              {view === 'knowledge' ? 'Conhecimento' : view === 'review' ? 'Sugestões' : 'Histórico'}
             </h2>
+            {view === 'knowledge' && (
+              <div style={{ display: 'flex', gap: 4, overflowX: 'auto', flex: 1 }}>
+                {MEMORY_TABS.map(t => {
+                  const active = selectedTab === t.id;
+                  return (
+                    <button key={t.id} onClick={() => setSelectedTab(t.id)} style={{
+                      padding: '6px 12px', borderRadius: 6, border: 'none', cursor: 'pointer',
+                      background: active ? 'var(--ao-accent-muted)' : 'transparent',
+                      color: active ? 'var(--ao-accent)' : 'var(--ao-text-secondary)',
+                      fontSize: 12, fontWeight: active ? 700 : 500, whiteSpace: 'nowrap',
+                      display: 'flex', alignItems: 'center', gap: 6, transition: 'all 0.15s',
+                    }}>
+                      <span style={{ fontSize: 11, opacity: 0.7, fontFamily: "'Space Grotesk', monospace" }}>{t.icon}</span>
+                      <span>{t.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
             <MiniStat label="Ativos" value={totalActive} color="#22c55e" />
@@ -246,6 +275,7 @@ export default function HybridMemory() {
           {view === 'knowledge' && (
             <KnowledgeView agents={agents} clients={clients}
               selectedAgent={selectedAgent} selectedClient={selectedClient} selectedCategory={selectedCategory}
+              selectedTab={selectedTab}
               searchQuery={searchQuery} onRefresh={refreshStats} />
           )}
           {view === 'review' && (
@@ -323,7 +353,8 @@ function IconClock() {
 }
 
 // ─── KNOWLEDGE VIEW ──────────────────────────────────────────
-function KnowledgeView({ agents, clients = [], selectedAgent, selectedClient, selectedCategory, searchQuery, onRefresh }) {
+function KnowledgeView({ agents, clients = [], selectedAgent, selectedClient, selectedCategory, selectedTab = 'todos', searchQuery, onRefresh }) {
+  const tabSpec = MEMORY_TABS.find(t => t.id === selectedTab) || MEMORY_TABS[0];
   const [memories, setMemories] = useState([])
   const [loading, setLoading] = useState(true)
   const [selectedMem, setSelectedMem] = useState(null)
@@ -335,12 +366,18 @@ function KnowledgeView({ agents, clients = [], selectedAgent, selectedClient, se
       if (selectedAgent) params.set('agent_id', selectedAgent)
       if (selectedClient) params.set('client_id', selectedClient)
       if (selectedCategory) params.set('category', selectedCategory)
+      if (!selectedCategory && tabSpec) {
+        if (tabSpec.category) params.set('category', tabSpec.category)
+        if (tabSpec.categories) params.set('categories', tabSpec.categories)
+        if (tabSpec.entity_type) params.set('entity_type', tabSpec.entity_type)
+        if (tabSpec.source_type) params.set('source_type', tabSpec.source_type)
+      }
       const res = await fetch(`/api/memory?${params}`)
       const data = await res.json()
       setMemories(data.memories || [])
     } catch (e) { console.error(e) }
     setLoading(false)
-  }, [selectedAgent, selectedClient, selectedCategory])
+  }, [selectedAgent, selectedClient, selectedCategory, selectedTab])
 
   useEffect(() => { fetchMemories() }, [fetchMemories])
 

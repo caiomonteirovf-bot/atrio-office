@@ -1137,8 +1137,8 @@ app.post('/api/whatsapp/reconnect', async (req, res) => {
 // GET /api/memory - List all approved memories
 app.get('/api/memory', async (req, res) => {
   try {
-    const { status = 'approved', agent, agent_id, category, search,
-            client_id, scope_type, limit = 100 } = req.query;
+    const { status = 'approved', agent, agent_id, category, categories, search,
+            client_id, scope_type, entity_type, source_type, limit = 100 } = req.query;
     let sql = `SELECT m.*, a.name as agent_name, a.role as agent_role,
                       COALESCE(NULLIF(lc.nome_fantasia, ''), lc.nome_legal, 'Sem nome') AS client_name
                FROM memories m 
@@ -1151,6 +1151,15 @@ app.get('/api/memory', async (req, res) => {
     if (agent_id) { params.push(agent_id); sql += ` AND m.agent_id = $${params.length}::uuid`; }
     else if (agent) { params.push(agent); sql += ` AND a.name ILIKE $${params.length}`; }
     if (category) { params.push(category); sql += ` AND m.category = $${params.length}::memory_category`; }
+    if (categories) {
+      const list = String(categories).split(',').map(c => c.trim()).filter(Boolean);
+      if (list.length) {
+        params.push(list);
+        sql += ` AND m.category = ANY($${params.length}::memory_category[])`;
+      }
+    }
+    if (entity_type) { params.push(entity_type); sql += ` AND m.metadata->>'entity_type' = $${params.length}`; }
+    if (source_type) { params.push(source_type); sql += ` AND m.metadata->>'source_type' = $${params.length}`; }
     if (scope_type) { params.push(scope_type); sql += ` AND m.scope_type = $${params.length}::memory_scope`; }
     if (client_id) { params.push(client_id); sql += ` AND m.scope_id = $${params.length}::uuid AND m.scope_type = 'client'::memory_scope`; }
     if (search) { params.push(`%${search}%`); sql += ` AND (m.title ILIKE $${params.length} OR m.content ILIKE $${params.length} OR m.summary ILIKE $${params.length})`; }

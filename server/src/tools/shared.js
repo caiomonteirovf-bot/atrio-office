@@ -1,6 +1,38 @@
 import * as gesthub from '../services/gesthub.js';
 import { consultarCNPJ } from '../services/receita.js';
 
+// Deteccao heuristica de genero pelo primeiro nome — BR.
+// Lista curada de finais e excecoes. Retorna 'M', 'F' ou null (indefinido).
+const NOMES_F_EXCECOES = new Set([
+  'nataly', 'natali', 'darci', 'daniele', 'michele', 'adriane', 'irene',
+  'ingrid', 'isis', 'esther', 'beatriz', 'doris', 'iris', 'ines',
+  'raquel', 'isabel', 'mabel', 'soledade', 'dayane', 'karen',
+]);
+const NOMES_M_EXCECOES = new Set([
+  'jose', 'andre', 'dante', 'tome', 'jonas', 'moises', 'lucas', 'elias',
+  'isaque', 'mateus', 'tobias', 'caique', 'heitor', 'nicolas', 'enzo',
+]);
+function detectarGenero(primeiroNome) {
+  if (!primeiroNome) return null;
+  const n = primeiroNome.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+  if (!n) return null;
+  if (NOMES_F_EXCECOES.has(n)) return 'F';
+  if (NOMES_M_EXCECOES.has(n)) return 'M';
+  // Heuristica: termina em 'a' quase sempre feminino no BR
+  if (/(a)$/.test(n)) return 'F';
+  // termina em 'e', 'i', 'o', 'u' ou consoante — masculino majoritario
+  return 'M';
+}
+function pronomeTratamento(primeiroNome, genero) {
+  const g = genero || detectarGenero(primeiroNome);
+  if (!primeiroNome) return null;
+  const nome = primeiroNome.trim().replace(/\b\w/g, l => l.toUpperCase());
+  if (g === 'F') return `Drª ${nome}`;
+  return `Dr. ${nome}`;
+}
+
+
+
 /**
  * Consulta cliente na base interna (Gesthub) por nome, CNPJ ou telefone.
  * Retorna dados completos: regime, honorário, Fator R, endereço, etc.
@@ -41,22 +73,73 @@ export async function consultarCliente({ busca }) {
   return {
     encontrado: true,
     total: resultados.length,
-    clientes: resultados.slice(0, 5).map(c => ({
-      id: c.id,
-      razao_social: c.legalName || '',
-      nome_fantasia: c.tradeName || '',
-      cnpj: c.document || '',
-      regime_tributario: c.taxRegime || 'Não informado',
-      status: c.status || '',
-      honorario_mensal: fmt(c.monthlyFee),
-      fator_r: c.fatorR || 'Não calculado',
-      cnae: c.cnae || '',
-      inscricao_municipal: c.municipalRegistration || '',
-      cidade: c.city || '',
-      uf: c.state || '',
-      telefone: c.phone || '',
-      email: c.email || '',
-      responsavel: c.analyst || c.officeOwner || '',
+    clientes: await Promise.all(resultados.slice(0, 5).map(async (c) => {
+      // Enriquece com contatos do Gesthub (o bootstrap nao traz por default)
+      if (!Array.isArray(c.contacts) || !c.contacts.length) {
+        try {
+          const contatos = await gesthub.getClientContatos(c.id);
+          c.contacts = contatos.map(ct => ({
+            nome: ct.nome,
+            cpf: ct.cpf,
+            funcao: ct.funcao,
+            telefone: ct.telefone,
+            email: ct.email,
+            genero: ct.genero,
+          }));
+        } catch {}
+      }
+
+      const tipo = (c.type || c.clientType || '').toUpperCase();
+      const requerPronome = ['MEDICINA', 'ODONTO', 'ODONTOLOGIA'].includes(tipo);
+      const contatos = Array.isArray(c.contacts) ? c.contacts : [];
+      const socios = contatos.filter(ct => /SOCIO|PROPRIETARIO/i.test(String(ct.funcao || ct.role || '')));
+      const contatosEnriquecidos = contatos.map(ct => {
+        const primeiroNome = String(ct.nome || ct.name || '').trim().split(/\s+/)[0];
+        const isSocio = /SOCIO|PROPRIETARIO/i.test(String(ct.funcao || ct.role || ''));
+        const genero = ct.genero || detectarGenero(primeiroNome);
+        return {
+          nome: ct.nome || ct.name,
+          cpf: ct.cpf || null,
+          funcao: ct.funcao || ct.role || null,
+          telefone: ct.telefone || ct.phone || null,
+          email: ct.email || null,
+          // Tratamento sugerido pela regra de negocio
+          tratamento_sugerido: (requerPronome && isSocio && primeiroNome)
+            ? pronomeTratamento(primeiroNome, genero)
+            : primeiroNome || null,
+          genero_detectado: genero,
+        };
+      });
+
+      return {
+        id: c.id,
+        razao_social: c.legalName || '',
+        nome_fantasia: c.tradeName || '',
+        cnpj: c.document || '',
+        tipo: tipo || null,
+        regime_tributario: c.taxRegime || 'Não informado',
+        status: c.status || '',
+        honorario_mensal: fmt(c.monthlyFee),
+        fator_r: c.fatorR || 'Não calculado',
+        cnae: c.cnae || '',
+        inscricao_municipal: c.municipalRegistration || '',
+        cidade: c.city || '',
+        uf: c.state || '',
+        telefone: c.phone || '',
+        email: c.email || '',
+        responsavel: c.analyst || c.officeOwner || '',
+        // ⚠️ REGRA DE TRATAMENTO: empresa MEDICINA/ODONTO → socios sao Dr./Drª
+        regra_tratamento: requerPronome
+          ? `⚠️ Empresa ${tipo} — TODOS os socios devem ser chamados com Dr./Drª + primeiro nome. Veja 'contatos[].tratamento_sugerido'.`
+          : null,
+        contatos: contatosEnriquecidos,
+        socios_para_chamar: requerPronome
+          ? socios.map(s => {
+              const pn = String(s.nome || s.name || '').trim().split(/\s+/)[0];
+              return { nome_completo: s.nome || s.name, chamar_como: pronomeTratamento(pn, s.genero) };
+            })
+          : undefined,
+      };
     })),
   };
 }

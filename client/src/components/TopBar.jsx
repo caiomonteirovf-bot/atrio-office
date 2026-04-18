@@ -7,6 +7,10 @@ const INTERNAL = [
   { label: 'Rotinas', id: 'crons' },
   { label: 'Calendário', id: 'calendar' },
   { label: 'Memória', id: 'memory' },
+  { label: 'Documentos', id: 'docs' },
+  { label: 'Auditoria', id: 'activity' },
+  { label: 'Alertas', id: 'alerts' },
+  { label: 'Erros', id: 'errors' },
   { label: 'Datalake', id: 'datalake' },
 ]
 const SISTEMAS = [

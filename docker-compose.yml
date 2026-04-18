@@ -34,6 +34,7 @@ services:
       GESTHUB_API_URL: ${GESTHUB_API_URL:-http://31.97.175.200}
       PORT: 3010
       OPENCLAW_GATEWAY: http://172.18.0.1:18789
+      NFSE_SYSTEM_URL: ${NFSE_SYSTEM_URL:-http://31.97.175.200:3020}
       NODE_ENV: production
       CORS_ORIGIN: "*"
       XAI_API_KEY: ${XAI_API_KEY}
@@ -42,9 +43,26 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       SLA_TOLERANCE_SECONDS: ${SLA_TOLERANCE_SECONDS:-600}
       REFLECTION_ENABLED: ${REFLECTION_ENABLED:-true}
+      ATRIO_FINANCE_URL: ${ATRIO_FINANCE_URL:-http://atrio-banking-system-1:3000}
     volumes:
       - ./client/dist:/app/client/dist:ro
       - ./server/src:/app/src:ro
+      - ./server/agents:/app/agents:ro
+      - ./server/skills:/app/skills:ro
+      - ingest_storage:/app/storage/ingest
+    networks:
+      - default
+      - atrio_finance
+      - gesthub
 
 volumes:
   pgdata:
+  ingest_storage:
+
+networks:
+  atrio_finance:
+    external: true
+    name: atrio_default
+  gesthub:
+    external: true
+    name: gesthub_default

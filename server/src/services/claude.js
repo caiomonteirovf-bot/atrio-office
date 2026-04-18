@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import dotenv from 'dotenv';
 import { query } from '../db/pool.js';
+import { checkBudget, invalidateBudgetCache } from './agent-budget.js';
 
 dotenv.config();
 
@@ -49,7 +50,8 @@ function recordTokenUsage(agentId, conversationId, model, usage) {
       `INSERT INTO token_usage (agent_id, conversation_id, tokens_input, tokens_output, model, cost_usd)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [agentId || null, conversationId || null, tokensInput, tokensOutput, model, costUsd]
-    ).catch(err => {
+    ).then(() => { if (agentId) invalidateBudgetCache(agentId); })
+     .catch(err => {
       console.error('[TokenUsage] Erro ao gravar:', err.message);
     });
   } catch (err) {
@@ -183,6 +185,27 @@ async function sendToAnthropic(agent, messages, options = {}) {
 // OPENAI-COMPATIBLE — Grok, DeepSeek, MiniMax
 // ============================================
 async function sendToOpenAI(agent, messages, options = {}) {
+  // Se budget bloqueou, forcar deepseek barato
+  if (agent._forceProvider === 'deepseek') {
+    const ds = getProvider('deepseek');
+    if (ds) {
+      try {
+        const response = await ds.chat.completions.create({
+          model: 'deepseek-chat',
+          messages: messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) })),
+          temperature: 0.3,
+          max_tokens: 512,
+        });
+        recordTokenUsage(agent.id || null, null, 'deepseek-chat', response.usage);
+        return response.choices?.[0]?.message?.content || '';
+      } catch (e) {
+        console.error('[Budget-downgrade] deepseek falhou:', e.message);
+        return '[orçamento mensal do agente excedido — resposta indisponível]';
+      }
+    }
+    return '[orçamento mensal do agente excedido — resposta indisponível]';
+  }
+
   const config = getAgentConfig(agent.name);
   const { maxTokens = config.maxTokens, temperature = config.temperature } = options;
 
@@ -206,6 +229,9 @@ async function sendToOpenAI(agent, messages, options = {}) {
       role: m.role === 'assistant' ? 'assistant' : (m.role === 'tool' ? 'tool' : 'user'),
       content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
       ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+      // Preserva tool_calls do assistant — sem isso, a proxima iteracao manda
+      // mensagens com role 'tool' sem 'tool_calls' precedente => 400.
+      ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
     })),
   ];
 
@@ -275,6 +301,16 @@ async function sendToOpenAI(agent, messages, options = {}) {
 // ============================================
 export async function sendToAgent(agent, messages, options = {}) {
   const config = getAgentConfig(agent.name);
+  // Budget gate — bloqueia ou faz downgrade forçado para DeepSeek (barato)
+  const budget = await checkBudget(agent);
+  if (budget.blocked) {
+    console.warn(`[Budget] ${agent.name} BLOQUEADO ($${budget.spent}/$${budget.budget}). Downgrade -> deepseek.`);
+    const forced = { ...agent, _forceProvider: 'deepseek', _budgetBlocked: true };
+    return sendToOpenAI(forced, messages, { ...options, _budgetBlocked: true });
+  }
+  if (budget.status === 'warn') {
+    console.warn(`[Budget] ${agent.name} em WARN (${budget.pct}%) — $${budget.spent}/$${budget.budget}`);
+  }
   if (config.provider === 'anthropic') return sendToAnthropic(agent, messages, options);
   return sendToOpenAI(agent, messages, options);
 }
@@ -307,11 +343,36 @@ function parseFunctionCallXml(text) {
   return calls.length > 0 ? calls : null;
 }
 
+
+// Resume um resultado de tool em string curta para auditoria
+function _summarizeToolResult(r) {
+  if (r == null) return 'null';
+  if (typeof r === 'string') return r.slice(0, 120);
+  if (typeof r !== 'object') return String(r);
+  if (r.erro || r.error) return 'erro: ' + String(r.erro || r.error).slice(0, 100);
+  if (r.numero_nfse) return 'nfse=' + r.numero_nfse + ' status=' + (r.status_nfse || '?');
+  if (r.tomador?.razao_social) return 'tomador=' + r.tomador.razao_social;
+  if (Array.isArray(r.tomadores)) return 'tomadores=' + r.tomadores.length;
+  if (r.cliente?.legalName || r.cliente?.razao_social) return 'cliente=' + (r.cliente.legalName || r.cliente.razao_social);
+  if (Array.isArray(r.clientes) || Array.isArray(r.results)) return 'count=' + (r.clientes?.length || r.results?.length || 0);
+  if (r.sucesso !== undefined) return 'sucesso=' + r.sucesso;
+  return JSON.stringify(r).slice(0, 120);
+}
+
 // ============================================
 // CHAT COM AGENTE — Tool use loop (multi-provider)
 // ============================================
 export async function chatWithAgent(agent, messages, toolExecutor = null) {
   const config = getAgentConfig(agent.name);
+  const budget = await checkBudget(agent);
+  if (budget.blocked) {
+    console.warn(`[Budget] ${agent.name} BLOQUEADO ($${budget.spent}/$${budget.budget}). Downgrade -> deepseek.`);
+    const forced = { ...agent, _forceProvider: 'deepseek', _budgetBlocked: true };
+    return chatWithAgentOpenAI(forced, messages, toolExecutor);
+  }
+  if (budget.status === 'warn') {
+    console.warn(`[Budget] ${agent.name} em WARN (${budget.pct}%) — $${budget.spent}/$${budget.budget}`);
+  }
   if (config.provider === 'anthropic') {
     return chatWithAgentAnthropic(agent, messages, toolExecutor);
   }
@@ -327,6 +388,7 @@ async function chatWithAgentAnthropic(agent, messages, toolExecutor) {
 
   const agentForRequest = toolExecutor ? agent : { ...agent, tools: [] };
   let iterations = 0;
+  const toolCallTrace = [];
 
   while (iterations < 10) {
     const response = await sendToAnthropic(agentForRequest, currentMessages);
@@ -340,6 +402,7 @@ async function chatWithAgentAnthropic(agent, messages, toolExecutor) {
         text: extractText(response.content),
         usage: response.usage,
         provider: response.provider,
+        toolCallTrace,
       };
     }
 
@@ -354,14 +417,32 @@ async function chatWithAgentAnthropic(agent, messages, toolExecutor) {
     // Executa tools
     const toolResults = [];
     for (const tc of response.toolCalls) {
+      const _t0 = Date.now();
       try {
         const result = await toolExecutor(tc.name, tc.input);
+        toolCallTrace.push({
+          name: tc.name,
+          args: tc.input,
+          ok: result?.sucesso !== false && result?.ok !== false && !result?.erro && !result?.error,
+          summary: _summarizeToolResult(result),
+          ms: Date.now() - _t0,
+          iteration: iterations,
+        });
         toolResults.push({
           type: 'tool_result',
           tool_use_id: tc.id,
           content: typeof result === 'string' ? result : JSON.stringify(result),
         });
       } catch (err) {
+        toolCallTrace.push({
+          name: tc.name,
+          args: tc.input,
+          ok: false,
+          summary: 'erro: ' + err.message,
+          ms: Date.now() - _t0,
+          iteration: iterations,
+          threw: true,
+        });
         toolResults.push({
           type: 'tool_result',
           tool_use_id: tc.id,
@@ -374,7 +455,7 @@ async function chatWithAgentAnthropic(agent, messages, toolExecutor) {
     iterations++;
   }
 
-  return { success: false, error: 'Max tool iterations reached', provider: 'anthropic' };
+  return { success: false, error: 'Max tool iterations reached', provider: 'anthropic', toolCallTrace };
 }
 
 // ---- OPENAI-COMPATIBLE tool use loop (Grok, DeepSeek, MiniMax) ----
@@ -387,6 +468,7 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
   const agentForRequest = toolExecutor ? agent : { ...agent, tools: [] };
   let iterations = 0;
   const _toolCallHistory = new Map(); // tool+args hash -> count
+  const toolCallTrace = []; // [{ name, args, ok, summary, ms, iteration }]
 
   while (iterations < 10) {
     const response = await sendToOpenAI(agentForRequest, currentMessages);
@@ -405,6 +487,7 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
         text: extractText(response.content),
         usage: response.usage,
         provider: response.provider,
+        toolCallTrace,
       };
     }
 
@@ -416,6 +499,7 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
         text: extractText(cleanText || 'Processado.'),
         usage: response.usage,
         provider: response.provider,
+        toolCallTrace,
       };
     }
 
@@ -428,13 +512,22 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
         const prev = _toolCallHistory.get(sig) || 0;
         _toolCallHistory.set(sig, prev + 1);
         let result;
+        const _t0 = Date.now();
         if (prev >= 1) {
-          // Chamada duplicada — injeta aviso em vez de reexecutar
           result = { ok: false, erro: 'tool-call duplicada detectada. Voce ja chamou ' + fnName + ' com os mesmos argumentos nessa conversa — NAO repita. Use o resultado anterior ou siga pro proximo passo.', duplicata: true };
           console.log('[chatWithAgent] dedup: ' + fnName + ' chamada ' + (prev + 1) + 'x, bloqueando');
         } else {
           result = await toolExecutor(fnName, fnArgs);
         }
+        toolCallTrace.push({
+          name: fnName,
+          args: fnArgs,
+          ok: prev >= 1 ? false : (result?.sucesso !== false && result?.ok !== false && !result?.erro && !result?.error),
+          summary: _summarizeToolResult(result),
+          ms: Date.now() - _t0,
+          iteration: iterations,
+          dedup: prev >= 1,
+        });
         currentMessages.push({
           role: 'tool',
           content: typeof result === 'string' ? result : JSON.stringify(result),
@@ -445,7 +538,17 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
       console.log(`[chatWithAgent] ${agent.name}: ${xmlToolCalls.length} <FunctionCall> XML`);
       const results = [];
       for (const call of xmlToolCalls) {
+        const _t0 = Date.now();
         const result = await toolExecutor(call.name, call.args);
+        toolCallTrace.push({
+          name: call.name,
+          args: call.args,
+          ok: result?.sucesso !== false && result?.ok !== false && !result?.erro && !result?.error,
+          summary: _summarizeToolResult(result),
+          ms: Date.now() - _t0,
+          iteration: iterations,
+          via: 'xml',
+        });
         results.push({ tool: call.name, result });
       }
       const cleanContent = response.content.replace(/<FunctionCall>[\s\S]*?<\/FunctionCall>/g, '').trim();
@@ -465,7 +568,7 @@ async function chatWithAgentOpenAI(agent, messages, toolExecutor) {
     iterations++;
   }
 
-  return { success: false, error: 'Max tool iterations reached', provider: 'openai-compatible' };
+  return { success: false, error: 'Max tool iterations reached', provider: 'openai-compatible', toolCallTrace };
 }
 
 export default { sendToAgent, chatWithAgent, extractText };

@@ -240,7 +240,45 @@ export const tools = {
     };
   },
 
-  async consultar_tomador({ cpf_cnpj, nome }) {
+  async consultar_status_nfse({ numero, tomador_cpf_cnpj, limite = 5 }) {
+    // Retorna STATUS REAL das NFS-e no NFS-e System.
+    // Use isto ANTES de afirmar que uma NFS-e foi emitida. Nunca confie so no chat interno.
+    const NFSE_SYSTEM_URL = process.env.NFSE_SYSTEM_URL || 'http://nfse-system:3020';
+    try {
+      let url = `${NFSE_SYSTEM_URL}/api/nfses?limit=${Math.min(parseInt(limite) || 5, 20)}`;
+      if (numero) url += `&numero=${encodeURIComponent(numero)}`;
+      if (tomador_cpf_cnpj) url += `&tomadorCpfCnpj=${encodeURIComponent(String(tomador_cpf_cnpj).replace(/\D/g, ''))}`;
+      const res = await fetch(url);
+      if (!res.ok) return { erro: `NFS-e System retornou ${res.status}` };
+      const data = await res.json();
+      const lista = (data.data || []).map(n => ({
+        numero: n.numero,
+        tomador: n.tomadorRazaoSocial || n.tomadorNome,
+        tomador_cpf_cnpj: n.tomadorCpfCnpj,
+        valor: n.valorServicos,
+        status: n.status,
+        data_emissao: n.dataEmissao,
+        erro_emissao: n.statusEmissao === 'ERRO' || n.status === 'ERRO'
+          ? (n.mensagemErro || n.erroEmissao || 'erro sem detalhe — verificar em Notas Fiscais')
+          : null,
+        origem: n.origem,
+      }));
+      // Resumo factual
+      const total = lista.length;
+      const emitidas = lista.filter(l => /EMITIDA|AUTORIZADA|PROCESSADA/i.test(l.status || '')).length;
+      const erros = lista.filter(l => /ERRO|REJEITADA/i.test(l.status || '')).length;
+      const pendentes = lista.filter(l => /PENDENTE|PROCESSANDO/i.test(l.status || '')).length;
+      return {
+        total, emitidas, erros, pendentes,
+        alerta: erros > 0 ? `ATENCAO: ${erros} NFS-e com ERRO — NAO reportar como sucesso.` : null,
+        notas: lista,
+      };
+    } catch (err) {
+      return { erro: `Falha ao consultar NFS-e System: ${err.message}` };
+    }
+  },
+
+    async consultar_tomador({ cpf_cnpj, nome }) {
     const NFSE_SYSTEM_URL = process.env.NFSE_SYSTEM_URL || 'http://localhost:3020';
     try {
       // Busca por documento específico
@@ -289,9 +327,33 @@ export const tools = {
     }
   },
 
-  async emitir_nfse({ prestador_cnpj, tomador_cpf_cnpj, tomador_nome, valor, descricao, codigo_servico, aliquota_iss, task_id }) {
-    // Validação de dados obrigatórios
-    if (!prestador_cnpj) return { sucesso: false, erro: 'CNPJ do prestador não informado.' };
+  async emitir_nfse({ prestador_cnpj, tomador_cpf_cnpj, tomador_nome, valor, descricao, codigo_servico, aliquota_iss, task_id, cliente_phone }) {
+    // Defensiva: prestador_cnpj nao veio → resolver via telefone do cliente no Gesthub.
+    // Regra de negocio: prestador = cliente da carteira que solicitou a NFS-e via WhatsApp.
+    // Identificacao acontece pelo telefone, nao pelo nome.
+    if (!prestador_cnpj && cliente_phone) {
+      try {
+        const cli = await gesthub.findClientByPhone(String(cliente_phone).replace(/\D/g, ''));
+        if (cli?.document) {
+          prestador_cnpj = cli.document;
+          console.log('[emitir_nfse] prestador_cnpj resolvido via telefone ' + cliente_phone + ': ' + cli.legalName + ' (' + cli.document + ')');
+        } else {
+          console.log('[emitir_nfse] telefone ' + cliente_phone + ' nao corresponde a nenhum cliente no Gesthub');
+        }
+      } catch (e) {
+        console.error('[emitir_nfse] falha findClientByPhone:', e.message);
+      }
+    }
+
+    // Validacao de dados obrigatorios
+    if (!prestador_cnpj) return {
+      sucesso: false,
+      erro: 'CNPJ do prestador nao informado. Quem solicita a NFS-e (prestador) e identificado pelo telefone do WhatsApp via Gesthub. Verifique se o cliente esta cadastrado com o telefone correto.',
+      acao_necessaria: cliente_phone
+        ? ('Telefone ' + cliente_phone + ' nao esta vinculado a nenhuma empresa no Gesthub - atualizar carteira.')
+        : 'Informar cliente_phone na chamada da tool ou prestador_cnpj diretamente.',
+      cliente_phone_recebido: cliente_phone || null,
+    };
     if (!tomador_cpf_cnpj) return { sucesso: false, erro: 'CPF/CNPJ do tomador não informado.' };
     if (!valor || valor <= 0) return { sucesso: false, erro: 'Valor do serviço não informado ou inválido.' };
     if (!descricao) return { sucesso: false, erro: 'Descrição do serviço não informada.' };

@@ -1,4 +1,5 @@
 import { query } from '../db/pool.js';
+import { logEvent } from './activity-log.js';
 import { chatWithAgent } from './claude.js';
 import { executeToolCall } from '../tools/registry.js';
 import { sendNfseToGroup, sendAlertToGroup, sendMessage } from './whatsapp.js';
@@ -63,13 +64,35 @@ export async function processTask(taskId) {
       if (task.result) originalMeta = typeof task.result === 'string' ? JSON.parse(task.result) : task.result;
     } catch {}
 
+    // Guard de aprovacao humana: se a task foi criada com esse flag,
+    // nao processa ate humano aprovar (ex: cobranca via Luna).
+    if (originalMeta?.aguardando_aprovacao_humana === true) {
+      console.log(`[Orchestrator] Task ${taskId} aguardando aprovacao humana — skip`);
+      taskStates.delete(taskId);
+      return;
+    }
+
     console.log(`[Orchestrator] Processando "${task.title}" → ${agent.name}`);
-    await query(`UPDATE tasks SET status = 'in_progress' WHERE id = $1`, [taskId]);
+    // Atomic checkout — garante que somente um worker processa
+    // Permite claim a partir de 'pending' OU 'in_progress' (recovery de crash)
+    const claim = await query(
+      `UPDATE tasks
+          SET status = 'in_progress', updated_at = NOW()
+        WHERE id = $1 AND status IN ('pending', 'in_progress')
+      RETURNING id, status`,
+      [taskId]
+    );
+    if (!claim.rows.length) {
+      console.log(`[Orchestrator] Task ${taskId} ja foi processada ou cancelada — skip`);
+      taskStates.delete(taskId);
+      return;
+    }
     broadcastFn?.({ type: 'task_updated', task: { id: taskId, status: 'in_progress', assigned_name: task.assigned_name } });
 
     // Chat: Rodrigo delega para o agente — extrai info da metadata para mensagem rica
     const clienteName = originalMeta?.cliente_nome || extractClientName(task, originalMeta);
-    const isNfseTask = task.title?.includes('[NFSE]') || task.title?.includes('[FISCAL]');
+    const isNfseTask = task.title?.includes('[NFSE]') || task.title?.includes('[FISCAL]')
+      || /nfs.?-?e|nota fiscal|emiss[aã]o|emitir/i.test(task.title || '');
     const parsedFields = originalMeta?.parsed_fields || {};
 
     // Notificação no chat: sistema informa que task foi delegada
@@ -79,24 +102,29 @@ export async function processTask(taskId) {
     let taskPrompt;
     if (isNfseTask && Object.keys(parsedFields).length > 0) {
       const pf = parsedFields;
-      taskPrompt = `Você recebeu uma tarefa de emissão de NFS-e.
+      const clientePhoneCtx = originalMeta?.cliente_phone || '';
+      taskPrompt = `Voce recebeu uma tarefa de emissao de NFS-e.
 
 TAREFA: ${task.title}
 PRIORIDADE: ${task.priority}
 
 DADOS ESTRUTURADOS (use EXATAMENTE estes valores na tool emitir_nfse):
-- prestador_cnpj: ${pf.prestador_cnpj || 'NÃO INFORMADO'}
-- prestador_nome: ${pf.prestador_nome || 'NÃO INFORMADO'}
-- tomador_cpf_cnpj: ${pf.tomador_cpf_cnpj || 'NÃO INFORMADO'}
-- tomador_tipo_doc: ${pf.tomador_tipo_doc || 'NÃO INFORMADO'}
-- valor: ${pf.valor || 'NÃO INFORMADO'}
-- descricao: ${pf.descricao || 'NÃO INFORMADA'}
-- cep_tomador: ${pf.cep_tomador || 'NÃO INFORMADO'}
+- prestador_cnpj: ${pf.prestador_cnpj || 'NAO INFORMADO - passe cliente_phone como fallback'}
+- prestador_nome: ${pf.prestador_nome || 'NAO INFORMADO'}
+- tomador_cpf_cnpj: ${pf.tomador_cpf_cnpj || 'NAO INFORMADO'}
+- tomador_tipo_doc: ${pf.tomador_tipo_doc || 'NAO INFORMADO'}
+- valor: ${pf.valor || 'NAO INFORMADO'}
+- descricao: ${pf.descricao || 'NAO INFORMADA'}
+- cep_tomador: ${pf.cep_tomador || 'NAO INFORMADO'}
+- cliente_phone (solicitante WhatsApp): ${clientePhoneCtx || 'NAO INFORMADO'}
 
-IMPORTANTE: Use o campo tomador_cpf_cnpj acima (${pf.tomador_cpf_cnpj || '?'}), NÃO confunda com CEP ou outros números.
+REGRA: prestador = cliente da carteira que solicitou via WhatsApp, identificado pelo telefone.
+SE prestador_cnpj acima estiver NAO INFORMADO mas cliente_phone existir, passe cliente_phone na tool emitir_nfse - ela resolve via Gesthub automaticamente.
+
+IMPORTANTE: tomador_cpf_cnpj e ${pf.tomador_cpf_cnpj || '?'} (NAO confunda com CEP ou outros numeros).
 ${task.description ? `\nCONTEXTO: ${task.description}` : ''}
 
-Execute a emissão usando a tool emitir_nfse com os dados acima.`;
+Execute a emissao usando a tool emitir_nfse.`;
     } else {
       taskPrompt = `Você recebeu uma tarefa delegada por Rodrigo (Diretor de Operações).
 
@@ -108,14 +136,85 @@ ${task.due_date ? `PRAZO: ${new Date(task.due_date).toLocaleDateString('pt-BR')}
 Execute a tarefa usando suas ferramentas disponíveis e retorne o resultado.`;
     }
 
-    const response = await chatWithAgent(agent, [
-      { role: 'user', content: taskPrompt },
-    ], executeToolCall);
+    // Wrapper do tool executor: auto-injeta cliente_phone, prestador_cnpj,
+    // tomador_cpf_cnpj e task_id em chamadas emitir_nfse. Essa e a fonte de
+    // verdade da task — LLM nao precisa lembrar de preencher.
+    const taskToolExecutor = async (name, args) => {
+      if (name === 'emitir_nfse' && isNfseTask) {
+        const pf = parsedFields || {};
+        const phone = originalMeta?.cliente_phone || '';
+        const enriched = { ...(args || {}) };
+        if (!enriched.prestador_cnpj && pf.prestador_cnpj) enriched.prestador_cnpj = pf.prestador_cnpj;
+        if (!enriched.cliente_phone && phone) enriched.cliente_phone = String(phone).replace(/\D/g, '');
+        if (!enriched.tomador_cpf_cnpj && pf.tomador_cpf_cnpj) enriched.tomador_cpf_cnpj = pf.tomador_cpf_cnpj;
+        if (!enriched.tomador_nome && pf.tomador_nome) enriched.tomador_nome = pf.tomador_nome;
+        if (!enriched.valor && pf.valor) enriched.valor = pf.valor;
+        if (!enriched.descricao && pf.descricao) enriched.descricao = pf.descricao;
+        if (!enriched.task_id) enriched.task_id = taskId;
+        const added = Object.keys(enriched).filter(k => !(k in (args || {})));
+        if (added.length) console.log('[Orchestrator] emitir_nfse auto-inject:', added.join(','));
+        return executeToolCall(name, enriched);
+      }
+      return executeToolCall(name, args);
+    };
 
-    if (response.success) {
+    let response = await chatWithAgent(agent, [
+      { role: 'user', content: taskPrompt },
+    ], taskToolExecutor);
+
+    // Post-flight fallback: se e task NFSe e LLM nao fez chamada bem-sucedida
+    // de emitir_nfse mas temos todos os dados, chama a tool diretamente.
+    // Defesa contra instrucao-nao-seguida do LLM (Grok as vezes "desiste").
+    if (response.success && isNfseTask) {
+      const calls = response.toolCallTrace || [];
+      const successfulEmit = calls.some(c => c.name === 'emitir_nfse' && c.ok);
+      const pf = parsedFields || {};
+      const phone = originalMeta?.cliente_phone || '';
+      const canAutoEmit = (pf.prestador_cnpj || phone) && pf.tomador_cpf_cnpj && pf.valor && pf.descricao;
+      if (!successfulEmit && canAutoEmit) {
+        console.log('[Orchestrator] LLM nao emitiu NFSe mas dados estao completos — fallback deterministico');
+        const enriched = {
+          prestador_cnpj: pf.prestador_cnpj || undefined,
+          cliente_phone: phone ? String(phone).replace(/\D/g, '') : undefined,
+          tomador_cpf_cnpj: pf.tomador_cpf_cnpj,
+          tomador_nome: pf.tomador_nome || undefined,
+          valor: pf.valor,
+          descricao: pf.descricao,
+          codigo_servico: pf.codigo_servico || undefined,
+          aliquota_iss: pf.aliquota_iss || undefined,
+          task_id: taskId,
+        };
+        const fallbackResult = await executeToolCall('emitir_nfse', enriched);
+        const fallbackCall = {
+          name: 'emitir_nfse',
+          args: enriched,
+          ok: fallbackResult?.sucesso === true,
+          summary: fallbackResult?.sucesso
+            ? 'nfse=' + (fallbackResult.numero_nfse || '?') + ' status=' + (fallbackResult.status_nfse || '?')
+            : 'erro: ' + String(fallbackResult?.erro || 'falha').slice(0, 100),
+          ms: 0,
+          iteration: -1,
+          via: 'orchestrator-fallback',
+        };
+        response = {
+          ...response,
+          text: (response.text || '') + '\n\n---\n[Orchestrator fallback] emitir_nfse chamada diretamente: ' + fallbackCall.summary,
+          toolCallTrace: [...calls, fallbackCall],
+        };
+      }
+    }
+
+    // Inspeciona resultados das tools — detecta falha mesmo com response.success=true
+    // (ex: emitir_nfse retornou sucesso:false mas o agente nao bloqueou sozinho)
+    const toolCalls = response.toolCallTrace || [];
+    const toolFailures = toolCalls.filter(c => c?.ok === false || /sucesso.{0,5}false|"ok"\s*:\s*false|\berro[":\s]/i.test(String(c?.summary || '')));
+    const hasToolFailure = toolFailures.length > 0;
+    const taskActuallyFailed = !response.success || hasToolFailure;
+
+    if (!taskActuallyFailed) {
       await query(`
         UPDATE tasks SET status = 'done', result = $1, completed_at = NOW() WHERE id = $2
-      `, [JSON.stringify({ text: response.text, usage: response.usage }), taskId]);
+      `, [JSON.stringify({ text: response.text, usage: response.usage, tool_calls: toolCalls }), taskId]);
 
       console.log(`[Orchestrator] "${task.title}" concluída por ${agent.name}`);
       broadcastFn?.({ type: 'task_completed', task: { id: taskId, title: task.title, assigned_name: task.assigned_name, status: 'done' } });
@@ -154,10 +253,19 @@ Execute a tarefa usando suas ferramentas disponíveis e retorne o resultado.`;
       // Responde ao cliente se for NFS-e/fiscal
       await notifyClientIfNfse(task, response.text, originalMeta);
     } else {
+      const blockReason = response.error
+        || (toolFailures.length ? `tool ${toolFailures[0].name || 'desconhecida'} falhou: ${toolFailures[0].summary || 'sem detalhe'}` : 'sem detalhe');
       await query(`UPDATE tasks SET status = 'blocked', result = $1 WHERE id = $2`,
-        [JSON.stringify({ error: response.error }), taskId]);
-      console.log(`[Orchestrator] "${task.title}" bloqueada: ${response.error}`);
+        [JSON.stringify({ error: blockReason, tool_failures: toolFailures, tool_calls: toolCalls, text: response.text }), taskId]);
+      console.log(`[Orchestrator] "${task.title}" bloqueada: ${blockReason}`);
       broadcastFn?.({ type: 'task_blocked', task: { id: taskId, title: task.title, assigned_name: task.assigned_name, status: 'blocked' } });
+
+      // Chat: avisa equipe com motivo REAL da falha (nao so 'erro generico')
+      const chatMsg = isNfseTask
+        ? `NFS-e de ${clienteName || 'cliente'} FALHOU: ${String(blockReason).slice(0, 160)}. Equipe, revisem no NFS-e System.`
+        : `Tarefa de ${clienteName || 'cliente'} BLOQUEADA: ${String(blockReason).slice(0, 160)}.`;
+      chat({ from: agent.name, text: `⚠️ ${chatMsg}`, tag: isNfseTask ? 'nfs-e' : 'bloqueado' });
+      // continua com o fluxo original (createNotification abaixo)
 
       // Notification: escalation / task bloqueada
       createNotification({
@@ -346,4 +454,81 @@ async function notifyTeamFailure(task, errorMsg) {
 
   telegram.sendAlert(alertMsg.replace(/\*/g, ''));
   try { await sendAlertToGroup(alertMsg); } catch {}
+}
+
+
+// ============================================
+// RECOVERY DE TASKS ORFAS (stranded-work)
+// Detecta tasks in_progress ha muito tempo — ninguem tocou.
+// 1a tentativa: volta para pending, deixa orquestrador re-pegar
+// 2a tentativa: bloqueia e notifica equipe
+// Inspirado no padrao heartbeat_runs + stranded-assigned-work do paperclipai/paperclip.
+// ============================================
+const STRANDED_AFTER_MINUTES = parseInt(process.env.STRANDED_AFTER_MINUTES || '15', 10);
+const STRANDED_MAX_RETRIES = parseInt(process.env.STRANDED_MAX_RETRIES || '1', 10);
+
+export async function recoverStrandedTasks({ maxAgeMinutes = STRANDED_AFTER_MINUTES } = {}) {
+  try {
+    const { rows } = await query(
+      `SELECT id, title, result,
+              EXTRACT(EPOCH FROM (NOW() - updated_at))/60 AS age_minutes
+         FROM tasks
+        WHERE status = 'in_progress'
+          AND updated_at < NOW() - ($1 || ' minutes')::interval
+        LIMIT 20`,
+      [String(maxAgeMinutes)]
+    );
+    if (!rows.length) return { scanned: 0, retried: 0, blocked: 0 };
+
+    let retried = 0, blocked = 0;
+    for (const t of rows) {
+      // In-memory lock: se a task estiver sendo processada agora, ignora
+      if (taskStates.has(t.id)) continue;
+
+      let meta = {};
+      try { meta = typeof t.result === 'string' ? JSON.parse(t.result) : (t.result || {}); } catch {}
+      const retries = parseInt(meta.stranded_retries || 0, 10);
+
+      if (retries < STRANDED_MAX_RETRIES) {
+        meta.stranded_retries = retries + 1;
+        meta.last_stranded_at = new Date().toISOString();
+        meta.last_stranded_age_min = Math.round(parseFloat(t.age_minutes));
+        await query(
+          `UPDATE tasks SET status = 'pending', result = $1 WHERE id = $2`,
+          [JSON.stringify(meta), t.id]
+        );
+        retried++;
+        logEvent({
+          actor_type: 'system', actor_id: 'recovery',
+          event_type: 'task.recovery', action: 'retry',
+          entity_type: 'task', entity_id: t.id,
+          payload: { title: t.title, age_min: Math.round(parseFloat(t.age_minutes)), attempt: retries + 1 },
+          severity: 'warn',
+        });
+        console.log(`[Recovery] Task ${t.id} ("${t.title}") retomada (tentativa ${retries + 1}/${STRANDED_MAX_RETRIES}, idade ${Math.round(parseFloat(t.age_minutes))}min)`);
+      } else {
+        meta.stranded_blocked_at = new Date().toISOString();
+        meta.error = 'task orfa: excedeu tentativas de recovery (processo pode ter crashado)';
+        await query(
+          `UPDATE tasks SET status = 'blocked', result = $1 WHERE id = $2`,
+          [JSON.stringify(meta), t.id]
+        );
+        blocked++;
+        logEvent({
+          actor_type: 'system', actor_id: 'recovery',
+          event_type: 'task.recovery', action: 'block',
+          entity_type: 'task', entity_id: t.id,
+          payload: { title: t.title, retries_exhausted: retries },
+          severity: 'critical',
+        });
+        console.warn(`[Recovery] Task ${t.id} ("${t.title}") BLOQUEADA apos ${retries} retries`);
+        // Notifica equipe
+        try { await notifyTeamFailure({ title: t.title, assigned_name: 'sistema' }, `Task orfa apos ${retries} retries — requer revisao manual`); } catch {}
+      }
+    }
+    return { scanned: rows.length, retried, blocked };
+  } catch (err) {
+    console.error('[Recovery] erro:', err.message);
+    return { scanned: 0, retried: 0, blocked: 0, error: err.message };
+  }
 }

@@ -35,7 +35,10 @@ const ONBOARDING_FASES = [
   },
 ];
 
+import { tools as campeloTools } from './campelo.js';
+
 export const tools = {
+  consultar_status_nfse: campeloTools.consultar_status_nfse,
   consultar_cliente: consultarCliente,
 
   async onboarding_cliente({ nome_cliente, cnpj }) {

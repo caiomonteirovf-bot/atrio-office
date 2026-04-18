@@ -6,3 +6,14 @@ server/whatsapp-session/
 server/.wwebjs_cache/
 server/.wwebjs_auth/
 *.log
+
+# Backups e arquivos temporarios
+*.bak
+*.bak.*
+*.backup
+*.save
+docker-compose.yml.save
+docker-compose.yml.bak*
+
+# Storage local (nao versionar arquivos de cliente)
+server/storage/

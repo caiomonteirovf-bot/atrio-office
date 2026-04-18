@@ -4,6 +4,7 @@ import { tools as sneijderTools } from './sneijder.js';
 import { tools as lunaTools } from './luna.js';
 import { tools as sofiaTools } from './sofia.js';
 import { tools as datalakeTools } from './datalake.js';
+import { tools as auditorTools } from './auditor.js';
 import { observeToolCall } from '../services/luna-observer.js';
 
 // Registro central de todas as 32 tools
@@ -14,6 +15,7 @@ const registry = {
   ...lunaTools,
   ...sofiaTools,
   ...datalakeTools,
+  ...auditorTools,
 };
 
 // Tools que criam tasks para agentes IA — disparam orquestração

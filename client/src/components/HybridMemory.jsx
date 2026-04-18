@@ -1,5 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 
+
+function formatCnpj(cnpj) {
+  if (!cnpj) return ''
+  const c = String(cnpj).replace(/\D/g, '')
+  if (c.length === 14) return `${c.slice(0,2)}.${c.slice(2,5)}.${c.slice(5,8)}/${c.slice(8,12)}-${c.slice(12)}`
+  if (c.length === 11) return `${c.slice(0,3)}.${c.slice(3,6)}.${c.slice(6,9)}-${c.slice(9)}`
+  return cnpj
+}
+
 // ─── Design tokens ───────────────────────────────────────────
 const gold = '#C4956A'
 const AGENT_COLORS = {
@@ -125,7 +134,10 @@ export default function HybridMemory() {
     refreshStats()
   }, [])
 
-  const refreshStats = () => fetch('/api/memory/stats').then(r => r.json()).then(setStats).catch(() => {})
+  const refreshStats = () => {
+    fetch('/api/memory/stats').then(r => r.json()).then(setStats).catch(() => {})
+    fetch('/api/memory/clients-with-memories').then(r => r.json()).then(d => setClients(Array.isArray(d) ? d : [])).catch(() => {})
+  }
   const pendingCount = stats?.suggestions?.pending || 0
   const totalActive = stats?.memories?.approved || 0
   const totalAll = stats?.memories?.total || 0
@@ -168,20 +180,6 @@ export default function HybridMemory() {
 
         <div style={{ height: 1, background: 'var(--ao-border)', margin: '8px 14px' }} />
 
-        {/* Agent filters */}
-        <SidebarSection label="AGENTES">
-          <SidebarItem active={selectedAgent === null} onClick={() => setSelectedAgent(null)}
-            icon={<span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--ao-text-dim)' }} />}
-            label="Todos" />
-          {agents.map(a => (
-            <SidebarItem key={a.id} active={selectedAgent === a.id}
-              onClick={() => setSelectedAgent(selectedAgent === a.id ? null : a.id)}
-              icon={<AgentDot name={a.name} />} label={a.name} />
-          ))}
-        </SidebarSection>
-
-        <div style={{ height: 1, background: 'var(--ao-border)', margin: '8px 14px' }} />
-
         {/* Client filters */}
         <SidebarSection label={`CLIENTES${clients.length ? ` (${clients.length})` : ''}`}>
           <SidebarItem active={selectedClient === null} onClick={() => setSelectedClient(null)}
@@ -216,19 +214,8 @@ export default function HybridMemory() {
           })}
         </SidebarSection>
 
-        {/* Bottom spacer + Teach button */}
+        {/* Bottom spacer — botao Ensinar agora vive no header */}
         <div style={{ flex: 1 }} />
-        <div style={{ padding: '12px 14px' }}>
-          <button onClick={() => setShowCreate(true)} style={{
-            width: '100%', padding: '9px 0', borderRadius: 8,
-            border: '1px solid rgba(196,149,106,0.25)', background: 'rgba(196,149,106,0.08)',
-            color: gold, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-            transition: 'all 0.15s',
-          }}>
-            <span style={{ fontSize: 15, fontWeight: 400 }}>+</span> Ensinar
-          </button>
-        </div>
       </aside>
 
       {/* ── MAIN CONTENT ── */}
@@ -242,6 +229,17 @@ export default function HybridMemory() {
             <h2 style={{ fontSize: 16, fontWeight: 700, color: 'var(--ao-text-primary)', margin: 0, flexShrink: 0 }}>
               {view === 'knowledge' ? 'Conhecimento' : view === 'review' ? 'Sugestões' : 'Histórico'}
             </h2>
+            <button onClick={() => setShowCreate(true)} style={{
+              padding: '7px 16px', borderRadius: 8,
+              border: '1px solid rgba(196,149,106,0.35)', background: 'rgba(196,149,106,0.12)',
+              color: gold, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+              display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0,
+              transition: 'all 0.15s',
+            }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'rgba(196,149,106,0.18)' }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'rgba(196,149,106,0.12)' }}>
+              <span style={{ fontSize: 14 }}>+</span> Ensinar
+            </button>
             {view === 'knowledge' && (
               <div style={{ display: 'flex', gap: 4, overflowX: 'auto', flex: 1 }}>
                 {MEMORY_TABS.map(t => {
@@ -359,7 +357,7 @@ function KnowledgeView({ agents, clients = [], selectedAgent, selectedClient, se
   const [loading, setLoading] = useState(true)
   const [selectedMem, setSelectedMem] = useState(null)
 
-  const fetchMemories = useCallback(async () => {
+  const fetchMemories = useCallback(async (signal) => {
     setLoading(true)
     try {
       const params = new URLSearchParams({ status: 'approved', limit: '200' })
@@ -372,14 +370,27 @@ function KnowledgeView({ agents, clients = [], selectedAgent, selectedClient, se
         if (tabSpec.entity_type) params.set('entity_type', tabSpec.entity_type)
         if (tabSpec.source_type) params.set('source_type', tabSpec.source_type)
       }
-      const res = await fetch(`/api/memory?${params}`)
+      const res = await fetch(`/api/memory?${params}`, { signal })
       const data = await res.json()
-      setMemories(data.memories || [])
-    } catch (e) { console.error(e) }
-    setLoading(false)
+      if (!signal?.aborted) {
+        setMemories(data.memories || [])
+        setLoading(false)
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        console.error(e)
+        if (!signal?.aborted) setLoading(false)
+      }
+    }
   }, [selectedAgent, selectedClient, selectedCategory, selectedTab])
 
-  useEffect(() => { fetchMemories() }, [fetchMemories])
+  // AbortController evita race condition: multiplos clicks rapidos
+  // podem fazer fetch antigo completar depois e sobrescrever estado novo.
+  useEffect(() => {
+    const ctrl = new AbortController()
+    fetchMemories(ctrl.signal)
+    return () => ctrl.abort()
+  }, [fetchMemories])
 
   const filtered = memories.filter(m => {
     if (!searchQuery) return true
@@ -664,6 +675,20 @@ function ReviewView({ agents, onAction }) {
                       {s.agent_name} · {formatDate(s.created_at)}
                       {s.trigger_type && <span> · via {s.trigger_type.replace('_', ' ')}</span>}
                     </div>
+                    {s.scope_type === 'client' && (s.client_nome || s.client_cnpj) && (
+                      <div style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 6,
+                        padding: '3px 10px', borderRadius: 6, marginTop: 6,
+                        background: 'rgba(196,149,106,0.08)', border: '1px solid rgba(196,149,106,0.25)',
+                        fontSize: 11, color: 'rgb(196,149,106)', fontWeight: 500,
+                      }}>
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                        </svg>
+                        <span>{s.client_nome || 'Cliente sem cadastro'}</span>
+                        {s.client_cnpj && <span style={{ opacity: 0.7 }}>· CNPJ {formatCnpj(s.client_cnpj)}</span>}
+                      </div>
+                    )}
                   </div>
 
                   {/* Quick actions (only if pending + collapsed) */}
@@ -894,11 +919,75 @@ function HistoryView() {
 
 // ─── CREATE MODAL ────────────────────────────────────────────
 function CreateModal({ agents, onClose, onCreated }) {
+  const [mode, setMode] = useState('write')  // 'write' | 'import'
   const [form, setForm] = useState({
     agent_id: '', category: 'general', title: '', content: '', summary: '', scope_type: 'global', priority: 0,
   })
   const [saving, setSaving] = useState(false)
+  const [importFile, setImportFile] = useState(null)
+  const [importPreview, setImportPreview] = useState(null)
+  const [importError, setImportError] = useState(null)
+  const [dragActive, setDragActive] = useState(false)
   const overlayRef = useRef(null)
+  const fileInputRef = useRef(null)
+
+  // Parser simples de frontmatter YAML --- ... ---
+  const parseMd = (text, filename) => {
+    const trimmed = text.replace(/^﻿/, '')  // remove BOM
+    let fm = {}
+    let body = trimmed
+    if (trimmed.startsWith('---')) {
+      const end = trimmed.indexOf('\n---', 3)
+      if (end !== -1) {
+        const fmSrc = trimmed.slice(3, end).replace(/^\n/, '')
+        body = trimmed.slice(end + 4).replace(/^\n+/, '')
+        for (const line of fmSrc.split('\n')) {
+          const m = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/)
+          if (m) {
+            let v = m[2].trim().replace(/^["']|["']$/g, '')
+            fm[m[1].toLowerCase()] = v
+          }
+        }
+      }
+    }
+    const title = fm.title || fm.titulo
+      || body.split('\n').find(l => l.startsWith('# '))?.replace(/^#\s+/, '')
+      || (filename || 'documento').replace(/\.md$/i, '')
+    const category = fm.category || fm.categoria || 'general'
+    const summary = fm.summary || fm.resumo || body.replace(/^#.*$/m, '').trim().slice(0, 160)
+    // Remove h1 inicial pro body nao duplicar o titulo
+    let content = body.replace(/^#\s+.+\n+/, '').trim() || body.trim()
+    return { title, category, summary, content, frontmatter: fm }
+  }
+
+  const handleFile = async (file) => {
+    if (!file) return
+    setImportError(null)
+    if (!file.name.toLowerCase().endsWith('.md') && !file.name.toLowerCase().endsWith('.markdown')) {
+      setImportError('Apenas arquivos .md / .markdown sao aceitos.')
+      return
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setImportError('Arquivo muito grande (max 2MB).')
+      return
+    }
+    try {
+      const text = await file.text()
+      const parsed = parseMd(text, file.name)
+      setImportFile(file)
+      setImportPreview(parsed)
+      // Popula o form com o parse
+      setForm(f => ({
+        ...f,
+        title: parsed.title || f.title,
+        category: CATEGORY_OPTIONS.includes(parsed.category) ? parsed.category : 'general',
+        summary: parsed.summary || f.summary,
+        content: parsed.content || f.content,
+      }))
+    } catch (e) {
+      setImportError('Falha ao ler arquivo: ' + e.message)
+    }
+  }
 
   const handleSubmit = async () => {
     if (!form.title || !form.content) return
@@ -906,7 +995,11 @@ function CreateModal({ agents, onClose, onCreated }) {
     try {
       await fetch('/api/memory', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...form, status: 'approved' }),
+        body: JSON.stringify({
+          ...form,
+          status: 'approved',
+          metadata: importPreview ? { source_type: 'markdown_import', filename: importFile?.name, frontmatter: importPreview.frontmatter } : undefined,
+        }),
       })
       onCreated?.()
     } catch (e) { console.error(e) }
@@ -923,12 +1016,72 @@ function CreateModal({ agents, onClose, onCreated }) {
         background: 'var(--ao-card)', border: '1px solid var(--ao-border)', padding: 28,
         boxShadow: '0 24px 48px rgba(0,0,0,0.4)',
       }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--ao-text-primary)' }}>Ensinar Conhecimento</h3>
           <button onClick={onClose} style={{
             border: 'none', background: 'transparent', cursor: 'pointer', color: 'var(--ao-text-dim)', fontSize: 18,
           }}>×</button>
         </div>
+
+        {/* Tabs: Escrever / Importar .md */}
+        <div style={{ display: 'flex', gap: 2, marginBottom: 18, borderBottom: '1px solid var(--ao-border)' }}>
+          {[['write', 'Escrever'], ['import', 'Importar .md']].map(([id, label]) => (
+            <button key={id} onClick={() => setMode(id)} style={{
+              padding: '8px 16px', border: 'none', background: 'transparent', cursor: 'pointer',
+              color: mode === id ? 'var(--ao-accent)' : 'var(--ao-text-dim)',
+              fontSize: 12, fontWeight: mode === id ? 700 : 500,
+              borderBottom: mode === id ? '2px solid var(--ao-accent)' : '2px solid transparent',
+              marginBottom: -1,
+            }}>{label}</button>
+          ))}
+        </div>
+
+        {/* IMPORT .md */}
+        {mode === 'import' && (
+          <div style={{ marginBottom: 18 }}>
+            <div
+              onDragOver={(e) => { e.preventDefault(); setDragActive(true) }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={(e) => { e.preventDefault(); setDragActive(false); const f = e.dataTransfer?.files?.[0]; if (f) handleFile(f) }}
+              onClick={() => fileInputRef.current?.click()}
+              style={{
+                border: `2px dashed ${dragActive ? gold : 'var(--ao-border)'}`,
+                borderRadius: 10, padding: '24px 16px', textAlign: 'center', cursor: 'pointer',
+                background: dragActive ? 'rgba(196,149,106,0.06)' : 'var(--ao-input-bg)',
+                transition: 'all 0.15s',
+              }}>
+              <input ref={fileInputRef} type="file" accept=".md,.markdown,text/markdown" hidden
+                onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = '' }} />
+              {importPreview ? (
+                <div style={{ textAlign: 'left' }}>
+                  <div style={{ fontSize: 12, color: gold, fontWeight: 600, marginBottom: 6 }}>✓ Arquivo carregado</div>
+                  <div style={{ fontSize: 12, color: 'var(--ao-text-primary)', fontWeight: 500 }}>{importFile?.name}</div>
+                  <div style={{ fontSize: 11, color: 'var(--ao-text-dim)', marginTop: 4 }}>
+                    {Object.keys(importPreview.frontmatter || {}).length > 0
+                      ? `Frontmatter: ${Object.keys(importPreview.frontmatter).join(', ')}`
+                      : 'Sem frontmatter — usando heuristicas'}
+                  </div>
+                  <div style={{ marginTop: 10, fontSize: 11, color: 'var(--ao-text-dim)' }}>
+                    Clique novamente para trocar · revise os campos abaixo antes de salvar
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div style={{ fontSize: 24, color: 'var(--ao-text-dim)', marginBottom: 6 }}>⬆</div>
+                  <div style={{ fontSize: 13, color: 'var(--ao-text-primary)', fontWeight: 500 }}>
+                    Arraste um arquivo .md aqui ou clique
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--ao-text-dim)', marginTop: 6 }}>
+                    Frontmatter YAML suportado (title, category, summary, priority).
+                  </div>
+                </>
+              )}
+            </div>
+            {importError && (
+              <div style={{ marginTop: 8, fontSize: 12, color: '#ef4444' }}>{importError}</div>
+            )}
+          </div>
+        )}
 
         {/* Agent selector */}
         <FormField label="Para quem?">

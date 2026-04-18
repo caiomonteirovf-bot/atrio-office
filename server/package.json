@@ -1,7 +1,7 @@
 {
   "name": "atrio-office-server",
   "version": "1.0.0",
-  "description": "Átrio Office — Backend do escritório contábil virtual",
+  "description": "\u00c1trio Office \u2014 Backend do escrit\u00f3rio cont\u00e1bil virtual",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
@@ -10,7 +10,10 @@
     "db:create": "psql -U postgres -c 'CREATE DATABASE atrio_office;'",
     "db:schema": "psql -U postgres -d atrio_office -f src/db/schema.sql",
     "db:seed": "psql -U postgres -d atrio_office -f src/db/seed.sql",
-    "db:setup": "npm run db:create && npm run db:schema && npm run db:seed"
+    "db:setup": "npm run db:create && npm run db:schema && npm run db:seed",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "vitest run tests/",
+    "test:watch": "vitest tests/"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
@@ -24,6 +27,13 @@
     "qrcode": "^1.5.4",
     "uuid": "^11.1.0",
     "whatsapp-web.js": "^1.34.6",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "pdf-parse": "^1.1.1",
+    "multer": "^1.4.5-lts.1",
+    "mammoth": "^1.8.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.9"
   }
 }

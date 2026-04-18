@@ -9,10 +9,12 @@ import { query } from './db/pool.js';
 import { chatWithAgent, extractText } from './services/claude.js';
 import { startWatchdog } from './services/luna-watchdog.js';
 import { executeToolCall, setOnTaskCreated } from './tools/registry.js';
-import { processTask, processPendingTasks, setBroadcast, setLogChat } from './services/orchestrator.js';
+import { processTask, processPendingTasks, setBroadcast, setLogChat, recoverStrandedTasks } from './services/orchestrator.js';
+import { syncAgentsFromFiles } from './services/agent-loader.js';
 import { createNotification } from './services/notifications.js';
 
 dotenv.config();
+installGlobalHandlers();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -755,6 +757,84 @@ app.patch('/api/tasks/:id', async (req, res) => {
   }
 });
 
+// POST /api/tasks/:id/approve — libera task que estava aguardando aprovacao humana.
+// Flipa result.aguardando_aprovacao_humana=false, aprova metadata, e dispara processTask.
+app.post('/api/tasks/:id/approve', async (req, res) => {
+  const { id } = req.params;
+  const { aprovado_por, observacao, mensagem_override } = req.body || {};
+  try {
+    const { rows } = await query(`SELECT * FROM tasks WHERE id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Task nao encontrada' });
+    const task = rows[0];
+    if (task.status !== 'pending') {
+      return res.status(409).json({ error: `Task ja esta ${task.status}, aprovacao so aplicavel em pending.` });
+    }
+    const currentResult = typeof task.result === 'string' ? JSON.parse(task.result || '{}') : (task.result || {});
+    if (currentResult.aguardando_aprovacao_humana !== true) {
+      return res.status(400).json({ error: 'Task nao esta aguardando aprovacao humana.' });
+    }
+    const approvedResult = {
+      ...currentResult,
+      aguardando_aprovacao_humana: false,
+      aprovado_em: new Date().toISOString(),
+      aprovado_por: aprovado_por || 'humano',
+      aprovacao_observacao: observacao || null,
+      ...(mensagem_override ? { mensagem_sugerida: mensagem_override } : {}),
+    };
+    await query(
+      `UPDATE tasks SET result = $1, updated_at = NOW() WHERE id = $2`,
+      [JSON.stringify(approvedResult), id]
+    );
+
+    createNotification({
+      type: 'approval_granted',
+      title: 'Aprovacao concedida',
+      message: `${task.title} liberada para execucao`,
+      severity: 'success',
+      taskId: id,
+    }).catch(() => {});
+
+    // Dispara processamento em background (orchestrator agora passa do guard).
+    processTask(id).catch(err => console.error('[approve] processTask erro:', err.message));
+
+    broadcast({ type: 'task_approved', task_id: id });
+    res.json({ ok: true, task_id: id, status: 'approved_and_dispatched' });
+  } catch (err) {
+    console.error('[approve] erro:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/tasks/:id/reject — rejeita task que aguardava aprovacao humana.
+app.post('/api/tasks/:id/reject', async (req, res) => {
+  const { id } = req.params;
+  const { rejeitado_por, motivo } = req.body || {};
+  try {
+    const { rows } = await query(`SELECT * FROM tasks WHERE id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Task nao encontrada' });
+    const task = rows[0];
+    const currentResult = typeof task.result === 'string' ? JSON.parse(task.result || '{}') : (task.result || {});
+    if (currentResult.aguardando_aprovacao_humana !== true) {
+      return res.status(400).json({ error: 'Task nao esta aguardando aprovacao humana.' });
+    }
+    const rejectedResult = {
+      ...currentResult,
+      aguardando_aprovacao_humana: false,
+      rejeitado_em: new Date().toISOString(),
+      rejeitado_por: rejeitado_por || 'humano',
+      motivo_rejeicao: motivo || null,
+    };
+    await query(
+      `UPDATE tasks SET status = 'cancelled', result = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2`,
+      [JSON.stringify(rejectedResult), id]
+    );
+    broadcast({ type: 'task_rejected', task_id: id });
+    res.json({ ok: true, task_id: id, status: 'cancelled' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ============================================
 // CLIENTS — CRUD básico
 // ============================================
@@ -940,16 +1020,80 @@ app.post('/api/agent-chat', async (req, res) => {
 
     const agent = agents[0];
 
+    // === RETROALIMENTACAO: busca tasks REAIS do agente nas ultimas 24h ===
+    // Isso garante que o agente responde baseado no estado factual, NUNCA apenas
+    // no que disse no chat (que pode ser otimista/incorreto). Inclui status + result
+    // da task (o result contem tool_failures quando houve erro em tool interna).
+    let tasksReais = '';
+    try {
+      const { rows: recentTasks } = await query(
+        `SELECT t.title, t.status, t.completed_at, t.created_at,
+                t.result->>'error'           AS erro,
+                t.result->'tool_failures'    AS tool_failures,
+                t.result->>'text'            AS texto_resumo
+           FROM tasks t
+           JOIN team_members tm ON t.assigned_to = tm.id
+          WHERE tm.agent_id = $1
+            AND t.created_at > NOW() - INTERVAL '24 hours'
+          ORDER BY t.created_at DESC
+          LIMIT 8`,
+        [agent.id]
+      );
+      if (recentTasks.length) {
+        tasksReais = '\n\nSUAS ULTIMAS TASKS (estado REAL do banco — NUNCA contradiga isso):\n' +
+          recentTasks.map(t => {
+            const marker = t.status === 'blocked' ? '🔴 BLOQUEADA/FALHOU'
+                         : t.status === 'done'     ? '✅ concluida'
+                         : t.status === 'in_progress' ? '⏳ em andamento'
+                         : `· ${t.status}`;
+            let linha = `${marker} | ${t.title}`;
+            if (t.erro) linha += `\n    ↳ ERRO: ${String(t.erro).slice(0, 220)}`;
+            if (t.tool_failures && Array.isArray(t.tool_failures) && t.tool_failures.length) {
+              const tf = t.tool_failures[0];
+              linha += `\n    ↳ tool "${tf.name || '?'}" falhou: ${String(tf.summary || '').slice(0, 180)}`;
+            }
+            return linha;
+          }).join('\n');
+      }
+    } catch (e) {
+      console.warn('[AgentChat] falha ao buscar tasks reais:', e.message);
+    }
+
+    // === RETROALIMENTACAO: busca memorias correctionss (erros passados aprendidos) ===
+    let licoesAprendidas = '';
+    try {
+      const { rows: correcoes } = await query(
+        `SELECT title, summary FROM memories
+          WHERE agent_id = $1
+            AND category IN ('correction'::memory_category, 'learned_pattern'::memory_category)
+            AND status = 'approved'::memory_status
+            AND is_rag_enabled = true
+          ORDER BY priority DESC, updated_at DESC
+          LIMIT 3`,
+        [agent.id]
+      );
+      if (correcoes.length) {
+        licoesAprendidas = '\n\nLICOES APRENDIDAS (aplicar SEMPRE):\n' +
+          correcoes.map(c => `- ${c.title}: ${c.summary || ''}`).join('\n');
+      }
+    } catch {}
+
     // Monta contexto: últimas mensagens do chat + pergunta do CEO
     const recentChat = agentChatLog.slice(-20).map(m => `${m.from}: ${m.text}`).join('\n');
     const prompt = `Você está no chat interno da equipe do Átrio Contabilidade. O CEO Caio acabou de enviar uma mensagem para você.
 
-CONTEXTO DAS ÚLTIMAS MENSAGENS:
+REGRA ABSOLUTA — ANTI-ALUCINACAO:
+- JAMAIS afirme que emitiu, concluiu, enviou ou finalizou algo sem ter a evidencia factual abaixo.
+- Se sua propria TASK estiver BLOQUEADA/FALHOU na secao "SUAS ULTIMAS TASKS", voce DEVE reportar isso honestamente — NUNCA dizer "sim, foi emitida".
+- Se o CEO perguntar sobre status/resultado, sempre USE as tools disponiveis (ex: consultar_status_nfse) antes de afirmar.
+- Se nao tem certeza, responda "deixa eu verificar" e chame a tool apropriada.${tasksReais}${licoesAprendidas}
+
+CONTEXTO DAS ULTIMAS MENSAGENS DO CHAT (pode estar desatualizado — confie no estado real das tasks acima):
 ${recentChat}
 
 MENSAGEM DO CEO CAIO: ${text.trim()}
 
-Responda de forma direta e útil. Se ele perguntou sobre uma tarefa ou resultado, explique com clareza. Seja conciso (2-3 frases).`;
+Responda de forma direta e honesta. Seja conciso (2-3 frases). Se ha falha/erro nas suas tasks recentes, COMECE a resposta reconhecendo o problema.`;
 
     // Chat da equipe: com tools para que o agente possa executar ações reais
     const response = await chatWithAgent(agent, [{ role: 'user', content: prompt }], executeToolCall);
@@ -1008,6 +1152,7 @@ import * as whatsapp from './services/whatsapp.js';
 import * as telegram from './services/telegram.js';
 import * as omie from './services/omie.js';
 import { scheduleDailyReport, generateDailyReport } from './services/daily-report.js';
+import { scheduleAuditorDaily, generateAuditorReport } from './services/auditor-daily.js';
 import * as scheduler from './services/scheduler.js';
 import { startCronScheduler, registerCronHandler, executeCronJob, getCronHandler } from './services/cronScheduler.js';
 import { checkInadimplencia, checkContasPagar, checkSemHonorario, checkAlertasFiscais, checkDadosIncompletos } from './services/scheduler.js';
@@ -1256,12 +1401,15 @@ app.get('/api/memory/suggestions', async (req, res) => {
   try {
     const { status = 'pending', limit = 50 } = req.query;
     const result = await query(
-      `SELECT ms.*, a.name as agent_name 
-       FROM memory_suggestions ms 
-       LEFT JOIN agents a ON ms.agent_id = a.id 
-       WHERE ms.review_status = $1::suggestion_status
-       ORDER BY ms.priority_score DESC, ms.created_at DESC 
-       LIMIT $2`,
+      `SELECT ms.*, a.name AS agent_name,
+              COALESCE(NULLIF(cl.nome_fantasia, ''), cl.nome_legal) AS client_nome,
+              cl.cnpj AS client_cnpj
+         FROM memory_suggestions ms
+         LEFT JOIN agents a ON ms.agent_id = a.id
+         LEFT JOIN luna_v2.clients cl ON cl.id = ms.scope_id AND ms.scope_type = 'client'
+        WHERE ms.review_status = $1::suggestion_status
+        ORDER BY ms.priority_score DESC, ms.created_at DESC
+        LIMIT $2`,
       [status, parseInt(limit)]
     );
     res.json({ suggestions: result.rows });
@@ -1282,14 +1430,36 @@ app.post('/api/memory/suggestions/:id/approve', async (req, res) => {
     if (sugResult.rows.length === 0) return res.status(404).json({ error: 'Suggestion not found' });
     const suggestion = sugResult.rows[0];
     
-    // Create memory from suggestion
+    // Normaliza trigger_type para valores aceitos pelo enum memory_source
+    const SOURCE_MAP = {
+      'conversation_insight': 'conversation',
+      'conversation_reflection': 'conversation',
+      'auto_extract': 'tool_result',
+      'manual_teach': 'manual',
+    };
+    const rawSource = suggestion.trigger_type || 'manual';
+    const sourceType = SOURCE_MAP[rawSource] || (['manual','conversation','tool_result','trigger','import','document'].includes(rawSource) ? rawSource : 'conversation');
+
+    // Determina scope_type/scope_id: preserva cliente se sugestao tiver
+    const scopeType = suggestion.scope_type || 'agent';
+    const scopeId = suggestion.scope_id || null;
+
+    // Create memory from suggestion (preservando scope do cliente + metadata rica)
+    const metaFromEvidence = suggestion.evidence_json || {};
     const memResult = await query(
-      `INSERT INTO memories (agent_id, scope_type, category, title, content, summary, source_type, source_ref, confidence_score, status, tags)
-       VALUES ($1, 'agent', $2, $3, $4, $5, $6, $7, $8, 'approved', $9) RETURNING *`,
-      [suggestion.agent_id, suggestion.category || 'general', suggestion.title, 
+      `INSERT INTO memories (agent_id, scope_type, scope_id, category, title, content, summary,
+                              source_type, source_ref, confidence_score, status, tags, metadata,
+                              is_rag_enabled)
+       VALUES ($1, $2::memory_scope, $3, $4::memory_category, $5, $6, $7,
+               $8::memory_source, $9, $10, 'approved'::memory_status, $11, $12::jsonb, true)
+       RETURNING *`,
+      [suggestion.agent_id, scopeType, scopeId,
+       suggestion.category || 'general', suggestion.title,
        suggestion.proposed_content, suggestion.proposed_summary,
-       suggestion.trigger_type || 'manual', suggestion.trigger_ref,
-       suggestion.confidence_score || 0.8, suggestion.tags || '{}']
+       sourceType, suggestion.trigger_ref,
+       suggestion.confidence_score || 0.8,
+       suggestion.tags || [],
+       JSON.stringify({ origin: 'suggestion', ...metaFromEvidence })]
     );
     
     // Update suggestion status
@@ -1482,6 +1652,14 @@ registerCostsOpenRouter(app);
 import { registerMemoryCrud } from './routes/memory-crud.js';
 registerMemoryCrud(app);
 import { registerAdminCleanup } from './routes/admin-cleanup.js';
+import { registerAdminBudgets } from './routes/admin-budgets.js';
+import { registerIngestRoutes } from './routes/ingest.js';
+import { registerSkillsRoutes } from './routes/skills.js';
+import { registerActivityRoutes } from './routes/activity.js';
+import { registerErrorsRoutes } from './routes/errors.js';
+import { registerAlertsRoutes } from './routes/alerts.js';
+import { findConversationsToAutoResolve, markResolved } from './services/alert-config.js';
+import { installGlobalHandlers, expressErrorHandler } from './services/error-collector.js';
 import { registerDatalake } from './routes/datalake.js';
 import { registerMemoryReflect } from './routes/memory-reflect.js';
 import { registerSentiment } from './routes/sentiment.js';
@@ -1489,6 +1667,15 @@ import { registerLunaHealth } from './routes/luna-health.js';
 import { registerRagRoutes } from './routes/rag.js';
 import { registerMemoryDecay } from './routes/memory-decay.js';
 registerAdminCleanup(app);
+registerAdminBudgets(app);
+registerIngestRoutes(app);
+registerSkillsRoutes(app);
+registerActivityRoutes(app);
+registerErrorsRoutes(app);
+registerAlertsRoutes(app);
+app.post('/api/auditor/report', async (req, res) => { try { const txt = await generateAuditorReport(logAgentChat); res.json({ ok: true, texto: txt }); } catch (e) { res.status(500).json({ error: e.message }); } });
+// Express error handler — DEVE ser o ultimo middleware registrado
+app.use(expressErrorHandler());
 registerDatalake(app);
 registerMemoryReflect(app);
 registerSentiment(app);
@@ -1540,7 +1727,7 @@ app.post('/api/orchestrator/run', async (req, res) => {
 // STARTUP
 // ============================================
 startWatchdog();
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   // Conecta orchestrator ao broadcast e ao registry
   setBroadcast(broadcast);
   setLogChat(logAgentChat);
@@ -1564,6 +1751,7 @@ server.listen(PORT, () => {
 
   // Agenda relatório diário do Rodrigo (18h)
   scheduleDailyReport();
+  scheduleAuditorDaily(logAgentChat);
 
   // Limpeza automática — tasks concluídas/canceladas > 7 dias
   setInterval(async () => {
@@ -1626,10 +1814,45 @@ server.listen(PORT, () => {
   console.log(`  Orchestrator: ativo`);
   console.log(`  WhatsApp: inicializando...\n`);
 
+  // Sincroniza agents/*/AGENTS.md com o DB (fonte-de-verdade = arquivo)
+  try {
+    const rep = await syncAgentsFromFiles();
+    console.log('[Agents] sync: loaded=' + rep.loaded + ' created=' + rep.created + ' updated=' + rep.updated + ' errors=' + rep.errors.length);
+    if (rep.errors.length) rep.errors.forEach(e => console.warn('[Agents] erro: ' + e));
+  } catch (e) { console.error('[Agents] sync falhou: ' + e.message); }
+
   // Processa tasks pendentes ao iniciar
   processPendingTasks().then(count => {
     if (count > 0) console.log(`[Orchestrator] ${count} tasks pendentes processadas no startup`);
   }).catch(() => {});
+
+  // Recovery de tasks orfas (stranded-work) — crashes anteriores
+  recoverStrandedTasks().then(r => {
+    if (r.retried || r.blocked) {
+      console.log(`[Recovery] startup: ${r.retried} retomadas, ${r.blocked} bloqueadas (scan=${r.scanned})`);
+    }
+  }).catch(e => console.error('[Recovery] startup falhou:', e.message));
+
+  // Recovery periodica a cada 10 min
+  setInterval(() => {
+    recoverStrandedTasks().then(r => {
+      if (r.retried || r.blocked) {
+        console.log(`[Recovery] periodica: ${r.retried} retomadas, ${r.blocked} bloqueadas (scan=${r.scanned})`);
+      }
+    }).catch(() => {});
+  }, 10 * 60 * 1000);
+
+  // Auto-resolve de conversas WhatsApp silenciosas
+  setInterval(async () => {
+    try {
+      const rows = await findConversationsToAutoResolve();
+      for (const r of rows) {
+        await markResolved(r.phone, 'auto_resolve_timeout');
+        console.log(`[AutoResolve] ${r.phone} (${r.client_name}) marcada como resolvida (lvl ${r.escalation_level})`);
+      }
+      if (rows.length) console.log(`[AutoResolve] ${rows.length} conversa(s) auto-resolvidas`);
+    } catch (e) { console.error('[AutoResolve] erro:', e.message); }
+  }, 15 * 60 * 1000);
 });
 
 // Dara Orquestrador - Auto-correção

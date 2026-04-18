@@ -10,6 +10,9 @@ import { query } from '../db/pool.js';
 import { findClientByPhone } from './gesthub.js';
 import { createNotification } from './notifications.js';
 import { handleWhatsAppMessage } from './whatsapp/webhook-handler.mjs';
+import { ingestFile } from './ingest.js';
+import { logEvent } from './activity-log.js';
+import { getAlertConfig, renderClientMessage, findConversationsToAutoResolve, markResolved } from './alert-config.js';
 
 // ============================================
 // ESTADO
@@ -637,8 +640,10 @@ export async function initialize() {
     // Ignora reações (reactions) — não são mensagens reais
     if (msg.type === 'reaction' || msg.type === 'reaction_sent') return;
 
-    // Ignora mensagens sem corpo real (stickers, locations sem texto, etc)
-    if (!msg.body?.trim() || msg.type === 'sticker') return;
+    // Ignora stickers e locations sem texto.
+    // MAS: se tem mídia (PDF/imagem), deixa passar mesmo sem body — auto-ingest vai capturar
+    if (msg.type === 'sticker') return;
+    if (!msg.body?.trim() && !msg.hasMedia) return;
 
     try {
       await handleIncoming(msg);
@@ -844,8 +849,8 @@ async function handleIncoming(msg) {
   if (msg.type === 'reaction' || msg.type === 'reaction_sent' || msg.type === 'sticker') return;
 
   const phone = normalizePhone(from);
-  const body = msg.body;
-  if (!body?.trim()) return;
+  const body = msg.body || '';
+  if (!body.trim() && !msg.hasMedia) return;
 
   const contact = await msg.getContact().catch(() => null);
   const name = contact?.pushname || contact?.name || phone;
@@ -858,6 +863,41 @@ async function handleIncoming(msg) {
     try {
       const clientInfo = await getClientInfo(phone);
       const conversationInfo = await getConversationInfo(from, clientInfo);
+
+      // Auto-ingest de PDF/imagem — fire-and-forget, nao bloqueia Luna
+      if (msg.hasMedia) {
+        autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo).catch(() => {});
+      }
+
+      // Alerta o grupo quando ha novo contato SEM intervencao humana pendente.
+      // Dispara UMA vez por conversa (primeira entrada) OU se cliente volta apos inatividade > 2h.
+      // Fire-and-forget — nao bloqueia o fluxo de resposta.
+      (async () => {
+        try {
+          const { rows: msgCounts } = await query(
+            `SELECT COUNT(*) AS n,
+                    MAX(created_at) FILTER (WHERE direction = 'inbound' AND created_at < NOW() - INTERVAL '2 hours') AS last_before
+               FROM luna_v2.messages
+              WHERE conversation_id = $1`,
+            [conversationInfo.id]
+          );
+          const totalMsgs = parseInt(msgCounts[0]?.n || 0, 10);
+          const isFirstContact = totalMsgs <= 1;          // conta so a mensagem atual
+          const isComeback = msgCounts[0]?.last_before != null;
+          if (!isFirstContact && !isComeback) return;
+
+          const displayPhone = formatPhone(realPhone || phone);
+          const horarioInfo = isHorarioComercial();
+          const horarioTag = horarioInfo.open ? '' : `\n⏰ _Fora do horario (${horarioInfo.reason})_`;
+          const tag = isFirstContact ? '📩 *Novo contato*' : '🔁 *Retomada apos inatividade*';
+          const alertMsg = `${tag}\n\nCliente: *${clientInfo?.legalName || clientInfo?.name || name}*\nTelefone: ${displayPhone}\nMensagem: _${String(body || '').substring(0, 180)}_${horarioTag}\n\n_Luna processando — intervir se necessario._`;
+          await notifyTeamWhatsApp(alertMsg);
+          log(`[AlertGrupo] ${isFirstContact ? 'novo contato' : 'retomada'}: ${displayPhone}`);
+        } catch (e) {
+          log(`[AlertGrupo] erro: ${e.message}`);
+        }
+      })();
+
       // Buffer 10s: agrupa mensagens rapidas do mesmo contato
       scheduleLunaProcess(phone, msg,
         { ...(clientInfo||{}), pushname: name, realPhone, displayPhone: formatPhone(realPhone) },
@@ -1067,7 +1107,10 @@ function scheduleClassification(phone, chatId, name, conv) {
       log(`Classificação ${name}: ${classification.classificacao} → ${classification.atendente_sugerido} (${classification.resumo})`);
       broadcastFn?.({ type: 'whatsapp_classification', phone, name, classification });
 
-      // Notificação no chat: classificação feita
+      // Guarda classificacao no conv para enriquecer alertas subsequentes
+      conv.classification = classification;
+
+      // Notificacao no chat: classificacao feita
       chat({ from: 'Luna', text: `🏷️ *${name}* classificado: *${classification.classificacao}* → ${classification.atendente_sugerido}${classification.resumo ? `. ${classification.resumo}` : ''}`, tag: classification.classificacao });
 
       // UMA mensagem no grupo com tudo
@@ -1079,7 +1122,15 @@ function scheduleClassification(phone, chatId, name, conv) {
       const resumoTag = classification.resumo ? `\nResumo: _${classification.resumo}_` : '';
 
       const alertUnico = `📩 *Novo contato*\n\nCliente: *${name}*\nTelefone: ${displayPhone}\nMensagem: _${lastMsg.substring(0, 150)}_${tipoTag}${resumoTag}${horarioTag}`;
-      notifyTeamWhatsApp(alertUnico).catch(() => {});
+      // Se config diz pra esperar o 10min para avisar (reduz ruido no grupo),
+      // pulamos a notificacao imediata. Classificacao fica salva em conv.classification
+      // e eh incluida no alerta de 10min quando dispara.
+      const _cfg = await getAlertConfig();
+      if (_cfg.meta.first_contact_alert_delayed !== 'true') {
+        notifyTeamWhatsApp(alertUnico).catch(() => {});
+      } else {
+        log(`[NovoContato] ${name} — alerta adiado para 10min (config)`);
+      }
 
       // Cria task e roteia (pula se já tem NFS-e em andamento ou se é fiscal com NFS-e ativo)
       if (!conv.nfseRequested && !conv.nfseTaskId && classification.classificacao !== 'geral') {
@@ -1789,18 +1840,19 @@ async function routeDemandToAgent(phone, name, chatId, body, conv, classificatio
 // ============================================
 // ESCALATION
 // ============================================
-function startEscalation(phone, chatId, name, fromLevel) {
+async function startEscalation(phone, chatId, name, fromLevel) {
   const conv = conversations.get(phone);
   if (!conv) return;
 
   conv.timers.forEach(t => clearTimeout(t));
   conv.timers = [];
 
-  for (let i = fromLevel; i < ESCALATION_LEVELS.length; i++) {
-    const level = ESCALATION_LEVELS[i];
+  const { levels } = await getAlertConfig();
+  for (let i = fromLevel; i < levels.length; i++) {
+    const level = levels[i];
+    if (!level.active) continue;
     const delay = level.minutes * 60 * 1000;
-
-    log(`Escalation agendada: ${name} → nível ${i} (${level.severity}) em ${level.minutes}min`);
+    log(`Escalation agendada: ${name} → nivel ${i} (${level.severity}) em ${level.minutes}min`);
     conv.timers.push(setTimeout(() => escalate(phone, chatId, name, i), delay));
   }
 }
@@ -1810,7 +1862,8 @@ async function escalate(phone, chatId, name, levelIndex) {
   if (!conv || conv.resolved) return;
   if (conv.humanReplied) return; // humano já respondeu, para escalation
 
-  const level = ESCALATION_LEVELS[levelIndex];
+  const cfg = await getAlertConfig();
+  const level = cfg.levels[levelIndex] || cfg.levels[cfg.levels.length - 1];
   conv.escalationLevel = levelIndex;
   const lastMsg = conv.messages[conv.messages.length - 1]?.body || '';
   dbUpdateConversation(phone, { escalation_level: levelIndex });
@@ -1818,34 +1871,36 @@ async function escalate(phone, chatId, name, levelIndex) {
 
   log(`${level.emoji} ${level.label} — ${name} (${phone})`);
 
-  // Mensagem ao cliente — SOMENTE em horário comercial
-  // Fora do expediente o greeting já avisou que a equipe retorna no próximo dia útil
   const horario = isHorarioComercial();
 
-  const clientMsgFn = CLIENT_MESSAGES[levelIndex];
-  if (clientMsgFn && horario.open) {
+  // Mensagem ao cliente — somente em horario comercial
+  if (level.client_message && horario.open) {
     try {
-      const msg = clientMsgFn(name);
+      const msg = renderClientMessage(level.client_message, name);
       await botSend(chatId, LUNA_HEADER + msg);
       dbSaveMessage(conv, 'luna', msg);
     } catch (err) {
-      log(`ERRO follow-up nível ${levelIndex}: ${err.message}`);
+      log(`ERRO follow-up nivel ${levelIndex}: ${err.message}`);
     }
-  } else if (clientMsgFn && !horario.open) {
-    log(`Escalation nível ${levelIndex} para ${name} — fora do horário, não envia ao cliente`);
+  } else if (level.client_message && !horario.open) {
+    log(`Escalation nivel ${levelIndex} para ${name} — fora do horario, nao envia ao cliente`);
   }
 
-  // SEMPRE notifica equipe via Telegram (independente do horário)
-  // WhatsApp da equipe só em horário comercial
+  // Enriquece alerta com classificacao (se conversa ja foi classificada)
+  const classificacaoInfo = conv.classification
+    ? `\nTipo: *${String(conv.classification.classificacao || '').toUpperCase()}* → *${conv.classification.atendente_sugerido || '-'}*` +
+      (conv.classification.resumo ? `\nResumo: _${conv.classification.resumo}_` : '')
+    : '';
+
   const foraHorario = !horario.open ? `\n⏰ _${horario.reason}_` : '';
-  const urgencia = levelIndex >= 2 ? '\n\n⚠️ *AÇÃO IMEDIATA NECESSÁRIA*' : '';
-  const alertMsg = `${level.emoji} *${level.label}*\n\nCliente: *${name}*\nTelefone: ${conv.displayPhone || phone}\nÚltima msg: _${lastMsg.substring(0, 150)}_${foraHorario}${urgencia}`;
+  const urgencia = levelIndex >= 2 ? '\n\n⚠️ *ACAO IMEDIATA NECESSARIA*' : '';
+  const alertMsg = `${level.emoji} *${level.label}*\n\nCliente: *${name}*\nTelefone: ${conv.displayPhone || phone}${classificacaoInfo}\nUltima msg: _${lastMsg.substring(0, 150)}_${foraHorario}${urgencia}`;
 
   // Telegram: SEMPRE
   telegram.sendAlert(alertMsg);
 
-  // WhatsApp equipe: só em horário comercial ou nível crítico+
-  if (horario.open || levelIndex >= 2) {
+  // WhatsApp equipe: respeita config por nivel
+  if (level.send_to_team && (horario.open || level.team_even_off_hours)) {
     await notifyTeamWhatsApp(alertMsg);
   }
 
@@ -2013,4 +2068,83 @@ export async function destroy() {
   });
   conversations.clear();
   if (client) { await client.destroy(); client = null; isReady = false; qrCodeData = null; }
+}
+
+
+// ============================================
+// AUTO-INGEST DE MIDIA (PDF / IMAGEM)
+// Chamado pelo handler do WhatsApp quando msg.hasMedia.
+// Baixa o arquivo, despacha para o pipeline de ingest e cria memoria vinculada ao cliente.
+// A memoria entra como 'draft' — requer aprovacao via UI /docs.
+// ============================================
+export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo) {
+  if (!msg?.hasMedia) return null;
+  try {
+    const media = await msg.downloadMedia();
+    if (!media || !media.data) return null;
+
+    const mime = media.mimetype || '';
+    // Apenas PDF e imagens — ignora audio (por ora), video, docs nao suportados
+    const isPdf = mime === 'application/pdf';
+    const isImage = mime.startsWith('image/');
+    if (!isPdf && !isImage) {
+      log(`[AutoIngest] ignorando mime nao suportado: ${mime}`);
+      return null;
+    }
+
+    const buffer = Buffer.from(media.data, 'base64');
+    const filename = media.filename || (isPdf ? `whatsapp_${Date.now()}.pdf` : `whatsapp_${Date.now()}.jpg`);
+
+    // Busca o agent_id da Luna para marcar a origem
+    let lunaAgentId = null;
+    try {
+      const { rows } = await query(`SELECT id FROM agents WHERE name='Luna' LIMIT 1`);
+      lunaAgentId = rows[0]?.id || null;
+    } catch {}
+
+    const meta = {
+      filename,
+      client_id: clientInfo?.id ? String(clientInfo.id) : null,
+      agent_id: lunaAgentId,
+      title: msg.body?.trim() || filename,
+      tags: ['whatsapp', isPdf ? 'pdf' : 'imagem'],
+      metadata: {
+        whatsapp_msg_id: msg.id?._serialized || msg.id,
+        conversation_id: conversationInfo?.id || null,
+        client_phone: msg.from,
+        received_at: new Date().toISOString(),
+      },
+    };
+
+    const result = await ingestFile(buffer, mime, meta);
+    logEvent({
+      actor_type: 'agent', actor_id: lunaAgentId, actor_name: 'Luna',
+      event_type: 'memory.ingest.whatsapp', action: 'auto',
+      entity_type: 'memory',
+      entity_id: result.memory_id || (result.memory_ids && result.memory_ids[0]) || null,
+      payload: { filename, mime, client_id: clientInfo?.id, phone: msg.from, ok: result.ok, doc_type: result.doc_type, chunks: result.chunks },
+      source: 'whatsapp',
+      severity: result.ok ? 'info' : 'warn',
+    });
+    log(`[AutoIngest] ${filename} → ${result.ok ? 'ok' : 'fail'} (${result.type}${result.ok ? (result.memory_id ? ', mem='+result.memory_id.slice(0,8) : (result.memory_ids?.length ? ', chunks='+result.memory_ids.length : '')) : ': '+result.error})`);
+
+    // Notifica equipe no chat interno (NAO responde o cliente — regra feedback_nfse_notificacao)
+    if (result.ok && typeof chat === "function") {
+      const preview = result.type === 'image'
+        ? `${result.doc_type || 'imagem'}: ${result.summary?.slice(0, 160) || ''}`
+        : `PDF ${result.pages}p, ${result.chunks} chunks — ${result.preview?.slice(0, 160) || ''}`;
+      try {
+        chat({
+          from: 'Luna',
+          text: `📎 ${clientInfo?.name || 'Cliente'} enviou ${isPdf ? 'PDF' : 'imagem'}: ${filename}\n${preview}\n(Pendente de aprovacao na aba Documentos)`,
+          tag: 'ingest'
+        });
+      } catch {}
+    }
+
+    return result;
+  } catch (err) {
+    log(`[AutoIngest] ERRO: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
 }

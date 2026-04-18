@@ -18,6 +18,10 @@ import SessionHistory from './components/SessionHistory'
 import WeeklyCalendar from './components/WeeklyCalendar'
 import MemoryBrowser from './components/MemoryBrowser'
 import HybridMemory from './components/HybridMemory'
+import DocsIngest from './components/DocsIngest'
+import ActivityPanel from './components/ActivityPanel'
+import ErrorsPanel from './components/ErrorsPanel'
+import AlertsConfig from './components/AlertsConfig'
 import ErrorBoundary from './components/ErrorBoundary'
 import DatalakeViewer from './components/DatalakeViewer'
 import PortalLogin from './portal/PortalLogin'
@@ -52,7 +56,7 @@ function AdminDashboard() {
   const [currentPage, setCurrentPage] = useState('home')
   const [chatOpen, setChatOpen] = useState(false)
   // Paginas largas (datalake, memory) nao mostram chat fixo — usa floating
-  const WIDE_PAGES = ['datalake', 'memory', 'crons', 'custos', 'sessions']
+  const WIDE_PAGES = ['datalake', 'memory', 'crons', 'custos', 'sessions', 'docs', 'activity', 'errors', 'alerts']
   const isWidePage = WIDE_PAGES.includes(currentPage)
 
   // Global search shortcut (Cmd+K / Ctrl+K)
@@ -139,6 +143,10 @@ function AdminDashboard() {
             {currentPage === 'calendar' && <WeeklyCalendar />}
             {currentPage === 'memory' && <ErrorBoundary label='HybridMemory'><HybridMemory /></ErrorBoundary>}
             {currentPage === 'datalake' && <DatalakeViewer />}
+            {currentPage === 'docs' && <DocsIngest />}
+            {currentPage === 'alerts' && <div className='flex-1 flex flex-col gap-4 p-4 overflow-auto' style={{ color: 'var(--ao-text)' }}><h1 className='text-2xl font-semibold'>Alertas</h1><p className='text-sm opacity-70'>Configuração dos gatilhos de escalation Luna</p><AlertsConfig /></div>}
+            {currentPage === 'errors' && <div className='flex-1 flex flex-col gap-4 p-4 overflow-auto' style={{ color: 'var(--ao-text)' }}><h1 className='text-2xl font-semibold'>Erros</h1><p className='text-sm opacity-70'>Exceções e falhas capturadas — agrupadas por fingerprint</p><ErrorsPanel /></div>}
+            {currentPage === 'activity' && <div className='flex-1 flex flex-col gap-4 p-4 overflow-auto' style={{ color: 'var(--ao-text)' }}><h1 className='text-2xl font-semibold'>Auditoria</h1><p className='text-sm opacity-70'>Trilha append-only de todas as operações sensíveis do sistema</p><ActivityPanel /></div>}
           </div>
 
           {/* RIGHT COLUMN — Agent Chat (oculto em paginas largas) */}

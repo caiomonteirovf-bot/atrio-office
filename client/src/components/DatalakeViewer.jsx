@@ -1,3 +1,4 @@
+import ClientDocsTab from './ClientDocsTab'
 import { useEffect, useState } from 'react'
 
 const fmtMoney = (v) => v == null || v === '' ? '—' : new Intl.NumberFormat('pt-BR', { style:'currency', currency:'BRL' }).format(Number(v))
@@ -187,6 +188,7 @@ export default function DatalakeViewer() {
                       ['contatos',   `Contatos (${(detail.contatos?.length||0)+(detail.socios?.length||0)})`],
                       ['endereco',   'Endereço'],
                       ['luna',       'Luna'],
+                      ['docs',       'Documentos'],
                     ].map(([id, label]) => (
                       <button key={id} onClick={()=>setTab(id)}
                         className="px-2.5 py-1.5 text-[11.5px] rounded-t transition-colors"
@@ -315,6 +317,13 @@ export default function DatalakeViewer() {
                     </Section>
                   )}
 
+                  {tab === 'docs' && (
+                    <div className="space-y-3">
+                      <Section title="Documentos ingeridos">
+                        <ClientDocsTab gesthub_id={c.gesthub_id} />
+                      </Section>
+                    </div>
+                  )}
                   {tab === 'luna' && (
                     <div className="space-y-5">
                       {!c.luna_client_id ? (

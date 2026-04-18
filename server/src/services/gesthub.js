@@ -67,6 +67,16 @@ export async function searchClientByName(name) {
   ).slice(0, 10);
 }
 
+export async function getClientContatos(clientId) {
+  try {
+    const resp = await request();
+    return resp?.data || [];
+  } catch (e) {
+    console.warn('[Gesthub] getClientContatos:', e.message);
+    return [];
+  }
+}
+
 export async function getClient360(clientId) {
   return request(`/clients/${clientId}/360`);
 }

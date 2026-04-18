@@ -210,7 +210,7 @@ export async function runReflectionScan({ maxBatch = 5 } = {}) {
   const { rows } = await query(`
     SELECT id FROM luna_v2.conversations
     WHERE reflection_at IS NULL
-      AND last_message_at < NOW() - INTERVAL '30 minutes'
+      AND last_message_at < NOW() - INTERVAL '10 minutes'
       AND COALESCE(mensagens_count, 0) >= 3
     ORDER BY last_message_at DESC
     LIMIT $1

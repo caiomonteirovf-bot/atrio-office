@@ -801,7 +801,7 @@ async function getClientInfo(phone) {
   } catch (err) {
     log(`[Luna v2] Erro getClientInfo local: ${err.message}`);
   }
-  return { id: null, name: 'Cliente', trade_name: null, phone: null, source: 'unknown' };
+  return { id: null, name: null, trade_name: null, phone: null, source: 'unknown' };
 }
 
 // Helper: busca/cria conversa Luna v2
@@ -882,17 +882,57 @@ async function handleIncoming(msg) {
             [conversationInfo.id]
           );
           const totalMsgs = parseInt(msgCounts[0]?.n || 0, 10);
-          const isFirstContact = totalMsgs <= 1;          // conta so a mensagem atual
+          const isFirstContact = totalMsgs <= 1;
           const isComeback = msgCounts[0]?.last_before != null;
           if (!isFirstContact && !isComeback) return;
 
           const displayPhone = formatPhone(realPhone || phone);
           const horarioInfo = isHorarioComercial();
           const horarioTag = horarioInfo.open ? '' : `\n⏰ _Fora do horario (${horarioInfo.reason})_`;
+
+          // === RESOLVER IDENTIDADE do contato ===
+          const isLead = !clientInfo?.id && !clientInfo?.gesthub_id;
+          // Prioridade: razao_social/legal_name > nome_fantasia/trade_name > name do clientInfo > pushname WhatsApp > "Desconhecido"
+          const nomeCliente = clientInfo?.razao_social
+            || clientInfo?.legalName
+            || clientInfo?.nome_fantasia
+            || clientInfo?.trade_name
+            || clientInfo?.name
+            || name
+            || contact?.pushname
+            || 'Sem nome cadastrado';
+
+          const empresaExtra = (clientInfo?.nome_fantasia && clientInfo?.razao_social
+                                && clientInfo.nome_fantasia !== clientInfo.razao_social)
+            ? ` (${clientInfo.nome_fantasia})`
+            : '';
+
+          const cnpjLinha = clientInfo?.cnpj
+            ? `\nCNPJ: ${clientInfo.cnpj}`
+            : '';
+
+          const statusLinha = isLead
+            ? `\n🟡 *LEAD NOVO* — nao cadastrado no Gesthub`
+            : clientInfo?.regime
+              ? `\nRegime: ${clientInfo.regime}`
+              : '';
+
           const tag = isFirstContact ? '📩 *Novo contato*' : '🔁 *Retomada apos inatividade*';
-          const alertMsg = `${tag}\n\nCliente: *${clientInfo?.legalName || clientInfo?.name || name}*\nTelefone: ${displayPhone}\nMensagem: _${String(body || '').substring(0, 180)}_${horarioTag}\n\n_Luna processando — intervir se necessario._`;
+
+          const alertMsg = [
+            tag,
+            ``,
+            `Cliente: *${nomeCliente}${empresaExtra}*${cnpjLinha}${statusLinha}`,
+            `Telefone: ${displayPhone}`,
+            `Mensagem: _${String(body || '').substring(0, 220)}_${horarioTag}`,
+            ``,
+            isLead
+              ? `_Luna coletando dados. Equipe: avaliar oportunidade._`
+              : `_Luna processando — intervir se necessario._`,
+          ].join('\n');
+
           await notifyTeamWhatsApp(alertMsg);
-          log(`[AlertGrupo] ${isFirstContact ? 'novo contato' : 'retomada'}: ${displayPhone}`);
+          log(`[AlertGrupo] ${isFirstContact ? 'novo' : 'retomada'}: ${nomeCliente} (${displayPhone}) ${isLead ? '[LEAD]' : ''}`);
         } catch (e) {
           log(`[AlertGrupo] erro: ${e.message}`);
         }

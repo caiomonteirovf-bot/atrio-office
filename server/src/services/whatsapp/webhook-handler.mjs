@@ -8,6 +8,7 @@
 
 // axios removed - using native fetch
 import { buildContext, persistTurn, extractFactsAsync } from '../luna-memory.js';
+import { contextoTemporal, isHorarioComercial } from '../business-hours.js';
 import { runWithContext } from '../luna-observer.js';
 import { chatWithAgent, extractText } from '../claude.js';
 import { makeLunaExecutor } from '../luna-tools.js';
@@ -28,10 +29,11 @@ async function handleWhatsAppMessage(message, clientInfo, conversationInfo) {
   let ctx = { block: '', conversationId: null, clientId: null };
   try {
     ctx = await buildContext({ phone: payload.phone, clientInfo });
-    if (ctx.block) {
-      payload.mensagem = payload.mensagem || {};
-      payload.mensagem.conteudo = ctx.block + (payload.mensagem.conteudo || '');
-    }
+    // SEMPRE injeta contexto temporal (mesmo se ctx.block estiver vazio)
+    const tempCtx = contextoTemporal();
+    const ctxFinal = (ctx.block ? ctx.block : '') + tempCtx + '\n\n';
+    payload.mensagem = payload.mensagem || {};
+    payload.mensagem.conteudo = ctxFinal + (payload.mensagem.conteudo || '');
   } catch (e) {
     console.error('[Webhook] buildContext erro (seguindo sem contexto):', e.message);
   }

@@ -68,11 +68,59 @@ async function fetchResponsavelInterno(clientId) {
   } catch { return null; }
 }
 
+// Formata telefone BR: 558199387529 → +55 (81) 99938-7529
+function formatPhoneBR(phone) {
+  if (!phone) return '(sem telefone)';
+  const digits = String(phone).replace(/\D/g, '');
+  // 55 + DDD(2) + numero(8 ou 9)
+  if (digits.length === 13) return `+${digits.slice(0,2)} (${digits.slice(2,4)}) ${digits.slice(4,9)}-${digits.slice(9)}`;
+  if (digits.length === 12) return `+${digits.slice(0,2)} (${digits.slice(2,4)}) ${digits.slice(4,8)}-${digits.slice(8)}`;
+  if (digits.length === 11) return `(${digits.slice(0,2)}) ${digits.slice(2,7)}-${digits.slice(7)}`;
+  return phone;
+}
+
+// Constrói mensagem natural a partir do tipo + meta
+function buildNaturalMessage(titulo, meta) {
+  const tipo = meta.tipo || meta.type || 'alerta';
+  const phone = meta.phone ? formatPhoneBR(meta.phone) : null;
+  const responsavel = meta.responsavel ? ` Responsável: ${meta.responsavel}.` : '';
+
+  if (tipo === 'stale_review') {
+    return `Uma conversa no WhatsApp está aberta há mais de 24h sem retorno. Alguém pode confirmar se o atendimento foi concluído e fechar?${responsavel}`;
+  }
+  if (tipo === 'sla_alert' && meta.idade_segundos) {
+    const min = Math.floor(meta.idade_segundos / 60);
+    return `Cliente ${phone || 'WhatsApp'} aguarda resposta humana há ${min} minutos.${responsavel} Passou do SLA — verifique e responda.`;
+  }
+  // fallback: titulo limpo sem prefixo [tipo]
+  return titulo.replace(/^\[[^\]]+\]\s*/, '');
+}
+
+// Constrói título amigável (sem JSON, sem phone cru)
+function buildFriendlyTitle(titulo, meta) {
+  if (!meta || !meta.phone) return titulo;
+  // substitui telefone cru no título por formato amigável
+  const formatted = formatPhoneBR(meta.phone);
+  return titulo.replace(meta.phone, formatted);
+}
+
 async function enviarPraEquipe(texto, meta = {}) {
   try {
+    // Cria como NOTIFICATION (nao como task) — essas sao para humano revisar,
+    // nao para orchestrator processar. Se fosse task 'pending' sem assigned_to,
+    // ficava orfa no Mission Control e enchia a fila.
+    const titulo = buildFriendlyTitle(texto, meta);
+    const mensagem = buildNaturalMessage(texto, meta);
     await query(
-      `INSERT INTO public.tasks (title, status, result, created_at) VALUES ($1, 'pending', $2::jsonb, now())`,
-      [texto, JSON.stringify({ type: 'sla_alert', ...meta })]
+      `INSERT INTO public.notifications (type, title, message, severity, metadata, created_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, now())`,
+      [
+        meta.tipo || 'sla_alert',
+        titulo,
+        mensagem,
+        meta.severity || 'warning',
+        JSON.stringify({ ...meta, fonte: 'luna-watchdog' }),  // raw meta vai pra metadata
+      ]
     );
   } catch (e) { console.error('[watchdog] alert falhou:', e.message); }
 }

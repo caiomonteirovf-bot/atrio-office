@@ -21,6 +21,8 @@ import HybridMemory from './components/HybridMemory'
 import DocsIngest from './components/DocsIngest'
 import ActivityPanel from './components/ActivityPanel'
 import ErrorsPanel from './components/ErrorsPanel'
+import ImpactDashboard from './components/ImpactDashboard'
+import MissionControl from './components/MissionControl'
 import AlertsConfig from './components/AlertsConfig'
 import ErrorBoundary from './components/ErrorBoundary'
 import DatalakeViewer from './components/DatalakeViewer'
@@ -106,6 +108,8 @@ function AdminDashboard() {
           <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
             {currentPage === 'home' && (
               <div className="max-w-[960px] mx-auto px-5 py-5 space-y-5">
+                <ImpactDashboard />
+                <MissionControl />
                 <StatsBar />
 
                 {/* Agent Cards Grid */}

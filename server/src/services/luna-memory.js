@@ -51,9 +51,56 @@ async function fetchMemories({ clientId, conversationId, limit = 5 }) {
        LIMIT $2`, [conversationId, limit]);
     return rows;
   }
-  return [];
+  // Sempre retorna global_rules (regras de comunicação que valem pra todos os clientes)
+  try {
+    const { rows } = await query(
+      `SELECT titulo, conteudo, tipo, tags FROM luna_v2.memories
+        WHERE trigger_type = 'global_rule' AND status = 'ativa' AND is_rag_enabled = true
+        ORDER BY prioridade DESC NULLS LAST LIMIT $1`, [limit]);
+    return rows;
+  } catch { return []; }
 }
 
+
+// Busca memórias de public.memories escopadas: global + cliente atual + contato atual.
+// Invocada em todo turno da Luna pra que regras manuais (via modal Ensinar) cheguem ao prompt.
+async function fetchScopedMemories({ effectiveClientId, phone, limit = 15 }) {
+  let contactUuid = null;
+  if (phone) {
+    const tail = String(phone).replace(/\D/g, '').slice(-8);
+    if (tail) {
+      try {
+        const r = await query(
+          `SELECT id FROM luna_v2.contacts
+             WHERE regexp_replace(COALESCE(telefone,''),'\D','','g') LIKE '%' || $1 || '%'
+             ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+          [tail]
+        );
+        contactUuid = r.rows[0]?.id || null;
+      } catch {}
+    }
+  }
+  try {
+    const { rows } = await query(
+      `SELECT id, scope_type::text AS scope_type, category::text AS category,
+              title, content, summary, priority
+         FROM public.memories
+        WHERE status = 'approved' AND is_rag_enabled = true
+          AND (
+            scope_type = 'global'
+            OR (scope_type = 'client'  AND scope_id = $1::uuid)
+            OR (scope_type = 'contact' AND scope_id = $2::uuid)
+          )
+        ORDER BY priority DESC NULLS LAST, created_at DESC
+        LIMIT $3`,
+      [effectiveClientId, contactUuid, limit]
+    );
+    return { rows, contactUuid };
+  } catch (e) {
+    console.error('[fetchScopedMemories]', e.message);
+    return { rows: [], contactUuid: null };
+  }
+}
 
 async function fetchSoul() {
   // Carrega "alma" da Luna + roster dos outros agentes do DB. Unica fonte de verdade.
@@ -134,16 +181,69 @@ export async function buildContext({ phone, clientInfo }) {
   const lastInbound = [...history].reverse().find(h => h.direction === 'inbound');
   const queryText = lastInbound ? String(lastInbound.content || '').slice(0, 500) : null;
 
-  const [memories, soul, semanticHits] = await Promise.all([
+  const [memories, soul, semanticHits, scoped] = await Promise.all([
     fetchMemories({ clientId: effectiveClientId, conversationId, limit: 5 }),
     fetchSoul(),
     queryText
       ? searchMemories(queryText, { limit: 5 }).then(arr => arr.filter(m => (m.similarity || 0) >= 0.6).slice(0, 3))
           .catch(err => { console.error('[buildContext] searchMemories:', err.message); return []; })
       : Promise.resolve([]),
+    fetchScopedMemories({ effectiveClientId, phone, limit: 15 }),
   ]);
 
   const parts = [];
+
+  // === SOUL.md — princípios permanentes (self-improving pattern) ===
+  // Fica no TOP do contexto pra que NUNCA seja ignorado pelo LLM, mesmo em prompts longos.
+  try {
+    const fs = await import('node:fs/promises');
+    const soulPath = '/app/agents/luna/SOUL.md';
+    const soul = await fs.readFile(soulPath, 'utf-8').catch(() => null);
+    if (soul) {
+      parts.push('## ⚠️ PRINCÍPIOS NÃO-NEGOCIÁVEIS (SOUL)');
+      // Pega só as seções Premissas + Operação (não o promotion log — evita bloat)
+      const soulEssence = soul
+        .split(/^## /m)
+        .filter(sec => /Premissas|Operação|Fronteiras|Formato/i.test(sec))
+        .map(sec => '## ' + sec.trim())
+        .join('\n\n');
+      parts.push(soulEssence);
+      parts.push('');
+    }
+  } catch (e) { console.error('[buildContext] SOUL.md nao carregado:', e.message); }
+
+  // === LEARNINGS PENDING — o que foi detectado errado recentemente ===
+  // Injeta até 3 learnings com severity high/critical que ainda não foram resolvidos.
+  // Luna vê os próprios erros recentes e NÃO repete.
+  try {
+    const { listPending } = await import('./learning-log.js');
+    const errs = await listPending({ file: 'ERRORS.md', limit: 3 });
+    const criticos = errs.filter(e => ['critical','high'].includes(e.priority));
+    if (criticos.length > 0) {
+      parts.push('## 🚨 Incidentes recentes a NÃO repetir');
+      criticos.forEach((e, i) => parts.push(`${i + 1}. [${e.id}] ${e.summary}`));
+      parts.push('');
+    }
+  } catch (e) { console.error('[buildContext] learnings pending falhou:', e.message); }
+
+  // === ESTADO DA CONVERSA (reforco anti-repeticao) ===
+  const turnos = history.length;
+  const lunaJaFalou = history.some(h => h.direction === 'outbound');
+  const ultimaLunaTxt = [...history].reverse().find(h => h.direction === 'outbound')?.content || '';
+  const jaCumprimentou = /bom\s+dia|boa\s+tarde|boa\s+noite|ol[áa]|oi/i.test(ultimaLunaTxt);
+  const jaDisseForaHora = /fora\s+do\s+hor[áa]rio|retorn(a|amos)|pr[óo]ximo\s+dia\s+[úu]til/i.test(ultimaLunaTxt);
+  const jaPediuDetalhe = /me\s+(conta|diga|informe|passe)|precis(o|amos)\s+de/i.test(ultimaLunaTxt);
+
+  if (turnos > 0) {
+    parts.push('## Estado da conversa atual (leia antes de responder)');
+    parts.push(`- Turnos ja trocados: ${turnos}`);
+    parts.push(`- Voce ja cumprimentou o cliente nesta conversa: ${jaCumprimentou ? 'SIM — NAO cumprimente de novo' : 'nao'}`);
+    parts.push(`- Voce ja avisou que estamos fora do horario: ${jaDisseForaHora ? 'SIM — NAO repita' : 'nao'}`);
+    parts.push(`- Voce ja pediu pro cliente detalhar a demanda: ${jaPediuDetalhe ? 'SIM — agora avance o contexto, faca UMA pergunta nova baseada na resposta' : 'nao'}`);
+    parts.push('**Regra:** cada resposta avanca UM passo. Nao reinicie. Nao reempacote. Nao pergunte tudo de uma vez.');
+    parts.push('');
+  }
+
   // Nao duplicamos system_prompt aqui: claude.js ja injeta via agent.system_prompt.
   // So mantemos o roster da equipe pra Luna saber a quem delegar.
   if (soul.outros?.length) {
@@ -160,7 +260,7 @@ export async function buildContext({ phone, clientInfo }) {
     parts.push(`- CNPJ: ${h.cnpj} | Regime: ${h.regime || '—'} | Status: ${h.status}`);
     if (h.analyst) parts.push(`- Analista interno: ${h.analyst}`);
     if (h.inscricao_municipal) parts.push(`- Insc. Municipal: ${h.inscricao_municipal} | Cod. serviço: ${h.codigo_servico || '—'} | ISS: ${h.aliquota_iss || '—'}%`);
-    parts.push(`**Já sabe quem é. Cumprimenta pelo nome + empresa em UMA frase. NUNCA pergunte qual empresa.**`);
+    parts.push(`**Já sabe quem é. Cumprimente APENAS pelo primeiro nome. NÃO mencione a empresa na saudação — o cliente sabe onde trabalha. Essa info é só pro seu contexto, não repita pra ele.**`);
   } else if (datalakeHits.length > 1) {
     parts.push(`## Contato em multiplas empresas (${datalakeHits.length})`);
     datalakeHits.forEach(h => parts.push(`- ${h.nome_fantasia || h.razao_social} (${h.cnpj})`));
@@ -178,8 +278,24 @@ export async function buildContext({ phone, clientInfo }) {
     if (clientInfo.cnpj) parts.push(`- CNPJ: ${clientInfo.cnpj}`);
     if (clientInfo.regime) parts.push(`- Regime: ${clientInfo.regime}`);
     if (clientInfo.municipio) parts.push(`- Municipio: ${clientInfo.municipio}`);
+    if (clientInfo.tipo) parts.push(`- Tipo: ${clientInfo.tipo} (regra Dr./Dra: so MEDICINA/ODONTO recebem titulo)`);
+    if (clientInfo.contato?.funcao || clientInfo.contato?.nome) {
+      parts.push(`- Contato ativo: ${clientInfo.contato.nome || '(sem nome)'}${clientInfo.contato.funcao ? ' (' + clientInfo.contato.funcao + ')' : ''}`);
+    }
   }
-  if (memories.length) {
+  // Regras escopadas (global/client/contact) — ALTA prioridade no prompt
+  if (scoped?.rows?.length) {
+    parts.push(`
+## Regras obrigatorias (aplicar SEMPRE)`);
+    scoped.rows.forEach((m, i) => {
+      const escopo = m.scope_type === 'global' ? 'GLOBAL'
+                   : m.scope_type === 'client'  ? 'ESTE CLIENTE'
+                   : m.scope_type === 'contact' ? 'ESTE CONTATO'
+                   : 'agente';
+      parts.push(`${i + 1}. [${escopo}/${m.category}] ${m.title} — ${m.content}`);
+    });
+  }
+    if (memories.length) {
     parts.push(`\n## Memorias relevantes`);
     memories.forEach((m, i) => parts.push(`${i + 1}. [${m.tipo || 'fato'}] ${m.titulo || ''} — ${m.conteudo}`));
   }

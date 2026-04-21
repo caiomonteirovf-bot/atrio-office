@@ -244,3 +244,32 @@ export async function enrichClientCnpj(clientId) {
   }
   return payload;
 }
+
+// ============================================
+// LEGALIZATIONS — detalhes (para Saldanha)
+// ============================================
+
+export async function updateLegalization(id, payload) {
+  invalidateCache();
+  const data = await request(`/legalizations/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+  return data;
+}
+
+export async function getLegalizationHistorico(id) {
+  return request(`/legalizations/${id}/historico`);
+}
+
+export async function addLegalizationHistorico(id, { texto, autor = 'Saldanha' }) {
+  invalidateCache();
+  return request(`/legalizations/${id}/historico`, {
+    method: 'POST',
+    body: JSON.stringify({ texto, autor }),
+  });
+}
+
+export async function getLegalizationExigencias(id) {
+  return request(`/legalizations/${id}/exigencias`);
+}

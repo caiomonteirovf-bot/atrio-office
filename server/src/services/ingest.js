@@ -167,10 +167,95 @@ async function ingestDocumentFromText(text, pages, docType, meta, persisted) {
   return { ok: true, memory_ids, chunks: chunks.length, pages, preview: text.slice(0, 400), title };
 }
 
+// Extrai estrutura (doc_type, cnpj, banco, valor, periodo) do texto do PDF via LLM.
+// Usa anthropic se disponivel, senao openrouter (que e o padrao do sistema).
+// Retorna { doc_type, structured, summary } ou null se falhar.
+export async function classifyPdfText(text) {
+  if (!text || text.length < 50) return null;
+  const snippet = text.slice(0, 8000);
+  const prompt = `Analise este texto extraido de um PDF recebido por contabilidade brasileira e retorne APENAS JSON valido (sem markdown):
+{
+  "doc_type": "boleto" | "comprovante" | "nota_fiscal" | "contrato" | "extrato" | "documento_pessoal" | "outro",
+  "structured": {
+    "cnpj": "se encontrar",
+    "cpf": "se encontrar",
+    "razao_social": "titular/empresa do documento",
+    "banco": "se for extrato/comprovante",
+    "agencia_conta": "se for extrato",
+    "periodo_inicial": "YYYY-MM-DD se for extrato",
+    "periodo_final": "YYYY-MM-DD se for extrato",
+    "valor": "R$ X,XX para boleto/comprovante",
+    "vencimento": "YYYY-MM-DD para boleto"
+  },
+  "summary": "1-2 frases"
+}
+Omita campos vazios. Heuristica: se tem "Saldo inicial", "Movimentacoes", "Transferencia", "Pix recebido/enviado" = EXTRATO. Se tem "Codigo de barras" ou "Linha digitavel" = BOLETO.
+
+TEXTO:
+${snippet}`;
+
+  const parseJson = (raw) => {
+    if (!raw) return null;
+    const cleaned = String(raw).replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    try { return JSON.parse(m[0]); } catch { return null; }
+  };
+
+  try {
+    if (anthropic) {
+      const resp = await anthropic.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 800,
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const parsed = parseJson(resp.content?.[0]?.text);
+      if (parsed) return parsed;
+    }
+  } catch (e) {
+    console.error('[classifyPdfText] anthropic falhou:', e.message);
+  }
+
+  try {
+    if (openrouter) {
+      const resp = await openrouter.chat.completions.create({
+        model: VISION_MODEL_OPENROUTER,
+        max_tokens: 800,
+        messages: [
+          { role: 'system', content: 'Voce e um extrator JSON. Responda SOMENTE com JSON valido.' },
+          { role: 'user', content: prompt },
+        ],
+      });
+      const parsed = parseJson(resp.choices?.[0]?.message?.content);
+      if (parsed) {
+        console.log('[classifyPdfText] openrouter classificou:', parsed.doc_type);
+        return parsed;
+      }
+    }
+  } catch (e) {
+    console.error('[classifyPdfText] openrouter falhou:', e.message);
+  }
+
+  console.log('[classifyPdfText] nenhum provider disponivel, retornando null');
+  return null;
+}
+
 export async function ingestPdf(buffer, meta = {}) {
   const persisted = await persistBuffer(buffer, meta.filename || 'documento.pdf');
   const { text, pages } = await extractPdfText(buffer);
-  return ingestDocumentFromText(text, pages, 'pdf', meta, persisted);
+  const result = await ingestDocumentFromText(text, pages, 'pdf', meta, persisted);
+  // Passada adicional: classificar o PDF via LLM (doc_type + structured.cnpj etc)
+  if (result.ok) {
+    try {
+      const classification = await classifyPdfText(text);
+      if (classification) {
+        result.doc_type = classification.doc_type || result.doc_type;
+        result.structured = classification.structured || {};
+        result.summary = classification.summary || result.preview;
+      }
+    } catch (e) { console.error('[ingestPdf] classify falhou:', e.message); }
+  }
+  return result;
 }
 
 export async function ingestDocx(buffer, meta = {}) {

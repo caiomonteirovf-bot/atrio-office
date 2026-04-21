@@ -21,7 +21,7 @@ export default function ActivityHeatmap() {
   const grid = []
   const dataMap = {}
   const heatmap = data.heatmap || []
-  heatmap.forEach(d => { dataMap[d.date] = d.count })
+  heatmap.forEach(d => { const key = String(d.date).split('T')[0]; dataMap[key] = d.count })
 
   // Start from 364 days ago (52 weeks)
   const start = new Date(today)

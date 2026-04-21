@@ -69,6 +69,33 @@ async function dbSaveMessage(conv, sender, body, metadata = {}) {
     await query(`INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata) VALUES ($1, $2, $3, $4)`,
       [conv.dbId, sender, body, JSON.stringify(metadata)]);
     await query(`UPDATE whatsapp_conversations SET last_message_at = NOW() WHERE id = $1`, [conv.dbId]);
+
+    // Espelho em luna_v2.messages pro audit trail unificado (item 4, abr/2026)
+    // Sem isso, detector de regressão e RAG só veem fração das conversas.
+    // Best-effort: se falhar, não propaga (já gravamos no whatsapp_messages).
+    try {
+      let lunaConvId = null;
+      if (conv.phone) {
+        const ex = await query(`SELECT id FROM luna_v2.conversations WHERE phone = $1 ORDER BY last_message_at DESC NULLS LAST LIMIT 1`, [conv.phone]).catch(() => ({ rows: [] }));
+        if (ex.rows[0]) {
+          lunaConvId = ex.rows[0].id;
+          await query(`UPDATE luna_v2.conversations SET last_message_at = NOW() WHERE id = $1`, [lunaConvId]).catch(() => {});
+        } else {
+          const ins = await query(`INSERT INTO luna_v2.conversations (phone, last_message_at) VALUES ($1, NOW()) RETURNING id`, [conv.phone]).catch(() => ({ rows: [] }));
+          lunaConvId = ins.rows[0]?.id || null;
+        }
+      }
+      if (lunaConvId) {
+        const direction = sender === 'client' ? 'inbound' : 'outbound';
+        const senderType = sender === 'client' ? 'user' : sender === 'team' ? 'human' : 'agent';
+        const agentId = sender === 'luna' ? 'luna' : (sender === 'bot' ? 'luna' : null);
+        await query(
+          `INSERT INTO luna_v2.messages (conversation_id, direction, sender_type, agent_id, content)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [lunaConvId, direction, senderType, agentId, body]
+        );
+      }
+    } catch { /* audit não deve quebrar send */ }
   } catch (err) {
     log(`DB ERRO saveMessage: ${err.message}`);
   }
@@ -139,30 +166,24 @@ const ESCALATION_LEVELS = [
 ];
 
 // Mensagens da Luna ao cliente por nível (null = não envia, só notifica equipe)
+// Mensagens reescritas conforme SOUL.md — objetivas, sem "agradecemos paciência",
+// sem "volume elevado", sem emojis, sem frases genéricas de call center.
 const CLIENT_MESSAGES = {
-  0: (name) => {
-    const firstName = (name || '').split(' ')[0];
-    return `${firstName}, agradecemos a paciência! Notamos que você ainda está aguardando. Nossa equipe está empenhada em finalizar os atendimentos atuais para te responder com a atenção que você merece.\n\nSe preferir, pode deixar os detalhes da sua solicitação descritos abaixo. Isso ajuda muito a nossa equipe a te dar um retorno mais assertivo e rápido assim que assumirmos seu chat! 😊`;
-  },
-  1: (name) => {
-    const firstName = (name || '').split(' ')[0];
-    return `${firstName}, agradecemos a espera! Estamos com um volume elevado de atendimentos hoje. Sua solicitação é prioridade e um colaborador entrará em contato em breve. 💙`;
-  },
+  0: null,  // 10min: só alerta interno, nada pro cliente (escopo restrito — quem fala é humano)
+  1: null,  // 30min: só alerta interno
   2: (name) => {
+    // 1h sem retorno: única mensagem automática, objetiva
     const firstName = (name || '').split(' ')[0];
     const horario = isHorarioComercial();
     if (!horario.open) {
-      return `${firstName}, nosso time encerrou o expediente, mas sua mensagem está salva e será a primeira a ser respondida amanhã às 8h.\n\nSe for algo extremamente urgente, entre em contato pelo ${CONTACT_PHONE} 🔔`;
+      return `${firstName}, registrei sua mensagem. Retomamos o atendimento às 08h do próximo dia útil.`;
     }
-    return `${firstName}, sabemos que a espera está longa. Sua solicitação é prioridade e estimamos que um colaborador assuma seu atendimento nos próximos minutos.\n\nSe for algo extremamente urgente, entre em contato pelo ${CONTACT_PHONE} 🔔`;
+    return `${firstName}, sua mensagem foi recebida e está na fila. A equipe retorna em seguida.`;
   },
-  3: (name) => {
-    const firstName = (name || '').split(' ')[0];
-    return `${firstName}, sua solicitação está sendo tratada internamente e um responsável entrará em contato com você. Agradecemos a compreensão. 🙏`;
-  },
-  4: null, // 6h: só equipe
-  5: null, // 12h: só equipe
-  6: null, // 24h: só equipe
+  3: null,  // 2h: só equipe
+  4: null,  // 6h: só equipe
+  5: null,  // 12h: só equipe
+  6: null,  // 24h: só equipe
 };
 
 const NOTIFY_NUMBERS = ['5581997166091'];
@@ -175,7 +196,7 @@ let groupChatId = null;
 
 const FERIADOS_FIXOS = ['01-01','04-21','05-01','09-07','10-12','11-02','11-15','12-25'];
 
-const LUNA_HEADER = '✨ *Luna — Assistente Virtual* | Átrio Contabilidade\n\n';
+const LUNA_HEADER = '';  // Removido: cliente não deve ver 'Luna assistente virtual' — Luna representa a Átrio diretamente (regra 19 do prompt mestre)
 const GREETING_DELAY_MS = 30 * 1000; // 30 segundos
 const URGENTE_KEYWORDS = ['urgente', 'urgência', 'urgencia', 'emergencia', 'emergência'];
 
@@ -249,7 +270,7 @@ function isHorarioComercial() {
 // antes de enviar pra Luna (evita respostas duplicadas)
 // ============================================
 const __lunaInboundBuffer = new Map();
-const LUNA_DEBOUNCE_MS = Number(process.env.LUNA_DEBOUNCE_MS || 2500);
+const LUNA_DEBOUNCE_MS = Number(process.env.LUNA_DEBOUNCE_MS || 1200);
 
 async function __persistBuffer(phone, entry) {
   try {
@@ -271,6 +292,17 @@ async function __persistBuffer(phone, entry) {
 function scheduleLunaProcess(phone, msg, clientInfo, conversationInfo, processFn) {
   const existing = __lunaInboundBuffer.get(phone);
   if (existing) {
+    // Se está processando agora (Luna em flush), acumula em pendingMsgs
+    // O flush vai re-scheduler ao final vendo essa fila.
+    if (existing.processing) {
+      existing.pendingMsgs = existing.pendingMsgs || [];
+      existing.pendingMsgs.push(msg.body || '');
+      existing.pendingLatestMsg = msg;
+      existing.pendingClientInfo = clientInfo;
+      existing.pendingConversationInfo = conversationInfo;
+      log('[Buffer] msg de ' + phone + ' durante processing — acumulada (' + existing.pendingMsgs.length + ' pending)');
+      return;
+    }
     clearTimeout(existing.timer);
     existing.msgs.push(msg.body || '');
     existing.latestMsg = msg;
@@ -281,11 +313,22 @@ function scheduleLunaProcess(phone, msg, clientInfo, conversationInfo, processFn
     log('[Buffer] +1 msg p/ ' + phone + ' (total: ' + existing.msgs.length + ') — timer resetado');
     return;
   }
-  // Flush rapido (1.5s) pra mensagens que parecem completas: terminam com pontuacao
-  // final ou sao saudacoes curtas isoladas (oi/ola/bom dia/etc)
+  // Estratégia de debounce adaptativa:
+  //   Saudação → flush rápido (user não digita mais após "oi")
+  //   Texto pontuado → flush rápido (frase completa, auto-contida)
+  //   Texto curto sem pontuação (< 40 chars) → debounce LONGO (user provavelmente está
+  //     mandando DATA-POINTS em sequência: CNPJ, valor, nome — bato tudo em 1 flush)
+  //   Texto longo sem pontuação → debounce normal (continuação de digitação)
   const body = (msg.body || '').trim();
-  const looksComplete = /[.!?]$/.test(body) || /^(oi|ola|olá|bom dia|boa tarde|boa noite|hey|hi|e ai|eai)[.!?\s]*$/i.test(body);
-  const waitMs = looksComplete ? 1500 : LUNA_DEBOUNCE_MS;
+  const isGreeting = /^(oi+|ola|olá|bom dia|boa tarde|boa noite|hey|hi|e ai|eai|opa)[.!?\s]*$/i.test(body);
+  const hasPunct = /[.!?]$/.test(body);
+  const isVeryShort = body.length < 20;  // CNPJ isolado (18-20 chars), "1 real" (6 chars), etc.
+  const isShort = body.length < 40;
+  const waitMs = isGreeting ? 300
+               : hasPunct ? 700
+               : isVeryShort ? 6000  // data-points (CNPJ, valor, nome) em burst — espera 6s
+               : isShort ? 3500
+               : LUNA_DEBOUNCE_MS;   // 1200ms default
   const entry = {
     msgs: [msg.body || ''],
     latestMsg: msg,
@@ -301,9 +344,19 @@ function scheduleLunaProcess(phone, msg, clientInfo, conversationInfo, processFn
 async function __lunaFlush(phone, processFn) {
   const entry = __lunaInboundBuffer.get(phone);
   if (!entry) return;
-  __lunaInboundBuffer.delete(phone);
-  const combinedBody = entry.msgs.filter(Boolean).join('\n');
-  const msg = entry.latestMsg;
+  if (entry.processing) {
+    log('[Buffer] flush de ' + phone + ' ignorado — ja esta processando');
+    return;
+  }
+  entry.processing = true;
+  // Snapshot das mensagens que vão ser processadas agora
+  const msgsSnapshot = [...entry.msgs];
+  const msgSnapshot = entry.latestMsg;
+  // Reseta as msgs do entry mas MANTÉM o entry no buffer (pra novas msgs caírem em pendingMsgs)
+  entry.msgs = [];
+  entry.pendingMsgs = [];  // fresh
+  const combinedBody = msgsSnapshot.filter(Boolean).join('\n');
+  const msg = msgSnapshot;
   const proxyMsg = new Proxy(msg, {
     get(t, k) { return k === 'body' ? combinedBody : t[k]; }
   });
@@ -337,21 +390,47 @@ async function __lunaFlush(phone, processFn) {
       }
       // Caso precise retomar: marca motivo e segue
       if (humanOwns && minutesSinceHuman >= HANDOFF_REENGAGE_MIN) {
-        log('[Handoff] ' + phone + ' — humano inativo ha ' + Math.round(minutesSinceHuman) + 'min, Luna retoma + alerta');
         try {
-          await query(`INSERT INTO public.tasks (title, status, result, created_at)
-                       VALUES ($1, 'pending', $2::jsonb, now())`,
-            ['[ALERTA] Atendimento humano em inercia — ' + phone,
-             JSON.stringify({ type: 'handoff_inertia', conversation_id: r.id, phone, minutos_sem_resposta: Math.round(minutesSinceHuman) })]);
+          const existing = await query(
+            `SELECT id FROM public.tasks
+             WHERE status = 'pending'
+               AND result->>'phone' = $1
+               AND result->>'type' = 'handoff_inertia'
+               AND created_at > NOW() - INTERVAL '6 hours'
+             LIMIT 1`,
+            [phone]
+          );
+          if (existing.rowCount === 0) {
+            log('[Handoff] ' + phone + ' — humano inativo ha ' + Math.round(minutesSinceHuman) + 'min, alerta criado');
+            await query(`INSERT INTO public.tasks (title, status, result, created_at)
+                         VALUES ($1, 'pending', $2::jsonb, now())`,
+              ['[ALERTA] Atendimento humano em inercia — ' + (cInfo?.name || phone),
+               JSON.stringify({ type: 'handoff_inertia', conversation_id: r.id, phone, minutos_sem_resposta: Math.round(minutesSinceHuman) })]);
+          } else {
+            log('[Handoff] ' + phone + ' — alerta inercia ja aberto, skip');
+          }
         } catch (_) {}
       }
       if (humanOwns && lastOutShort) {
-        log('[Handoff] ' + phone + ' — resposta humana vaga, Luna retoma + alerta');
         try {
-          await query(`INSERT INTO public.tasks (title, status, result, created_at)
-                       VALUES ($1, 'pending', $2::jsonb, now())`,
-            ['[ALERTA] Resposta humana vaga — ' + phone,
-             JSON.stringify({ type: 'handoff_vague', conversation_id: r.id, phone, ultima_resposta: r.last_outbound_body })]);
+          const existing = await query(
+            `SELECT id FROM public.tasks
+             WHERE status = 'pending'
+               AND result->>'phone' = $1
+               AND result->>'type' = 'handoff_vague'
+               AND created_at > NOW() - INTERVAL '6 hours'
+             LIMIT 1`,
+            [phone]
+          );
+          if (existing.rowCount === 0) {
+            log('[Handoff] ' + phone + ' — resposta humana vaga, alerta criado');
+            await query(`INSERT INTO public.tasks (title, status, result, created_at)
+                         VALUES ($1, 'pending', $2::jsonb, now())`,
+              ['[ALERTA] Resposta humana vaga — ' + (cInfo?.name || phone),
+               JSON.stringify({ type: 'handoff_vague', conversation_id: r.id, phone, ultima_resposta: r.last_outbound_body })]);
+          } else {
+            log('[Handoff] ' + phone + ' — alerta vaga ja aberto, skip');
+          }
         } catch (_) {}
       }
     }
@@ -364,6 +443,26 @@ async function __lunaFlush(phone, processFn) {
   try { await query('DELETE FROM luna_v2.inbound_buffer WHERE phone = $1', [phone]); } catch (_) {}
   try { await processFn(proxyMsg, entry.clientInfo, entry.conversationInfo); }
   catch (e) { log('[Buffer] processFn erro: ' + e.message); }
+
+  // CLEANUP MUTEX + processa pendingMsgs acumuladas durante o flush
+  const liveEntry = __lunaInboundBuffer.get(phone);
+  if (liveEntry) {
+    liveEntry.processing = false;
+    if (Array.isArray(liveEntry.pendingMsgs) && liveEntry.pendingMsgs.length > 0) {
+      // Move pending → msgs e reagenda flush
+      liveEntry.msgs = [...liveEntry.pendingMsgs];
+      liveEntry.latestMsg = liveEntry.pendingLatestMsg || liveEntry.latestMsg;
+      liveEntry.clientInfo = liveEntry.pendingClientInfo || liveEntry.clientInfo;
+      liveEntry.conversationInfo = liveEntry.pendingConversationInfo || liveEntry.conversationInfo;
+      liveEntry.pendingMsgs = [];
+      log('[Buffer] re-flush de ' + phone + ' com ' + liveEntry.msgs.length + ' pending msgs agrupadas');
+      clearTimeout(liveEntry.timer);
+      liveEntry.timer = setTimeout(() => __lunaFlush(phone, processFn), 800);
+    } else {
+      // Nada pendente → remove o entry do buffer (libera memória)
+      __lunaInboundBuffer.delete(phone);
+    }
+  }
 }
 
 // Rehidratacao de buffers persistidos apos restart
@@ -491,7 +590,7 @@ export function getPendingMessages() {
   return list.sort((a, b) => new Date(a.receivedAt) - new Date(b.receivedAt));
 }
 
-export function markAsReplied(rawPhone) {
+export async function markAsReplied(rawPhone) {
   const phone = normalizePhone(rawPhone);
   const conv = conversations.get(phone);
   if (conv && !conv.resolved) {
@@ -500,6 +599,31 @@ export function markAsReplied(rawPhone) {
     dbUpdateConversation(phone, { human_replied: true, human_replied_at: conv.humanRepliedAt });
     dbLogMetric('Luna', 'human_replied', { phone, name: conv.name });
     log(`${conv.name} (${phone}) — humano respondeu`);
+    // Cancela Luna first-touch — tenta phone principal E realPhone (WA Web manda pro realPhone)
+    try {
+      const ft = await import('./luna-first-touch.js');
+      ft.cancelLunaFirstTouch(phone, log);
+      if (conv?.realPhone && conv.realPhone !== phone) ft.cancelLunaFirstTouch(conv.realPhone, log);
+      if (conv?.chatId && conv.chatId !== phone) ft.cancelLunaFirstTouch(conv.chatId, log);
+    } catch {}
+    // Auto-close: humano respondeu -> fecha alertas pending daquele phone
+    try {
+      const closed = await query(
+        `UPDATE public.tasks
+         SET status = 'done',
+             completed_at = NOW(),
+             result = COALESCE(result,'{}'::jsonb) || $2::jsonb,
+             updated_at = NOW()
+         WHERE status = 'pending'
+           AND result->>'phone' = $1
+           AND result->>'type' IN ('handoff_inertia','handoff_vague','administrativo','scope_defer')
+         RETURNING id`,
+        [phone, JSON.stringify({ closed_reason: 'humano respondeu', closed_at: new Date().toISOString() })]
+      );
+      if (closed.rowCount > 0) {
+        log('[markAsReplied] ' + closed.rowCount + ' alerta(s) auto-fechado(s) pra ' + phone);
+      }
+    } catch (e) { log('[markAsReplied] auto-close falhou: ' + e.message); }
     return true;
   }
   return false;
@@ -572,7 +696,7 @@ export async function initialize() {
         // Greeting pendente — envia agora
         if (!conv.greeted) {
           log(`Greeting pendente para ${conv.name} — enviando agora`);
-          sendGreeting(conv.chatId, conv.name, conv).catch(() => {});
+          // sendGreeting legacy desativado — Luna LLM cuida de retomadas também
         }
 
         // Retoma escalation
@@ -613,7 +737,16 @@ export async function initialize() {
     if (botIsSending) return;
 
     const phone = normalizePhone(msg.to);
-    const conv = conversations.get(phone);
+    // Busca conv pelo phone direto OU por realPhone (caso WA Web use numero diferente do LID)
+    let conv = conversations.get(phone);
+    if (!conv) {
+      for (const [k, c] of conversations) {
+        if (c.realPhone === phone || normalizePhone(c.realPhone || '') === phone) {
+          conv = c;
+          break;
+        }
+      }
+    }
     if (!conv || conv.resolved) return;
 
     conv.messages.push({ body: msg.body, from: 'team', at: new Date().toISOString() });
@@ -663,6 +796,193 @@ export async function initialize() {
 // =========================================
 // LUNA V2 - Wrapper para OpenClaw
 // =========================================
+
+// ============================================
+// ALERTA DELAYED — aguarda 60s apos ultima msg, agrupa contexto rico
+// ============================================
+const __pendingGroupAlerts = new Map();
+const GROUP_ALERT_DELAY_MS = Number(process.env.GROUP_ALERT_DELAY_MS || 60_000);
+
+function scheduleDelayedGroupAlert(ctx) {
+  const { phone, realPhone, name, body, clientInfo, contact } = ctx;
+  const existing = __pendingGroupAlerts.get(phone);
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.msgs.push(body || '');
+    existing.latestBody = body;
+    existing.clientInfo = clientInfo || existing.clientInfo;
+    existing.contact = contact || existing.contact;
+    existing.timer = setTimeout(() => __fireGroupAlert(phone), GROUP_ALERT_DELAY_MS);
+    log('[AlertGrupo] +1 msg acumulada p/ ' + phone + ' (timer resetado, aguarda ' + GROUP_ALERT_DELAY_MS/1000 + 's apos ultima msg)');
+    return;
+  }
+  const entry = {
+    msgs: [body || ''],
+    latestBody: body,
+    name, realPhone, phone, clientInfo, contact,
+    timer: setTimeout(() => __fireGroupAlert(phone), GROUP_ALERT_DELAY_MS),
+  };
+  __pendingGroupAlerts.set(phone, entry);
+  log('[AlertGrupo] agendado p/ ' + phone + ' em ' + GROUP_ALERT_DELAY_MS/1000 + 's (aguardando contexto)');
+}
+
+async function __fireGroupAlert(phone) {
+  const entry = __pendingGroupAlerts.get(phone);
+  if (!entry) return;
+  __pendingGroupAlerts.delete(phone);
+  try {
+    const { realPhone, name, clientInfo, contact, msgs } = entry;
+    const phoneKey = realPhone || phone;
+    const last8 = String(phoneKey || '').replace(/\D/g, '').slice(-8);
+    const { rows: convRows } = await query(
+      "SELECT id, last_alert_at, classificacao, contexto, "
+      + "EXTRACT(EPOCH FROM (NOW() - COALESCE(last_alert_at, NOW() - INTERVAL '10 years')))/3600 AS h_since_alert "
+      + "FROM luna_v2.conversations "
+      + "WHERE phone = $1 OR phone = $2 "
+      + "OR (length($3) = 8 AND phone LIKE '%' || $3) "
+      + "ORDER BY last_message_at DESC LIMIT 1",
+      [phoneKey, phone, last8]
+    );
+    const conv = convRows[0];
+    const hSince = conv?.last_alert_at ? parseFloat(conv.h_since_alert) : 99999;
+    const isFirstContact = !conv?.last_alert_at;
+    const isComeback = !isFirstContact && hSince >= 4;
+    if (!isFirstContact && !isComeback) {
+      log('[AlertGrupo] ' + phone + ' — dedup ativo (' + hSince.toFixed(1) + 'h), cancelando');
+      return;
+    }
+    let ultimasMsgs = [];
+    if (conv?.id) {
+      try {
+        const { rows: mrows } = await query(
+          "SELECT direction, content, created_at FROM luna_v2.messages "
+          + "WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 8",
+          [conv.id]
+        );
+        ultimasMsgs = mrows.reverse();
+      } catch {}
+    }
+    const isLead = !clientInfo?.id && !clientInfo?.gesthub_id;
+    const nomeCliente = clientInfo?.razao_social || clientInfo?.legalName
+      || clientInfo?.nome_fantasia || clientInfo?.trade_name
+      || clientInfo?.name || name || contact?.pushname || 'Sem nome cadastrado';
+    const cnpjLinha = clientInfo?.cnpj ? ('\nCNPJ: ' + clientInfo.cnpj) : '';
+    const statusLinha = isLead
+      ? '\n🟡 *LEAD NOVO* — nao cadastrado no Gesthub'
+      : (clientInfo?.regime ? '\nRegime: ' + clientInfo.regime : '');
+    const contatoNome = clientInfo?.contato?.nome;
+    const contatoFuncao = clientInfo?.contato?.funcao;
+    const contatoLinha = contatoNome
+      ? ('Contato: *' + contatoNome + '*' + (contatoFuncao ? ' (' + contatoFuncao + ')' : ''))
+      : (name && name !== nomeCliente ? 'Contato: *' + name + '*' : null);
+    const displayPhone = formatPhone(realPhone || phone);
+    const horarioInfo = isHorarioComercial();
+    const horarioTag = horarioInfo.open ? '' : ('\n⏰ _Fora do horario (' + horarioInfo.reason + ')_');
+    const classif = conv?.classificacao;
+    const classifLinha = classif ? ('\nClassificacao: *' + String(classif).toUpperCase() + '*') : '';
+    // === INTENT SEMÂNTICO (demanda) ===
+    // 1) Task recente vinculada (rotear_para_rodrigo criou) tem título descritivo
+    // 2) Classificacao salva na conv
+    // 3) Fallback: regex na 1ª msg inbound
+    const msgsInbound = ultimasMsgs
+      .filter(m => m.direction === 'inbound')
+      .map(m => String(m.content || '')
+        .replace(/---CONTEXTO---[\s\S]*?---FIM CONTEXTO---\s*/g, '')
+        .replace(/^(⏰|🌙|🚫|⚠️|📅).*?(\n|$)/gm, '')
+        .trim()
+      )
+      .filter(Boolean);
+
+    let demandaIntent = null;
+    // Passo 1: task recente criada pela Luna pra esse telefone
+    try {
+      const { rows: taskRows } = await query(
+        "SELECT title, result FROM public.tasks "
+        + "WHERE (result->>'phone' = $1 OR result->>'phone' = $2 "
+        + "OR result->>'conversation_id' = $3) "
+        + "AND created_at > NOW() - INTERVAL '10 minutes' "
+        + "ORDER BY created_at DESC LIMIT 1",
+        [phoneKey, phone, conv?.id || '']
+      );
+      if (taskRows[0]) {
+        const t = String(taskRows[0].title || '').replace(/^\[[^\]]+\]\s*/, '').trim();
+        // Pega só a parte antes dos ':' ou virgula (intent, não dados)
+        const shortIntent = t.split(/[:,]/)[0].trim();
+        if (shortIntent.length > 5 && shortIntent.length < 80) demandaIntent = shortIntent;
+      }
+    } catch {}
+
+    // Passo 2: classificacao salva na conv
+    if (!demandaIntent && conv?.classificacao) {
+      demandaIntent = String(conv.classificacao).charAt(0).toUpperCase() + String(conv.classificacao).slice(1);
+    }
+
+    // Passo 3: intent detection em TODAS as msgs inbound (não só a primeira)
+    // Prioridade: intent específico (NFS-e, IR, etc) > saudação genérica.
+    // Analisa o texto combinado de TODAS as msgs + metadados da conversa.
+    if (!demandaIntent && msgsInbound.length > 0) {
+      const blob = msgsInbound.join(' ').toLowerCase();
+      // Ordem de prioridade — mais específico primeiro
+      if (/emitir\s+(nota|nfs|nfe|nf)|emiss[aã]o\s+de\s+(nota|nf)|quero\s+(uma\s+)?(nota|nfs)/.test(blob))
+        demandaIntent = 'Emissão de NFS-e';
+      else if (/imposto\s+de\s+renda|declara[çc][aã]o\s+(de\s+)?ir|irpf/.test(blob))
+        demandaIntent = 'Imposto de Renda';
+      else if (/n[aã]o\s+receb(i|emos)|imposto.*(n[aã]o|falta|atrasad)|das.*(n[aã]o|falta)/.test(blob))
+        demandaIntent = 'Dúvida sobre imposto / recebimento';
+      else if (/abertura|abrir\s+empresa|cnpj\s+novo|constitui[çc][aã]o/.test(blob))
+        demandaIntent = 'Abertura de empresa';
+      else if (/contrato.*(altera|mudanç)|altera[çc][aã]o\s+contratual|mudança\s+de\s+cnae|alterar\s+(s[oó]cio|endereço)/.test(blob))
+        demandaIntent = 'Alteração contratual';
+      else if (/folha|pr[oó]-labore|sal[aá]rio|funcion[aá]rio|admiss[aã]o|demiss[aã]o/.test(blob))
+        demandaIntent = 'Folha de pagamento';
+      else if (/boleto|cobran[çc]a|pagamento\s+(de|da)|honor[aá]rio/.test(blob))
+        demandaIntent = 'Financeiro / cobrança';
+      else if (/conciliac|extrato|bancari/.test(blob))
+        demandaIntent = 'Conciliação bancária';
+      // Saudação só cai aqui se for a ÚNICA coisa dita
+      else if (msgsInbound.length === 1 && /^(oi+|ola|olá|bom\s+dia|boa\s+(tarde|noite)|hey|hi|opa|tudo\s+bem)[\s.!?]*$/.test(msgsInbound[0].toLowerCase()))
+        demandaIntent = 'Contato inicial (ainda sem pedido claro)';
+      else
+        // Usa a msg mais substantiva (não saudação) ou a primeira
+        demandaIntent = (msgsInbound.find(m => m.length > 15 && !/^(oi+|ola|olá|bom\s+dia)/i.test(m)) || msgsInbound[0]).substring(0, 80) + '…';
+    }
+    if (!demandaIntent) demandaIntent = 'A apurar';
+
+    // Dados coletados: concatena as msgs seguintes à primeira (respostas do cliente aos pedidos de Luna)
+    let dadosColetados = '';
+    if (msgsInbound.length > 1) {
+      dadosColetados = msgsInbound.slice(1).join(' | ');
+      if (dadosColetados.length > 200) {
+        const cut = dadosColetados.substring(0, 200);
+        const lastSpace = cut.lastIndexOf(' ');
+        dadosColetados = (lastSpace > 160 ? cut.substring(0, lastSpace) : cut) + '…';
+      }
+    }
+    const ultimaRespostaLuna = ultimasMsgs.filter(m => m.direction === 'outbound').slice(-1)[0]?.content || '';
+    const tag = isFirstContact ? '📩 *Novo contato*' : '🔁 *Retomada apos inatividade*';
+    const alertMsg = [
+      tag,
+      '',
+      'Cliente: *' + nomeCliente + '*' + cnpjLinha + statusLinha,
+      ...(contatoLinha ? [contatoLinha] : []),
+      'Telefone: ' + displayPhone,
+      '',
+      'Demanda: *' + demandaIntent + '*' + horarioTag,
+      ...(dadosColetados ? ['Dados coletados: _' + dadosColetados + '_'] : []),
+      ...(ultimaRespostaLuna ? ['', 'Luna já respondeu: _' + ultimaRespostaLuna.substring(0, 200) + '_'] : []),
+      '',
+      isLead ? '_Luna em triagem. Equipe: avaliar oportunidade._' : '_Luna conduzindo. Intervir apenas se necessário._',
+    ].join('\n');
+    await notifyTeamWhatsApp(alertMsg);
+    if (conv?.id) {
+      await query('UPDATE luna_v2.conversations SET last_alert_at = NOW() WHERE id = $1', [conv.id]).catch(() => {});
+    }
+    log('[AlertGrupo] ' + (isFirstContact ? 'novo' : 'retomada') + ' (delayed): ' + nomeCliente + ' — classif=' + (classif || 'sem-classif'));
+  } catch (e) {
+    log('[AlertGrupo] erro ao disparar: ' + e.message);
+  }
+}
+
 async function handleLunaV2(msg, clientInfo, conversationInfo) {
   try {
     const result = await handleWhatsAppMessage(msg, clientInfo, conversationInfo);
@@ -707,6 +1027,10 @@ async function handleLunaV2(msg, clientInfo, conversationInfo) {
         log(`[Luna v2] Escalando para humano: ${result.reason}`);
         return { handled: false };
 
+      case 'defer':
+        log(`[Luna v2] Deferido 5min: ${result.reason}`);
+        return { handled: true, deferred: true };
+
       case 'error':
         if (result.fallback) {
           return { handled: false };
@@ -731,10 +1055,14 @@ async function handleLunaV2(msg, clientInfo, conversationInfo) {
 async function upsertLunaClient(g) {
   // Espelha empresa do Gesthub em luna_v2.clients (chave: CNPJ). Retorna uuid local.
   if (!g) return null;
-  const cnpj = g.cnpj ? String(g.cnpj).replace(/\D/g, '') : null;
-  const nomeLegal = g.razao_social || g.nome_fantasia || g.name || 'Cliente';
-  const nomeFantasia = g.nome_fantasia || null;
-  const regime = g.regime || g.regime_tributario || null;
+  const rawCnpj = g.document || g.cnpj || null;
+  const cnpj = rawCnpj ? String(rawCnpj).replace(/\D/g, '') : null;
+  // Gesthub real usa inglês: legalName, tradeName, taxRegime.
+  const nomeLegal = g.legalName || g.razaoSocial || g.razao_social
+                 || g.tradeName || g.nomeFantasia || g.nome_fantasia
+                 || g.name || 'Cliente';
+  const nomeFantasia = g.tradeName || g.nomeFantasia || g.nome_fantasia || null;
+  const regime = g.taxRegime || g.regime || g.regimeTributario || g.regime_tributario || null;
   try {
     if (cnpj) {
       // Formato esperado 14 digitos ou XX.XXX.XXX/XXXX-XX; a coluna aceita varchar(18)
@@ -773,16 +1101,27 @@ async function getClientInfo(phone) {
     const g = await findClientByPhone(phone);
     if (g) {
       const lunaUuid = await upsertLunaClient(g);
+      // Gesthub usa inglês camelCase: legalName / tradeName / document / taxRegime / city / state.
+      // Aceitamos pt snake/camel como fallback pra compatibilidade.
+      const razaoSocial  = g.legalName || g.razaoSocial || g.razao_social || null;
+      const nomeFantasia = g.tradeName || g.nomeFantasia || g.nome_fantasia || null;
+      const cnpj         = g.document || g.cnpj || null;
+      const regime       = g.taxRegime || g.regime || g.regimeTributario || g.regime_tributario || null;
+      const municipio    = g.city || g.municipio || g.cidade || null;
+      const tipoCliente  = g.type || g.tipo || null;  // ex: 'MEDICINA', 'ODONTO', 'GERAL' — usado pra decidir Dr./Drª
       return {
         id: lunaUuid,
         gesthub_id: g.id || null,
-        name: g.nome_fantasia || g.razao_social || g.name || 'Cliente',
-        trade_name: g.nome_fantasia || g.trade_name || null,
-        nome_fantasia: g.nome_fantasia || null,
-        razao_social: g.razao_social || null,
-        cnpj: g.cnpj || null,
-        regime: g.regime || g.regime_tributario || null,
-        municipio: g.municipio || g.cidade || null,
+        name: razaoSocial || nomeFantasia || g.name || 'Cliente',
+        trade_name: nomeFantasia,
+        nome_fantasia: nomeFantasia,
+        razao_social: razaoSocial,
+        legalName: razaoSocial,          // espelho pro frontend que usa camelCase
+        tradeName: nomeFantasia,
+        cnpj,
+        regime,
+        municipio,
+        tipo: tipoCliente,
         phone: g.phone || null,
         contato: g._contato || null,
         source: 'gesthub',
@@ -861,7 +1200,10 @@ async function handleIncoming(msg) {
 
     // ====== NOVO: Tentar Luna v2 primeiro ======
     try {
-      const clientInfo = await getClientInfo(phone);
+      // WhatsApp pode entregar chatId em formato LID (15 digitos, nao E164). Usa realPhone (numero limpo).
+      const phoneForLookup = (realPhone && /^\d{10,13}$/.test(String(realPhone))) ? realPhone : phone;
+      const clientInfo = await getClientInfo(phoneForLookup);
+      log(`[lookup] phone=${phone} realPhone=${realPhone} usado=${phoneForLookup} gesthub=${clientInfo?.gesthub_id || 'nenhum'}`);
       const conversationInfo = await getConversationInfo(from, clientInfo);
 
       // Auto-ingest de PDF/imagem — fire-and-forget, nao bloqueia Luna
@@ -869,74 +1211,13 @@ async function handleIncoming(msg) {
         autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo).catch(() => {});
       }
 
-      // Alerta o grupo quando ha novo contato SEM intervencao humana pendente.
-      // Dispara UMA vez por conversa (primeira entrada) OU se cliente volta apos inatividade > 2h.
-      // Fire-and-forget — nao bloqueia o fluxo de resposta.
-      (async () => {
-        try {
-          const { rows: msgCounts } = await query(
-            `SELECT COUNT(*) AS n,
-                    MAX(created_at) FILTER (WHERE direction = 'inbound' AND created_at < NOW() - INTERVAL '2 hours') AS last_before
-               FROM luna_v2.messages
-              WHERE conversation_id = $1`,
-            [conversationInfo.id]
-          );
-          const totalMsgs = parseInt(msgCounts[0]?.n || 0, 10);
-          const isFirstContact = totalMsgs <= 1;
-          const isComeback = msgCounts[0]?.last_before != null;
-          if (!isFirstContact && !isComeback) return;
-
-          const displayPhone = formatPhone(realPhone || phone);
-          const horarioInfo = isHorarioComercial();
-          const horarioTag = horarioInfo.open ? '' : `\n⏰ _Fora do horario (${horarioInfo.reason})_`;
-
-          // === RESOLVER IDENTIDADE do contato ===
-          const isLead = !clientInfo?.id && !clientInfo?.gesthub_id;
-          // Prioridade: razao_social/legal_name > nome_fantasia/trade_name > name do clientInfo > pushname WhatsApp > "Desconhecido"
-          const nomeCliente = clientInfo?.razao_social
-            || clientInfo?.legalName
-            || clientInfo?.nome_fantasia
-            || clientInfo?.trade_name
-            || clientInfo?.name
-            || name
-            || contact?.pushname
-            || 'Sem nome cadastrado';
-
-          const empresaExtra = (clientInfo?.nome_fantasia && clientInfo?.razao_social
-                                && clientInfo.nome_fantasia !== clientInfo.razao_social)
-            ? ` (${clientInfo.nome_fantasia})`
-            : '';
-
-          const cnpjLinha = clientInfo?.cnpj
-            ? `\nCNPJ: ${clientInfo.cnpj}`
-            : '';
-
-          const statusLinha = isLead
-            ? `\n🟡 *LEAD NOVO* — nao cadastrado no Gesthub`
-            : clientInfo?.regime
-              ? `\nRegime: ${clientInfo.regime}`
-              : '';
-
-          const tag = isFirstContact ? '📩 *Novo contato*' : '🔁 *Retomada apos inatividade*';
-
-          const alertMsg = [
-            tag,
-            ``,
-            `Cliente: *${nomeCliente}${empresaExtra}*${cnpjLinha}${statusLinha}`,
-            `Telefone: ${displayPhone}`,
-            `Mensagem: _${String(body || '').substring(0, 220)}_${horarioTag}`,
-            ``,
-            isLead
-              ? `_Luna coletando dados. Equipe: avaliar oportunidade._`
-              : `_Luna processando — intervir se necessario._`,
-          ].join('\n');
-
-          await notifyTeamWhatsApp(alertMsg);
-          log(`[AlertGrupo] ${isFirstContact ? 'novo' : 'retomada'}: ${nomeCliente} (${displayPhone}) ${isLead ? '[LEAD]' : ''}`);
-        } catch (e) {
-          log(`[AlertGrupo] erro: ${e.message}`);
-        }
-      })();
+      // Alerta INTELIGENTE ao grupo: aguarda 60s após última msg, agrupa contexto
+      // (conversa completa + classificação Luna), depois dispara alerta rico.
+      // Reset do timer a cada nova msg no burst (debounce idêntico ao LLM buffer).
+      // Dedup: só na 1ª entrada OU retomada 4h+ após último alerta.
+      scheduleDelayedGroupAlert({
+        phone, realPhone, name, body, clientInfo, contact,
+      });
 
       // Buffer 10s: agrupa mensagens rapidas do mesmo contato
       scheduleLunaProcess(phone, msg,
@@ -1008,17 +1289,9 @@ async function handleIncoming(msg) {
     dbSaveMessage(conv, 'client', body);
 
     // Reseta greeting timer (espera cliente terminar de digitar) e reagenda
-    if (conv.greetingTimer) {
-      clearTimeout(conv.greetingTimer);
-      conv.greetingTimer = null;
-    }
-    if (!conv.greeted) {
-      conv.greetingTimer = setTimeout(async () => {
-        if (conv.greeted || conv.resolved) return;
-        conv.greeted = true;
-        await sendGreeting(conv.chatId, conv.name, conv);
-      }, GREETING_DELAY_MS);
-    }
+    // Greeting hardcoded desativado — Luna (LLM) já cumprimenta via prompt mestre.
+    if (conv.greetingTimer) { clearTimeout(conv.greetingTimer); conv.greetingTimer = null; }
+    conv.greeted = true;
 
     // Reseta timer de classificação/notificação (espera cliente parar de digitar)
     if (!conv.classified) {
@@ -1037,9 +1310,9 @@ async function handleIncoming(msg) {
     }
 
     // Detecta solicitação de NFS-e
+    // handleNfseRequest desativado — Luna (LLM) coleta via regra 21 do prompt mestre.
     if (isNfseRequest(body)) {
-      conv.classified = true; // já sabemos que é fiscal, evita classificação duplicada
-      await handleNfseRequest(from, phone, name, body, conv);
+      conv.classified = true;
     }
 
     // Cliente insistiu após humano responder → reinicia monitoramento
@@ -1071,11 +1344,10 @@ async function handleIncoming(msg) {
   dbSaveMessage(conv, 'client', body);
   dbLogMetric('Luna', 'new_conversation', { phone, name });
 
-  // Detecta NFS-e na primeira mensagem — pula greeting (a coleta de dados já é o greeting)
+  // Detecta NFS-e na primeira mensagem — só marca flags; Luna LLM faz a coleta
   if (isNfseRequest(body)) {
     conv.greeted = true;
-    conv.classified = true; // não precisa classificar, já sabemos que é fiscal
-    handleNfseRequest(from, phone, name, body, conv).catch(() => {});
+    conv.classified = true;
   }
 
   // Detecta URGENTE na primeira mensagem
@@ -1084,14 +1356,8 @@ async function handleIncoming(msg) {
     await handleUrgent(from, phone, name, body);
   }
 
-  // Greeting com delay de 10s
-  if (!conv.greeted) {
-    conv.greetingTimer = setTimeout(async () => {
-      if (conv.greeted || conv.resolved) return;
-      conv.greeted = true;
-      await sendGreeting(from, name, conv);
-    }, GREETING_DELAY_MS);
-  }
+  // Greeting hardcoded desativado — Luna LLM cumprimenta via prompt mestre (regra 2, 8, 10, 25)
+  conv.greeted = true;
 
   // Notificação no chat da equipe: nova mensagem recebida
   chat({ from: 'Luna', text: `📩 Nova mensagem de *${name}*: "${body.substring(0, 60)}${body.length > 60 ? '...' : ''}"`, tag: 'whatsapp' });
@@ -1165,12 +1431,9 @@ function scheduleClassification(phone, chatId, name, conv) {
       // Se config diz pra esperar o 10min para avisar (reduz ruido no grupo),
       // pulamos a notificacao imediata. Classificacao fica salva em conv.classification
       // e eh incluida no alerta de 10min quando dispara.
-      const _cfg = await getAlertConfig();
-      if (_cfg.meta.first_contact_alert_delayed !== 'true') {
-        notifyTeamWhatsApp(alertUnico).catch(() => {});
-      } else {
-        log(`[NovoContato] ${name} — alerta adiado para 10min (config)`);
-      }
+      // Removido: 'Novo contato' já foi emitido pelo IIFE em handleLunaV2 com dedup
+      // Esta classification só atualiza o conv.classification em memória pra escalation usar.
+      log(`[NovoContato] classification pronta — alerta já disparado anteriormente via dedup`);
 
       // Cria task e roteia (pula se já tem NFS-e em andamento ou se é fiscal com NFS-e ativo)
       if (!conv.nfseRequested && !conv.nfseTaskId && classification.classificacao !== 'geral') {
@@ -1181,8 +1444,8 @@ function scheduleClassification(phone, chatId, name, conv) {
       // Fallback — notifica grupo sem classificação
       const displayPhone = conv.displayPhone || phone;
       const lastMsg = conv.messages.filter(m => m.from === 'client').pop()?.body || '';
-      const alertFallback = `📩 *Novo contato*\n\nCliente: *${name}*\nTelefone: ${displayPhone}\nMensagem: _${lastMsg.substring(0, 150)}_`;
-      notifyTeamWhatsApp(alertFallback).catch(() => {});
+      // alertFallback removido — dedup já tratou no IIFE principal
+      log(`[Classif-fallback] classification falhou, mas alerta inicial já foi emitido: ${err.message}`);
     }
   }, CLASSIFICATION_DELAY_MS);
 }
@@ -2110,6 +2373,117 @@ export async function destroy() {
   if (client) { await client.destroy(); client = null; isReady = false; qrCodeData = null; }
 }
 
+// ============================================
+// AUTO-HEALING — monitora Chromium/Puppeteer e reinicia automaticamente
+// Detecta 3 sintomas:
+//  1) isReady=false por >3min sem QR ativo (conexao travada)
+//  2) Processo browser subjacente morto (pid nao existe)
+//  3) Muitos processos defunct ("zumbis") indicando crash parcial
+// ============================================
+let _healStartedAt = null;
+let _lastDisconnectReportedAt = 0;
+
+async function checkChromiumHealth() {
+  const status = { connected: isReady, hasQR: !!qrCodeData };
+
+  // Sintoma 1: cliente nem inicializado ha muito tempo
+  if (!client) {
+    status.reason = 'client-null';
+    status.needsHeal = true;
+    return status;
+  }
+
+  // Sintoma 2: browser pid morreu
+  try {
+    const browserPid = client.pupBrowser?.process()?.pid;
+    if (browserPid) {
+      try {
+        process.kill(browserPid, 0); // signal 0 = check if alive
+        status.browserPid = browserPid;
+      } catch (e) {
+        status.reason = 'browser-pid-dead:' + browserPid;
+        status.needsHeal = true;
+        return status;
+      }
+    }
+  } catch (e) { /* pupBrowser indisponivel = client nao totalmente pronto, ignora */ }
+
+  // Sintoma 3: zumbis demais (threshold: 8+)
+  try {
+    const { execSync } = await import('child_process');
+    const zombieCount = parseInt(execSync("ps aux | awk '$8 ~ /Z/' | wc -l").toString().trim(), 10) || 0;
+    status.zombies = zombieCount;
+    if (zombieCount >= 8) {
+      status.reason = 'too-many-zombies:' + zombieCount;
+      status.needsHeal = true;
+      return status;
+    }
+  } catch (e) { /* no-op */ }
+
+  // Sintoma 4: disconnected por mais de 3min sem QR em tela
+  if (!isReady && !qrCodeData) {
+    if (!_lastDisconnectReportedAt) _lastDisconnectReportedAt = Date.now();
+    const disconnectedFor = Date.now() - _lastDisconnectReportedAt;
+    if (disconnectedFor > 3 * 60 * 1000) {
+      status.reason = 'stuck-no-qr:' + Math.round(disconnectedFor / 1000) + 's';
+      status.needsHeal = true;
+      return status;
+    }
+  } else {
+    _lastDisconnectReportedAt = 0;
+  }
+
+  return status;
+}
+
+async function healChromium(reason) {
+  // Cooldown: nao cura 2x em menos de 2min
+  if (_healStartedAt && (Date.now() - _healStartedAt) < 2 * 60 * 1000) {
+    log('[auto-heal] em cooldown, pulando');
+    return false;
+  }
+  _healStartedAt = Date.now();
+  log('[auto-heal] acionado: ' + reason);
+  try {
+    if (client) {
+      try { await client.destroy(); } catch (e) { log('[auto-heal] destroy falhou: ' + e.message); }
+    }
+    client = null;
+    isReady = false;
+    qrCodeData = null;
+    _lastDisconnectReportedAt = 0;
+
+    // Aguarda 3s pra sistema limpar processos
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Reinicia (NaO apaga sessao — mantem login)
+    await initialize();
+    log('[auto-heal] initialize() chamado');
+    return true;
+  } catch (e) {
+    log('[auto-heal] ERRO: ' + e.message);
+    return false;
+  }
+}
+
+export function startHealthcheck(intervalMs = 90 * 1000) {
+  log('[auto-heal] healthcheck iniciado (interval ' + (intervalMs/1000) + 's)');
+  setInterval(async () => {
+    try {
+      const status = await checkChromiumHealth();
+      if (status.needsHeal) {
+        await healChromium(status.reason);
+      }
+    } catch (e) {
+      log('[auto-heal] check falhou: ' + e.message);
+    }
+  }, intervalMs);
+}
+
+export async function getHealthStatus() {
+  return await checkChromiumHealth();
+}
+
 
 // ============================================
 // AUTO-INGEST DE MIDIA (PDF / IMAGEM)
@@ -2117,6 +2491,33 @@ export async function destroy() {
 // Baixa o arquivo, despacha para o pipeline de ingest e cria memoria vinculada ao cliente.
 // A memoria entra como 'draft' — requer aprovacao via UI /docs.
 // ============================================
+// Faz upload de extrato pro Atrio Finance (banking-system) e retorna { ok, uploadId, transactions }
+async function uploadExtratoToFinance({ buffer, filename, clienteId, ano, mes }) {
+  if (!buffer || !clienteId) return { ok: false, error: 'dados insuficientes pra upload' };
+  const FINANCE_URL = process.env.ATRIO_FINANCE_URL || process.env.BANKING_URL || 'http://atrio-banking-system-1:3000';
+  try {
+    // Node 20+ tem FormData nativo; File/Blob tambem
+    const form = new FormData();
+    const blob = new Blob([buffer], { type: 'application/pdf' });
+    form.append('file', blob, filename || `extrato-${Date.now()}.pdf`);
+    form.append('cliente_id', String(clienteId));
+    form.append('ano', String(ano));
+    form.append('mes', String(mes));
+
+    const resp = await fetch(`${FINANCE_URL}/api/uploads`, { method: 'POST', body: form });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) return { ok: false, error: data?.detail || `HTTP ${resp.status}` };
+    return {
+      ok: true,
+      uploadId: data?.data?.id,
+      transactions: data?.data?.transacoes_count || data?.data?.num_transactions || 0,
+      periodo: data?.data ? `${data.data.periodo_inicio || ''} a ${data.data.periodo_fim || ''}` : null,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo) {
   if (!msg?.hasMedia) return null;
   try {
@@ -2124,16 +2525,70 @@ export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo)
     if (!media || !media.data) return null;
 
     const mime = media.mimetype || '';
-    // Apenas PDF e imagens — ignora audio (por ora), video, docs nao suportados
-    const isPdf = mime === 'application/pdf';
+    const filename = media.filename || `whatsapp_${Date.now()}`;
+    const fnameLower = filename.toLowerCase();
+    // Tipos aceitos: PDF, imagem, OFX (extratos bancarios), CSV (extratos Nubank etc)
+    const isPdf = mime === 'application/pdf' || fnameLower.endsWith('.pdf');
     const isImage = mime.startsWith('image/');
-    if (!isPdf && !isImage) {
-      log(`[AutoIngest] ignorando mime nao suportado: ${mime}`);
+    const isOfx = fnameLower.endsWith('.ofx') || fnameLower.endsWith('.qfx') || mime === 'application/x-ofx';
+    const isCsv = fnameLower.endsWith('.csv') || mime === 'text/csv';
+    if (!isPdf && !isImage && !isOfx && !isCsv) {
+      log(`[AutoIngest] ignorando mime nao suportado: ${mime} (${filename})`);
       return null;
     }
 
     const buffer = Buffer.from(media.data, 'base64');
-    const filename = media.filename || (isPdf ? `whatsapp_${Date.now()}.pdf` : `whatsapp_${Date.now()}.jpg`);
+
+    // Fast-path pra OFX/CSV: assume extrato bancario e vai direto pro Atrio Finance /auto
+    if (isOfx || isCsv) {
+      log(`[AutoIngest] ${filename} (${isOfx ? 'OFX' : 'CSV'}) -> Atrio Finance /auto`);
+      try {
+        const FINANCE_URL = process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000';
+        const form = new FormData();
+        const blob = new Blob([buffer], { type: isOfx ? 'application/x-ofx' : 'text/csv' });
+        form.append('file', blob, filename);
+        const resp = await fetch(`${FINANCE_URL}/api/uploads/auto`, { method: 'POST', body: form });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data?.ok) {
+          const uploadId = data?.data?.id;
+          const numTx = data?.data?.transacoes_count || data?.data?.num_transactions || 0;
+          log(`[AutoIngest] ${filename} -> upload #${uploadId} (${numTx} transacoes)`);
+          try {
+            chat({ from: 'Sneijder', text: `💾 ${isOfx ? 'OFX' : 'CSV'} de ${clientInfo?.name || 'cliente'} (${filename}) carregado no Atrio Finance — upload #${uploadId}, ${numTx} transações.`, tag: 'atrio-finance' });
+          } catch {}
+          return { ok: true, doc_type: 'extrato', upload_id: uploadId, transacoes: numTx, type: isOfx ? 'ofx' : 'csv' };
+        }
+        // Falhou: log detalhado + task manual pro Sneijder
+        const errMsg = typeof data?.detail === 'object' ? JSON.stringify(data.detail) : (data?.detail || `HTTP ${resp.status}`);
+        log(`[AutoIngest] ${filename} upload /auto falhou: ${errMsg}`);
+        try {
+          chat({ from: 'Luna', text: `⚠️ ${isOfx ? 'OFX' : 'CSV'} de ${clientInfo?.name || 'cliente'} (${filename}) chegou mas nao identifiquei a conta. Sneijder: cadastrar conta bancaria ou fazer upload manual.`, tag: 'atrio-finance' });
+        } catch {}
+        // Cria task manual
+        try {
+          const { rows: tmRows } = await query(
+            `SELECT tm.id FROM team_members tm JOIN agents a ON tm.agent_id = a.id WHERE a.name = 'Sneijder' LIMIT 1`
+          );
+          if (tmRows[0]?.id) {
+            await query(
+              `INSERT INTO tasks (title, description, client_id, assigned_to, priority, status, result, created_at)
+               VALUES ($1, $2, $3, $4, 'medium', 'pending', $5::jsonb, NOW())`,
+              [
+                `[EXTRATO] ${filename} — conta nao cadastrada`,
+                `Arquivo ${isOfx ? 'OFX' : 'CSV'} recebido via WhatsApp de ${clientInfo?.name || msg.from}.\nFilename: ${filename}\nErro auto-detect: ${errMsg}\n\nAção: cadastrar conta bancaria no Atrio Finance e fazer upload manual.`,
+                clientInfo?.id || null,
+                tmRows[0].id,
+                JSON.stringify({ origem: 'whatsapp_auto_route', file_type: isOfx ? 'ofx' : 'csv', filename, error: errMsg }),
+              ]
+            );
+          }
+        } catch (e) { log('[AutoIngest] task manual falhou: ' + e.message); }
+        return { ok: false, error: errMsg, type: isOfx ? 'ofx' : 'csv' };
+      } catch (e) {
+        log(`[AutoIngest] ${filename} upload /auto excecao: ${e.message}`);
+        return { ok: false, error: e.message };
+      }
+    }
 
     // Busca o agent_id da Luna para marcar a origem
     let lunaAgentId = null;
@@ -2180,6 +2635,115 @@ export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo)
           tag: 'ingest'
         });
       } catch {}
+    }
+
+    // IDENTIFICAÇÃO DO CLIENTE REAL: se o PDF tem CNPJ/CPF, usa pra achar cliente certo no Gesthub
+    // (ex: Kamille envia PDF do Instituto Maria Joana — cliente real é o instituto, não Kamille)
+    let realClientId = clientInfo?.id || null;
+    let realClientName = clientInfo?.name || clientInfo?.legalName || null;
+    if (result.ok && result.structured) {
+      const docCnpj = String(result.structured.cnpj || '').replace(/\D/g, '');
+      const docCpf = String(result.structured.cpf || '').replace(/\D/g, '');
+      const docToSearch = docCnpj.length === 14 ? docCnpj : (docCpf.length === 11 ? docCpf : null);
+      if (docToSearch) {
+        try {
+          const gh = await import('./gesthub.js');
+          const clients = await gh.getClients();
+          const hit = clients.find(c => (c.document || '').replace(/\D/g, '') === docToSearch);
+          if (hit) {
+            realClientId = hit.id;
+            realClientName = hit.legalName || hit.tradeName || result.structured.razao_social || realClientName;
+            log(`[AutoRoute] PDF do cliente ${realClientName} (${docToSearch}) — enviado via contato ${clientInfo?.name || msg.from}`);
+          }
+        } catch (e) { log('[AutoRoute] gesthub lookup falhou: ' + e.message); }
+      }
+    }
+
+    // ORQUESTRAÇÃO: rotear documento ao agente correto via task
+    // Mapeia doc_type → agente responsável. Documentos sem match ficam em /docs aguardando humano.
+    if (result.ok && result.doc_type && realClientId) {
+      const DOC_TYPE_TO_AGENT = {
+        extrato:      { agent: 'Sneijder', action: 'Upload no Atrio Finance + conciliação' },
+        comprovante:  { agent: 'Sneijder', action: 'Registrar no Atrio Finance (contas a pagar/receber)' },
+        boleto:       { agent: 'Sneijder', action: 'Lançar em contas a pagar no Atrio Finance' },
+        nota_fiscal:  { agent: 'Campelo', action: 'Conferir emissão/classificação fiscal' },
+        contrato:     { agent: 'Saldanha', action: 'Analisar cláusulas e arquivar' },
+      };
+      const route = DOC_TYPE_TO_AGENT[result.doc_type];
+      if (route) {
+        // Se extrato, tenta upload direto pro Atrio Finance antes da task
+        let uploadInfo = null;
+        if (result.doc_type === 'extrato') {
+          const structured = result.structured || {};
+          const periodFinal = String(structured.periodo_final || structured.periodo_inicial || '').slice(0, 10);
+          const mm = periodFinal.match(/^(\d{4})-(\d{2})/);
+          const ano = mm ? parseInt(mm[1], 10) : new Date().getFullYear();
+          const mes = mm ? parseInt(mm[2], 10) : new Date().getMonth() + 1;
+          uploadInfo = await uploadExtratoToFinance({
+            buffer, filename, clienteId: realClientId, ano, mes,
+          });
+          if (uploadInfo.ok) {
+            log(`[AutoRoute] extrato → Atrio Finance upload #${uploadInfo.uploadId} (${uploadInfo.transactions} transacoes)`);
+            chat({ from: 'Sneijder', text: `💾 Extrato de ${realClientName} carregado no Atrio Finance — upload #${uploadInfo.uploadId}, ${uploadInfo.transactions} transações. Conciliação disponível.`, tag: 'atrio-finance' });
+          } else {
+            log(`[AutoRoute] upload Atrio Finance falhou: ${uploadInfo.error}`);
+          }
+        }
+        try {
+          const { rows: tmRows } = await query(
+            `SELECT tm.id FROM team_members tm JOIN agents a ON tm.agent_id = a.id WHERE a.name = $1 LIMIT 1`,
+            [route.agent]
+          );
+          const assignedId = tmRows[0]?.id;
+          if (assignedId) {
+            const title = `[${String(result.doc_type).toUpperCase()}] ${realClientName || 'Cliente'} — ${route.action}`;
+            const contatoLinha = (clientInfo?.name && clientInfo.name !== realClientName)
+              ? `Enviado por: ${clientInfo.name} (${msg.from})\nCliente real (do documento): ${realClientName}\n\n`
+              : `Cliente: ${realClientName || '—'} (${msg.from})\n\n`;
+            const desc = contatoLinha
+              + `Tipo detectado: ${result.doc_type}\n`
+              + `Arquivo: ${filename}\n`
+              + (result.structured?.banco ? `Banco: ${result.structured.banco}\n` : '')
+              + (result.structured?.valor ? `Valor: R$ ${result.structured.valor}\n` : '')
+              + (result.summary ? `\nResumo:\n${result.summary.slice(0, 400)}\n` : '')
+              + (uploadInfo && uploadInfo.ok
+                  ? `\n✅ Upload automatico no Atrio Finance: #${uploadInfo.uploadId} (${uploadInfo.transactions} transacoes). Ação: conciliar.`
+                  : (uploadInfo && uploadInfo.error
+                    ? `\n⚠️ Upload automatico FALHOU: ${uploadInfo.error}. Ação: subir manualmente.`
+                    : `\nAção solicitada: ${route.action}`));
+            const { rows: taskRows } = await query(
+              `INSERT INTO tasks (title, description, client_id, assigned_to, priority, status, result, created_at)
+               VALUES ($1, $2, $3, $4, 'medium', 'pending', $5::jsonb, NOW())
+               RETURNING id`,
+              [
+                title.slice(0, 255),
+                desc,
+                realClientId,
+                assignedId,
+                JSON.stringify({
+                  doc_type: result.doc_type,
+                  memory_id: result.memory_id || null,
+                  filename,
+                  phone: msg.from,
+                  structured: result.structured || {},
+                  origem: 'whatsapp_auto_route',
+                }),
+              ]
+            );
+            log(`[AutoRoute] ${result.doc_type} → ${route.agent} (task ${taskRows[0]?.id?.slice(0,8)})`);
+            const quemMandou = (clientInfo?.name && clientInfo.name !== realClientName)
+              ? `${clientInfo.name} (doc é de ${realClientName})`
+              : realClientName;
+            chat({
+              from: 'Luna',
+              text: `🔀 Roteado: ${result.doc_type} de ${quemMandou} → *${route.agent}*.\n${route.action}`,
+              tag: 'ingest'
+            });
+          }
+        } catch (e) { log('[AutoRoute] falhou: ' + e.message); }
+      } else {
+        log(`[AutoRoute] doc_type=${result.doc_type} sem rota definida — fica em /docs pra triagem humana`);
+      }
     }
 
     return result;

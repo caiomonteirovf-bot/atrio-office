@@ -358,6 +358,47 @@ export const tools = {
     if (!valor || valor <= 0) return { sucesso: false, erro: 'Valor do serviço não informado ou inválido.' };
     if (!descricao) return { sucesso: false, erro: 'Descrição do serviço não informada.' };
 
+    // === VALIDAÇÃO CNPJ vs NOME (apenas pra CNPJ) ===
+    // Se for CNPJ (14 digitos), valida contra Gesthub + BrasilAPI antes de emitir.
+    // Se o nome informado divergir da razao social oficial, retorna erro estruturado
+    // pra Luna confirmar com o cliente antes de emitir errado.
+    const docClean = String(tomador_cpf_cnpj).replace(/\D/g, '');
+    if (docClean.length === 14 && tomador_nome) {
+      try {
+        const lookup = await consultarCnpj({ cnpj: docClean });
+        const razaoOficial = lookup?.cliente_interno?.razao_social
+                          || lookup?.receita_federal?.razao_social
+                          || null;
+        if (razaoOficial) {
+          // Comparação fuzzy: normaliza (uppercase, remove LTDA/ME/EIRELI, remove não-alfa)
+          const norm = (str) => String(str || '').toUpperCase()
+            .replace(/\b(LTDA|ME|EIRELI|EPP|SA|S\.A\.|S\/A|MEI)\b/g, '')
+            .replace(/[^A-Z0-9 ]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          const infNorm = norm(tomador_nome);
+          const offNorm = norm(razaoOficial);
+          // Divergencia se o nome informado nao for substring (qualquer direção) da razao oficial
+          const match = infNorm && offNorm && (offNorm.includes(infNorm) || infNorm.includes(offNorm));
+          if (!match) {
+            return {
+              sucesso: false,
+              erro: 'Divergência entre nome informado e razão social oficial do CNPJ',
+              cnpj_tomador: docClean,
+              nome_informado: tomador_nome,
+              razao_social_oficial: razaoOficial,
+              acao_necessaria: 'Luna deve confirmar com o cliente qual nome usar antes de emitir. Proposta: usar a razão social oficial ou pedir correção do CNPJ.',
+              divergencia: true,
+            };
+          }
+          console.log('[emitir_nfse] CNPJ ' + docClean + ' validado: nome informado "' + tomador_nome + '" bate com "' + razaoOficial + '"');
+        }
+      } catch (e) {
+        // Se lookup falhar (API off), loga e segue — não bloqueia emissão por indisponibilidade
+        console.warn('[emitir_nfse] validacao CNPJ falhou (seguindo sem validar):', e.message);
+      }
+    }
+
     const NFSE_SYSTEM_URL = process.env.NFSE_SYSTEM_URL || 'http://localhost:3020';
     const fmt = (v) => typeof v === 'number' ? v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : v;
     const valorNum = typeof valor === 'string' ? parseFloat(valor.replace(/[^\d.,]/g, '').replace(',', '.')) : Number(valor);

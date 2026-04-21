@@ -8,6 +8,8 @@
 
 // axios removed - using native fetch
 import { buildContext, persistTurn, extractFactsAsync } from '../luna-memory.js';
+import { detectConfidentialityLeak, pickSafeReplacement, logLeakAttempt } from '../confidentiality-vetter.js';
+import { query as _vetterQuery } from '../../db/pool.js';
 import { contextoTemporal, isHorarioComercial } from '../business-hours.js';
 import { runWithContext } from '../luna-observer.js';
 import { chatWithAgent, extractText } from '../claude.js';
@@ -22,6 +24,112 @@ const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
  */
 function stripCtx(t){ const i = t.indexOf('---FIM CONTEXTO---'); return i>=0 ? t.slice(i+'---FIM CONTEXTO---'.length).replace(/^\s+/, '') : t; }
 async function handleWhatsAppMessage(message, clientInfo, conversationInfo) {
+  // 0.0. GUARD COLABORADOR: se o remetente é da equipe Átrio (Gesthub /colaboradores),
+  //       tratamos como COMUNICAÇÃO INTERNA. Luna não responde, não alerta, não escala.
+  //       Só registra no chat da equipe com tag [INTERNO].
+  try {
+    const phoneIn = String(message?.from || message?.author || '').replace(/\D/g, '');
+    if (phoneIn) {
+      const { detectTeamMember } = await import('../team-member-guard.js');
+      const member = await detectTeamMember(phoneIn);
+      if (member) {
+        const rawText = String(message?.body || message?.content || '').trim().slice(0, 400);
+        console.log(`[TeamGuard] INTERNO: ${member.nome} (${member.areas?.join('/') || '—'}) — msg: ${rawText.slice(0, 80)}`);
+        // Registra no chat interno pra visibilidade, sem responder nem escalar
+        try {
+          const { logAgentChat } = await import('../agent-chat-logger.js').catch(() => ({}));
+          if (typeof logAgentChat === 'function') {
+            logAgentChat({
+              from: 'Sistema',
+              text: `📨 Comunicação interna de *${member.nome}* (${member.areas?.[0] || 'equipe'}): _${rawText}_`,
+              tag: 'interno',
+            });
+          }
+        } catch {}
+        return { action: 'defer', reason: 'colaborador-atrio-comunicacao-interna', _internal: true };
+      }
+    }
+  } catch (e) {
+    console.error('[TeamGuard] erro (seguindo com fluxo normal):', e.message);
+  }
+
+  // 0. GUARD DE ESCOPO — Luna só responde IMEDIATO se a intenção for inequivocamente NFS-e.
+  //    Para qualquer outra mensagem: alerta no grupo (já rola) + aguarda 5min pra humano responder.
+  //    Se 5min passaram sem humano, a Luna entra e faz triagem (luna-first-touch.js).
+  const rawText = String(message?.body || message?.content || '').trim();
+
+  const nfseIntent = /(emit\w*|nota\s*fiscal|\bnfs-?e\b|nfs\w?e)/i.test(rawText);
+  const hasDoc = /\b\d{2}\.?\d{3}\.?\d{3}[\/\-]?\d{4}?\-?\d{2}\b|\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/.test(rawText);
+  const isConfirmation = rawText.length <= 30
+    && /^(sim|ok\b|confirmo|pode (emitir|enviar|seguir)|correto|confere|certo|isso)\b/i.test(rawText);
+
+  // Verifica se existe intake NFS-e em andamento (continuação natural de coleta)
+  let nfseIntakeAtivo = false;
+  try {
+    if (conversationInfo?.id) {
+      const { query } = await import('../../db/pool.js');
+      const { rows } = await query(
+        `SELECT 1 FROM luna_v2.conversations WHERE id = $1 AND nfse_intake IS NOT NULL AND nfse_intake::text != '{}' LIMIT 1`,
+        [conversationInfo.id]
+      );
+      nfseIntakeAtivo = rows.length > 0;
+    }
+  } catch {}
+
+  // Luna responde IMEDIATO apenas quando:
+  //  - Pedido claro de NFS-e  OU
+  //  - Envio de CPF/CNPJ (tomador pra emissão)  OU
+  //  - Confirmação curta enquanto intake NFS-e está ativo
+  const lunaRespondeAgora = nfseIntent || hasDoc || (nfseIntakeAtivo && isConfirmation);
+
+  if (!lunaRespondeAgora) {
+    // Agenda Luna pra entrar daqui 5min se humano não responder
+    try {
+      const { scheduleLunaFirstTouch } = await import('../luna-first-touch.js');
+      const phone = message?.from || message?.author || null;
+      if (phone) {
+        scheduleLunaFirstTouch({
+          phone,
+          conversationId: conversationInfo?.id || null,
+          clientInfo,
+          message,
+          sendFn: async (to, text) => {
+            const wa = await import('../whatsapp.js');
+            return wa.botSend ? wa.botSend(to, text) : null;
+          },
+          log: (m) => console.log(m),
+        });
+      }
+    } catch (e) {
+      console.error('[ScopeGuard] scheduleLunaFirstTouch falhou:', e.message);
+    }
+
+    console.log(`[ScopeGuard] DEFER Luna → ${clientInfo?.legalName || 'lead'} (len=${rawText.length}) — humano tem 5min pra assumir`);
+
+    // Cria task administrativa pra equipe ver no painel (não bloqueia)
+    try {
+      fetch('http://localhost:3010/api/luna/delegate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_target: 'Rodrigo',
+          task_type: 'administrativo',
+          conversation_id: conversationInfo?.id || null,
+          client_id: clientInfo?.id || clientInfo?.gesthub_id || null,
+          payload: {
+            motivo: 'Aguardando resposta humana (Luna triagem em 5min se ninguém assumir)',
+            mensagem_original: rawText.slice(0, 2000),
+            contato: clientInfo?.contato?.nome || clientInfo?.name || null,
+          },
+        }),
+      }).catch(() => {});
+    } catch {}
+
+    // NÃO envia resposta ao cliente agora — o alerta no grupo + timer cuidam
+    return { action: 'defer', reason: 'awaiting-human-5min' };
+  }
+
+  // Luna responde — segue fluxo normal do LLM
   // 1. Formatar payload para OpenClaw
   const payload = formatMessage(message, clientInfo, conversationInfo);
 
@@ -29,9 +137,13 @@ async function handleWhatsAppMessage(message, clientInfo, conversationInfo) {
   let ctx = { block: '', conversationId: null, clientId: null };
   try {
     ctx = await buildContext({ phone: payload.phone, clientInfo });
-    // SEMPRE injeta contexto temporal (mesmo se ctx.block estiver vazio)
+    // Injeta contextoTemporal DENTRO do bloco de contexto (antes do marker ---FIM CONTEXTO---)
+    // pra que stripCtx consiga removê-lo. Antes, tempCtx vinha DEPOIS do marker e vazava pro DB.
     const tempCtx = contextoTemporal();
-    const ctxFinal = (ctx.block ? ctx.block : '') + tempCtx + '\n\n';
+    const baseBlock = ctx.block
+      ? ctx.block.replace(/---FIM CONTEXTO---\s*\n*$/, '')
+      : '---CONTEXTO---\n';
+    const ctxFinal = baseBlock + tempCtx + '\n---FIM CONTEXTO---\n\n';
     payload.mensagem = payload.mensagem || {};
     payload.mensagem.conteudo = ctxFinal + (payload.mensagem.conteudo || '');
   } catch (e) {
@@ -43,6 +155,9 @@ async function handleWhatsAppMessage(message, clientInfo, conversationInfo) {
 
   try {
     // 2. Enviar para Luna (OpenClaw) — instrumenta latencia
+    // Injeta ctx no payload pra makeLunaExecutor receber conversationId/clientId/phone corretamente
+    payload.__conversationId = ctx.conversationId;
+    payload.__clientId = ctx.clientId;
     const __t0 = Date.now();
     const result = await runWithContext(
       { conversationId: ctx.conversationId, clientId: ctx.clientId },
@@ -94,7 +209,27 @@ async function sendToOpenClaw(payload) {
 
   const resp = await chatWithAgent(lunaAgent, [{ role: 'user', content: userContent }], executor);
   if (!resp?.success) throw new Error('LLM Luna erro: ' + (resp?.error || 'desconhecido'));
-  const reply = (resp.text || '').trim() || '...';
+  let reply = (resp.text || '').trim() || '...';
+
+  // === CONFIDENTIALITY VETTER (defense-in-depth) ===
+  // Intercepta vazamento de dados internos antes de chegar no cliente.
+  // Se detectar, substitui por msg segura + loga incidente pra equipe.
+  const leakCheck = detectConfidentialityLeak(reply);
+  if (leakCheck.leak) {
+    console.error('[VETTER] Bloqueio de vazamento — pattern=' + leakCheck.pattern + ' matched=' + (leakCheck.matched || '').slice(0, 100));
+    logLeakAttempt({
+      conversationId: payload.__conversationId || null,
+      phone: payload.phone,
+      clientName: payload.cliente?.nome,
+      originalReply: reply,
+      detection: leakCheck,
+      queryFn: _vetterQuery,
+    }).catch(() => {});
+    reply = pickSafeReplacement({
+      patternId: leakCheck.pattern,
+      conversationId: payload.__conversationId || null,
+    });
+  }
   return {
     type: 'message',
     message: reply,

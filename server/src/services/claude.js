@@ -41,19 +41,51 @@ function recordTokenUsage(agentId, conversationId, model, usage) {
     const tokensInput = usage.prompt_tokens ?? usage.input_tokens ?? 0;
     const tokensOutput = usage.completion_tokens ?? usage.output_tokens ?? 0;
 
-    if (tokensInput === 0 && tokensOutput === 0) return;
+    // Prompt caching — normaliza entre providers:
+    //   Anthropic: usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    //   OpenAI/OpenRouter/xAI/DeepSeek: usage.prompt_tokens_details.cached_tokens (só leitura, sem write)
+    const cacheRead =
+         usage.cache_read_input_tokens
+      ?? usage.cache_read_tokens
+      ?? usage.prompt_tokens_details?.cached_tokens
+      ?? 0;
+    const cacheWrite =
+         usage.cache_creation_input_tokens
+      ?? usage.cache_creation_tokens
+      ?? 0;
+    // Reasoning tokens — modo thinking (cobrados como output)
+    const reasoningTokens =
+         usage.completion_tokens_details?.reasoning_tokens
+      ?? usage.reasoning_tokens
+      ?? 0;
+
+    if (tokensInput === 0 && tokensOutput === 0 && cacheRead === 0 && cacheWrite === 0) return;
 
     const pricing = MODEL_PRICING[model] || MODEL_PRICING._default;
-    const costUsd = (tokensInput / 1000) * pricing.input + (tokensOutput / 1000) * pricing.output;
+    // Custo real considerando cache:
+    //  - tokens_input: contam no preço cheio (sao tokens NOVOS, fora do cache)
+    //  - cache_read: 0.1x do preco input (90% desconto)
+    //  - cache_write: 1.25x do preco input (cobrado 1 vez ao criar)
+    const costUsd =
+        (tokensInput  / 1000) * pricing.input
+      + (cacheRead    / 1000) * pricing.input * 0.1
+      + (cacheWrite   / 1000) * pricing.input * 1.25
+      + (tokensOutput / 1000) * pricing.output;
 
     query(
-      `INSERT INTO token_usage (agent_id, conversation_id, tokens_input, tokens_output, model, cost_usd)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [agentId || null, conversationId || null, tokensInput, tokensOutput, model, costUsd]
+      `INSERT INTO token_usage (agent_id, conversation_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, model, cost_usd)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [agentId || null, conversationId || null, tokensInput, tokensOutput, cacheRead, cacheWrite, reasoningTokens, model, costUsd]
     ).then(() => { if (agentId) invalidateBudgetCache(agentId); })
      .catch(err => {
       console.error('[TokenUsage] Erro ao gravar:', err.message);
     });
+
+    // Log de cache hit quando expressivo — ajuda debug
+    if (cacheRead > 100) {
+      const hitPct = Math.round((cacheRead / (tokensInput + cacheRead)) * 100);
+      console.log(`[Cache] ${model} agent=${agentId?.slice(0, 8)} — ${cacheRead} tokens cached (${hitPct}% hit)`);
+    }
   } catch (err) {
     console.error('[TokenUsage] Erro inesperado:', err.message);
   }
@@ -103,8 +135,25 @@ const AGENT_CONFIG = {
 
 const FALLBACK_CONFIG = { provider: 'deepseek', model: 'deepseek-chat', temperature: 0.3, maxTokens: 512 };
 
-function getAgentConfig(agentName) {
-  return AGENT_CONFIG[agentName] || FALLBACK_CONFIG;
+function getAgentConfig(agentNameOrObj) {
+  // Aceita string (nome) ou objeto agent completo. Preferencia: agent.config (DB) > AGENT_CONFIG (hardcoded) > FALLBACK.
+  if (typeof agentNameOrObj === 'object' && agentNameOrObj?.config && typeof agentNameOrObj.config === 'object') {
+    const dbConfig = agentNameOrObj.config;
+    if (dbConfig.provider && dbConfig.model) {
+      return {
+        provider: dbConfig.provider,
+        model: dbConfig.model,
+        temperature: dbConfig.temperature ?? 0.3,
+        maxTokens: dbConfig.max_tokens ?? dbConfig.maxTokens ?? 1024,
+        // Extended Thinking — budget em tokens (>=1024 habilita). Só faz sentido em modelos Claude 4.5+ / Gemini 2.5 / GPT-5.
+        thinkingBudget: dbConfig.thinking_budget ?? dbConfig.thinkingBudget ?? null,
+        reasoningEffort: dbConfig.reasoning_effort ?? dbConfig.reasoningEffort ?? null,
+        use_gateway: dbConfig.use_gateway === true,
+      };
+    }
+  }
+  const name = typeof agentNameOrObj === 'string' ? agentNameOrObj : agentNameOrObj?.name;
+  return AGENT_CONFIG[name] || FALLBACK_CONFIG;
 }
 
 function getOpenAIClient(provider) {
@@ -131,7 +180,7 @@ console.log(`[LLM] Provedores: ${providers.join(', ') || 'NENHUM!'}`);
 async function sendToAnthropic(agent, messages, options = {}) {
   if (!anthropic) throw new Error('ANTHROPIC_API_KEY não configurada');
 
-  const config = getAgentConfig(agent.name);
+  const config = getAgentConfig(agent);
   const { maxTokens = config.maxTokens, temperature = config.temperature } = options;
 
   const tools = (agent.tools || []).map(tool => ({
@@ -142,16 +191,29 @@ async function sendToAnthropic(agent, messages, options = {}) {
     },
   }));
 
+  // Cache control na ULTIMA tool — cacheia o bloco inteiro de tools (alto ganho
+  // quando tem >=5 tools, raro elas mudarem entre chamadas). Anthropic aceita
+  // ate 4 cache_control por request; outros (system prompt + tools) contam separado.
+  if (tools.length > 0) {
+    tools[tools.length - 1].cache_control = { type: 'ephemeral' };
+  }
+
   const formattedMessages = messages.map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
     content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
   }));
 
   try {
+    // Extended Thinking nativo Anthropic
+    const thinkingParam = config.thinkingBudget && config.thinkingBudget >= 1024
+      ? { thinking: { type: 'enabled', budget_tokens: config.thinkingBudget } }
+      : {};
+
     const response = await anthropic.messages.create({
       model: config.model,
       max_tokens: maxTokens,
-      temperature,
+      // Quando usa thinking, temperature DEVE ser 1 (requisito Anthropic)
+      temperature: thinkingParam.thinking ? 1 : temperature,
       system: [{
         type: 'text',
         text: agent.system_prompt,
@@ -159,6 +221,7 @@ async function sendToAnthropic(agent, messages, options = {}) {
       }],
       messages: formattedMessages,
       ...(tools.length > 0 ? { tools, tool_choice: { type: 'auto' } } : {}),
+      ...thinkingParam,
     });
 
     const textBlocks = response.content.filter(b => b.type === 'text');
@@ -206,7 +269,7 @@ async function sendToOpenAI(agent, messages, options = {}) {
     return '[orçamento mensal do agente excedido — resposta indisponível]';
   }
 
-  const config = getAgentConfig(agent.name);
+  const config = getAgentConfig(agent);
   const { maxTokens = config.maxTokens, temperature = config.temperature } = options;
 
   const client = getOpenAIClient(config.provider);
@@ -223,8 +286,23 @@ async function sendToOpenAI(agent, messages, options = {}) {
     },
   }));
 
+  // Prompt caching via OpenRouter/OpenAI-compatible:
+  //   Claude (anthropic/*), Gemini 2.5+ e GPT-4 suportam cache_control em message content blocks.
+  //   Para outros (Grok, DeepSeek), system vai como string normal (nao quebra).
+  const modelLower = String(config.model || '').toLowerCase();
+  const supportsCacheControl =
+       modelLower.startsWith('anthropic/')
+    || modelLower.startsWith('claude')
+    || modelLower.includes('gemini-2')
+    || modelLower.startsWith('openai/gpt-4')
+    || modelLower.startsWith('gpt-4');
+
+  const systemContent = supportsCacheControl && agent.system_prompt?.length > 1000
+    ? [{ type: 'text', text: agent.system_prompt, cache_control: { type: 'ephemeral' } }]
+    : agent.system_prompt;
+
   const formattedMessages = [
-    { role: 'system', content: agent.system_prompt },
+    { role: 'system', content: systemContent },
     ...messages.map(m => ({
       role: m.role === 'assistant' ? 'assistant' : (m.role === 'tool' ? 'tool' : 'user'),
       content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
@@ -236,12 +314,23 @@ async function sendToOpenAI(agent, messages, options = {}) {
   ];
 
   try {
+    // Extended Thinking / Reasoning — só para modelos que suportam
+    const reasoningSupports = /claude|gemini-2|gpt-5|o[0-9]|deepseek-r/i.test(config.model || '');
+    const reasoningParam = (config.thinkingBudget || config.reasoningEffort) && reasoningSupports
+      ? {
+          reasoning: config.thinkingBudget
+            ? { max_tokens: config.thinkingBudget }
+            : { effort: config.reasoningEffort },
+        }
+      : {};
+
     const response = await client.chat.completions.create({
       model: config.model,
       messages: formattedMessages,
       max_completion_tokens: maxTokens,
       temperature,
       ...(tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
+      ...reasoningParam,
     });
 
     const choice = response.choices[0];
@@ -300,7 +389,7 @@ async function sendToOpenAI(agent, messages, options = {}) {
 // ROUTER
 // ============================================
 export async function sendToAgent(agent, messages, options = {}) {
-  const config = getAgentConfig(agent.name);
+  const config = getAgentConfig(agent);
   // Budget gate — bloqueia ou faz downgrade forçado para DeepSeek (barato)
   const budget = await checkBudget(agent);
   if (budget.blocked) {
@@ -363,8 +452,119 @@ function _summarizeToolResult(r) {
 // CHAT COM AGENTE — Tool use loop (multi-provider)
 // ============================================
 export async function chatWithAgent(agent, messages, toolExecutor = null) {
-  const config = getAgentConfig(agent.name);
+  const config = getAgentConfig(agent);
   const budget = await checkBudget(agent);
+
+  // ============================================================
+  // FEATURE-GATE: novo gateway via adapter registry.
+  // Opt-in por agente (config.use_gateway === true no DB).
+  // Só aplica se:
+  //   - não está bloqueado por budget
+  //   - não tem tools (gateway ainda não faz tool-use loop)
+  //   - registry tem o provider pronto
+  // ============================================================
+  if (config.use_gateway === true && !budget.blocked) {
+    try {
+      const { generate } = await import('./llm-gateway.js');
+      // Monta tools no formato OpenAI (inclusive pra adapters compat e openrouter)
+      const tools = (agent.tools || []).map(tool => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.input_schema || tool.parameters || { type: 'object', properties: {}, required: [] },
+        },
+      }));
+
+      // Sanitiza histórico: remove tool_calls órfãos + filtra messages 'tool'
+      // pq o DB só persiste role+content. Replay com tool_calls sem tool responses quebra.
+      const sanitized = messages.map(m => {
+        if (m.role === 'tool') return null;  // não reproduzível
+        const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+        // Descarta assistant com content vazio (originalmente só tool_calls, agora inválido)
+        if (m.role === 'assistant' && (!content || content.trim() === '')) return null;
+        return { role: m.role, content };
+      }).filter(Boolean);
+
+      // Prepend system_prompt se o agente tem um e ainda não está no histórico
+      let convo = sanitized;
+      if (agent.system_prompt && !sanitized.some(m => m.role === 'system')) {
+        convo = [{ role: 'system', content: agent.system_prompt }, ...sanitized];
+      }
+
+      let totalCost = 0, totalCached = 0;
+      for (let round = 0; round < 10; round++) {
+        const res = await generate({
+          provider: config.provider,
+          model: config.model,
+          messages: convo,
+          temperature: config.temperature,
+          maxTokens: config.maxTokens,
+          thinkingBudget: config.thinkingBudget,
+          tools: tools.length ? tools : undefined,
+          cache: true,
+          agentId: agent.id,
+        });
+        if (!res.success) {
+          console.warn('[gateway] ' + agent.name + ' falhou round=' + round + ' (' + res.error + '), fallback legacy');
+          throw new Error(res.error);  // cai pro catch → legacy path
+        }
+        totalCost += res.usage?.cost_usd || 0;
+        totalCached += res.usage?.cached_tokens || 0;
+
+        // Sem tool calls → resposta final
+        if (!res.tool_calls || res.tool_calls.length === 0) {
+          console.log('[gateway] ' + agent.name + ' via ' + config.provider + '/' + config.model + ' rounds=' + (round+1) + ' cost=$' + totalCost.toFixed(6) + ' cache=' + totalCached);
+          return {
+            success: true,
+            text: res.content || '',
+            usage: {
+              prompt_tokens: res.usage?.input_tokens || 0,
+              completion_tokens: res.usage?.output_tokens || 0,
+              total_tokens: (res.usage?.input_tokens || 0) + (res.usage?.output_tokens || 0),
+              prompt_tokens_details: { cached_tokens: totalCached },
+            },
+            provider: config.provider,
+            model: config.model,
+          };
+        }
+
+        // Com tool calls → executa e continua
+        if (!toolExecutor) {
+          console.warn('[gateway] ' + agent.name + ' pediu tools sem executor');
+          return { success: true, text: res.content || '', usage: {}, provider: config.provider, model: config.model };
+        }
+
+        // Assistant message com tool_calls
+        convo.push({
+          role: 'assistant',
+          content: res.content || '',
+          tool_calls: res.tool_calls.map(tc => ({
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments) },
+          })),
+        });
+
+        // Executa cada tool
+        for (const tc of res.tool_calls) {
+          let args = tc.arguments;
+          if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
+          const toolResult = await toolExecutor(tc.name, args, agent).catch(e => ({ error: e.message }));
+          convo.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          });
+        }
+      }
+      console.warn('[gateway] ' + agent.name + ' excedeu 10 rounds de tool-use');
+      return { success: false, error: 'loop de ferramentas excedido', text: '[loop de ferramentas excedido]', provider: config.provider, model: config.model };
+    } catch (e) {
+      console.warn('[gateway] exception em ' + agent.name + ':', e.message, '— caindo pro legacy');
+    }
+  }
+
   if (budget.blocked) {
     console.warn(`[Budget] ${agent.name} BLOQUEADO ($${budget.spent}/$${budget.budget}). Downgrade -> deepseek.`);
     const forced = { ...agent, _forceProvider: 'deepseek', _budgetBlocked: true };

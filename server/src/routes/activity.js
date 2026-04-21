@@ -2,13 +2,14 @@
 // Endpoints de consulta ao activity_log imutável.
 
 import { listEvents, summary24h } from '../services/activity-log.js';
+import { humanizeMany } from '../services/activity-humanizer.js';
 import { query } from '../db/pool.js';
 
 export function registerActivityRoutes(app) {
   app.get('/api/activity', async (req, res) => {
     try {
       const rows = await listEvents(req.query);
-      res.json({ ok: true, data: rows });
+      res.json({ ok: true, data: humanizeMany(rows) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 

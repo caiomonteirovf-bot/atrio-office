@@ -1,4 +1,5 @@
 import { query } from '../db/pool.js';
+import { humanizeErrorShort } from './error-humanizer.js';
 import { logEvent } from './activity-log.js';
 import { chatWithAgent } from './claude.js';
 import { executeToolCall } from '../tools/registry.js';
@@ -91,8 +92,12 @@ export async function processTask(taskId) {
 
     // Chat: Rodrigo delega para o agente — extrai info da metadata para mensagem rica
     const clienteName = originalMeta?.cliente_nome || extractClientName(task, originalMeta);
-    const isNfseTask = task.title?.includes('[NFSE]') || task.title?.includes('[FISCAL]')
-      || /nfs.?-?e|nota fiscal|emiss[aã]o|emitir/i.test(task.title || '');
+    // Estrito: só é NFS-e se tag explícita [NFSE] OU tiver 'nota' + 'emitir/emissão' juntos.
+    // Tag [FISCAL] NÃO é suficiente — é categoria ampla (imposto, guia, declaração, etc).
+    const t = task.title || '';
+    const hasNfseTag = t.includes('[NFSE]');
+    const hasNotaEmit = /(emitir|emiss[aã]o)/i.test(t) && /(nota|nfs.?-?e)/i.test(t);
+    const isNfseTask = hasNfseTag || hasNotaEmit;
     const parsedFields = originalMeta?.parsed_fields || {};
 
     // Notificação no chat: sistema informa que task foi delegada
@@ -233,25 +238,111 @@ Execute a tarefa usando suas ferramentas disponíveis e retorne o resultado.`;
       let chatResult;
       let statusEmoji = '✅';
       if (isNfseTask) {
-        const sucesso = response.text?.match(/"sucesso"\s*:\s*true/);
+        // Detecção ampla de sucesso: JSON, texto Markdown, ou toolCall ok
+        const sucessoJson = response.text?.match(/"sucesso"\s*:\s*true/);
+        const sucessoMd = response.text?.match(/NFS-?e\s+(criada|emitida|autorizada)\s+com\s+sucesso/i)
+                       || response.text?.match(/ATR\d{6,}/)
+                       || response.text?.match(/N[úu]mero\s+da\s+NFS-?e\s*[:\s]*\*?\*?\s*\d+/i);
+        const emitirOk = toolCalls.some(c => /emitir_nfse/.test(c?.name || '') && c?.ok === true);
+        const sucesso = sucessoJson || sucessoMd || emitirOk;
         if (sucesso) {
-          chatResult = `NFS-e de ${clienteName} emitida com sucesso!`;
+          // Extrai número pra mostrar no chat
+          const numMatch = response.text?.match(/ATR\d+/)
+                        || response.text?.match(/N[úu]mero[^:]{0,30}[:\s]+\*?\*?\s*(\d+)/i);
+          const numTxt = numMatch ? (numMatch[0].match(/ATR\d+/)?.[0] || ('nº ' + numMatch[1])) : '';
+          chatResult = `NFS-e de ${clienteName} emitida com sucesso${numTxt ? ' (' + numTxt + ')' : ''}!`;
         } else {
           statusEmoji = '⚠️';
-          // Extrai motivo real do resultado do Campelo
+
+          // 1) Tenta extrair motivo explícito da resposta
           const erroApi = response.text?.match(/`([^`]*(?:CPF|CNPJ|campo|inválido|obrigatório)[^`]*)`/i);
           const bloqueado = response.text?.match(/BLOQUEADO[^—]*—\s*(.+?)(?:\n|$)/);
           const acao = response.text?.match(/[Aa][çc][ãa]o [Nn]ecess[áa]ria[:\s]*\*?\*?\s*(.+?)(?:\n|$)/);
-          const motivo = erroApi?.[1] || bloqueado?.[1]?.trim() || acao?.[1]?.replace(/\*/g, '').trim() || 'dados insuficientes';
-          chatResult = `NFS-e de ${clienteName} pendente: ${motivo}. Equipe, verifiquem e reenviem.`;
+          const divergencia = response.text?.match(/(?:diverg[êe]ncia|n[ãa]o\s+bate)[^.]{0,200}/i);
+
+          // 2) Identifica campos faltantes a partir do parsedFields da task
+          const camposObrigatorios = {
+            tomador_cpf_cnpj: 'CPF ou CNPJ do tomador',
+            tomador_nome: 'Nome/razão social do tomador',
+            valor: 'Valor do serviço',
+            descricao: 'Descrição do serviço',
+          };
+          const faltando = [];
+          for (const [campo, label] of Object.entries(camposObrigatorios)) {
+            const v = parsedFields?.[campo];
+            if (!v || String(v).trim() === '' || String(v).trim() === 'null') {
+              faltando.push(label);
+            }
+          }
+
+          // 3) Extrai tool_failures (erros das tools do Campelo)
+          const toolErrs = (response.tool_calls || response.toolCalls || [])
+            .filter(tc => tc && tc.error)
+            .map(tc => String(tc.error).slice(0, 120))
+            .join(' | ');
+
+          // 4) Monta motivo final — específico e acionável
+          let motivo;
+          if (faltando.length > 0) {
+            motivo = 'faltam: ' + faltando.join(', ');
+          } else if (divergencia) {
+            motivo = divergencia[0].trim();
+          } else if (erroApi) {
+            motivo = erroApi[1];
+          } else if (bloqueado) {
+            motivo = bloqueado[1].trim();
+          } else if (acao) {
+            motivo = acao[1].replace(/\*/g, '').trim();
+          } else if (toolErrs) {
+            motivo = 'erro de tool: ' + toolErrs;
+          } else {
+            motivo = 'causa não identificada no retorno do agente — revisar o texto completo na task';
+          }
+
+          // 5) Monta resumo de dados COLETADOS pra equipe ver o que chegou
+          const dadosColetados = [];
+          if (parsedFields?.tomador_cpf_cnpj) dadosColetados.push('CNPJ/CPF: ' + parsedFields.tomador_cpf_cnpj);
+          if (parsedFields?.tomador_nome) dadosColetados.push('Tomador: ' + parsedFields.tomador_nome);
+          if (parsedFields?.valor) dadosColetados.push('Valor: ' + parsedFields.valor);
+          if (parsedFields?.descricao) dadosColetados.push('Descrição: ' + String(parsedFields.descricao).slice(0, 60));
+          const resumoDados = dadosColetados.length ? '\nDados recebidos: ' + dadosColetados.join(' | ') : '';
+
+          chatResult = 'NFS-e de ' + clienteName + ' pendente.\nMotivo: ' + motivo + '.' + resumoDados + '\nEquipe: verifiquem e reenviem.';
         }
       } else {
-        chatResult = `Tarefa de ${clienteName} concluída.`;
+        // Task não-NFSe: titulo + preview dos clientes/detalhes do description + resposta do agente
+        const cleanTitle = (task.title || 'Tarefa').replace(/^\[[^\]]+\]\s*/, '').slice(0, 100);
+
+        // 1) Pega as primeiras linhas úteis do DESCRIPTION da task (onde a lista de clientes vive)
+        const descLines = String(task.description || '')
+          .split('\n')
+          .map(l => l.trim())
+          .filter(l => l.length > 0 && !l.startsWith('Classificação:') && !l.startsWith('Prioridade:') && !l.startsWith('Responsável humano:'));
+        // Prioriza linhas que começam com "-" (itens de lista — clientes)
+        const listItems = descLines.filter(l => l.startsWith('-'));
+        let detalheDesc = '';
+        if (listItems.length > 0) {
+          const preview = listItems.slice(0, 5).join('\n');
+          const restante = listItems.length - 5;
+          detalheDesc = preview + (restante > 0 ? `\n... e mais ${restante} item(ns). Ver task #${String(task.id).substring(0, 8)} no painel.` : '');
+        } else if (descLines.length > 0) {
+          detalheDesc = descLines.slice(0, 3).join(' — ').slice(0, 400);
+        }
+
+        // 2) Resposta do agente (o que ele FEZ) — primeira linha significativa
+        const agentLine = String(response.text || '')
+          .split('\n')
+          .map(l => l.trim())
+          .filter(l => l && !l.startsWith('#') && !l.startsWith('```') && l.length > 15)[0] || '';
+        const acaoAgente = agentLine ? '\n📝 ' + agentLine.slice(0, 200) + (agentLine.length > 200 ? '...' : '') : '';
+
+        const clientePart = clienteName ? ` — ${clienteName}` : '';
+        chatResult = `${cleanTitle}${clientePart}${detalheDesc ? '\n\n' + detalheDesc : ''}${acaoAgente}`;
       }
       chat({ from: agent.name, text: `${statusEmoji} ${chatResult}`, tag: isNfseTask ? 'nfs-e' : 'concluído' });
 
       // Responde ao cliente se for NFS-e/fiscal
-      await notifyClientIfNfse(task, response.text, originalMeta);
+      await notifyClientIfNfse(task, response.text, originalMeta, toolCalls);
     } else {
       const blockReason = response.error
         || (toolFailures.length ? `tool ${toolFailures[0].name || 'desconhecida'} falhou: ${toolFailures[0].summary || 'sem detalhe'}` : 'sem detalhe');
@@ -261,9 +352,10 @@ Execute a tarefa usando suas ferramentas disponíveis e retorne o resultado.`;
       broadcastFn?.({ type: 'task_blocked', task: { id: taskId, title: task.title, assigned_name: task.assigned_name, status: 'blocked' } });
 
       // Chat: avisa equipe com motivo REAL da falha (nao so 'erro generico')
+      const motivoHumano = humanizeErrorShort(blockReason);
       const chatMsg = isNfseTask
-        ? `NFS-e de ${clienteName || 'cliente'} FALHOU: ${String(blockReason).slice(0, 160)}. Equipe, revisem no NFS-e System.`
-        : `Tarefa de ${clienteName || 'cliente'} BLOQUEADA: ${String(blockReason).slice(0, 160)}.`;
+        ? `NFS-e de ${clienteName || 'cliente'} não foi emitida: ${motivoHumano} Equipe, revisem no NFS-e System.`
+        : `Tarefa de ${clienteName || 'cliente'} ficou bloqueada: ${motivoHumano}`;
       chat({ from: agent.name, text: `⚠️ ${chatMsg}`, tag: isNfseTask ? 'nfs-e' : 'bloqueado' });
       // continua com o fluxo original (createNotification abaixo)
 
@@ -277,12 +369,8 @@ Execute a tarefa usando suas ferramentas disponíveis e retorne o resultado.`;
         taskId,
       }).catch(() => {});
 
-      // Chat: agente reporta bloqueio
-      // Notificação no chat: task bloqueada
-      const erroLimpo = (response.error || 'Erro desconhecido').substring(0, 150);
-      chat({ from: agent.name, text: `🚫 Bloqueado: ${erroLimpo}. Verifiquem os dados e reenviem a task.`, tag: 'bloqueado' });
-
-      await notifyTeamFailure(task, response.error);
+      // (mensagem de bloqueio já emitida acima — evita duplicata no chat)
+      await notifyTeamFailure(task, blockReason || response.error);
     }
   } catch (err) {
     console.error(`[Orchestrator] Erro task ${taskId}:`, err.message);
@@ -317,7 +405,7 @@ export async function processPendingTasks() {
 // ============================================
 // NOTIFICA CLIENTE VIA WHATSAPP (Luna responde)
 // ============================================
-async function notifyClientIfNfse(task, agentText, originalMeta) {
+async function notifyClientIfNfse(task, agentText, originalMeta, toolCalls) {
   const isNfse = task.title?.includes('[NFSE]') || task.title?.includes('[FISCAL]');
   if (!isNfse) return;
 
@@ -326,9 +414,18 @@ async function notifyClientIfNfse(task, agentText, originalMeta) {
 
   console.log(`[NFS-e] Resultado do Campelo para ${clientName}`);
 
-  // Verifica status do resultado do Campelo
-  const sucessoMatch = agentText?.match(/"sucesso"\s*:\s*true/);
-  const processandoMatch = agentText?.match(/"status_nfse"\s*:\s*"processando"/) || agentText?.match(/"processando"/);
+  // Verifica status do resultado do Campelo — aceita formato JSON e Markdown
+  const sucessoJson = agentText?.match(/"sucesso"\s*:\s*true/);
+  const sucessoMd = agentText?.match(/NFS-?e\s+(criada|emitida)\s+com\s+sucesso/i)
+                 || agentText?.match(/(ATR\d{6,}|N[úu]mero\s+da\s+NFS-?e)/i);
+  // Fallback via tool result — mais confiavel que regex quando agent retorna so JSON puro
+  const emitirToolOk = (toolCalls || []).some(c =>
+    /emitir_nfse/.test(c && c.name || "") && (c && c.ok === true || /sucesso["\'\s:]*true/i.test(String((c && c.summary) || "")))
+  );
+  const sucessoMatch = sucessoJson || sucessoMd || emitirToolOk;
+  const processandoMatch = agentText?.match(/"status_nfse"\s*:\s*"processando"/)
+                        || agentText?.match(/status[^\n]{0,20}processando/i)
+                        || agentText?.match(/(?:enviada|processando)\s+(?:para|pela)\s+(nuvem\s+fiscal|prefeitura)/i);
 
   // Extrai motivos de pendência do resultado do Campelo (JSON ou Markdown)
   const erroMatch = agentText?.match(/"erro"\s*:\s*"([^"]+)"/);
@@ -346,17 +443,91 @@ async function notifyClientIfNfse(task, agentText, originalMeta) {
   let alertMsg;
   let chatStatus;
 
+  // Se sucesso, tenta extrair numero e buscar detalhes no NFS-e System
+  let nfseDetails = null;
+  if (sucessoMatch) {
+    // Extrai numero — formato ATR12345678 OU "Número da NFS-e: 30" OU outros padrões
+    const numMatch = agentText?.match(/(?:ATR\d{6,})/)
+                  || agentText?.match(/N[úu]mero[^:]*NFS-?e[:\s]*\*?\*?\s*(\d+)/i)
+                  || agentText?.match(/NFS-?e[:\s]+n[º°]?\s*(\d+)/i);
+    const numero = numMatch ? (numMatch[0].match(/ATR\d+/) ? numMatch[0].match(/ATR\d+/)[0] : numMatch[1]) : null;
+    if (numero) {
+      try {
+        const NFSE_URL = process.env.NFSE_SYSTEM_URL || 'http://localhost:3020';
+        const resp = await fetch(`${NFSE_URL}/api/nfses?numero=${encodeURIComponent(numero)}`);
+        const data = await resp.json();
+        if (data?.ok && data.data?.length) {
+          nfseDetails = data.data[0];
+        } else {
+          // Fallback: lista recentes e pega a mais nova pro mesmo prestador
+          const resp2 = await fetch(`${NFSE_URL}/api/nfses?limit=5`);
+          const data2 = await resp2.json();
+          if (data2?.ok && data2.data?.length) nfseDetails = data2.data[0];
+        }
+      } catch (e) { console.error('[orchestrator] fetch NFS-e details falhou:', e.message); }
+    }
+  }
+
   if (sucessoMatch && !processandoMatch) {
-    // SUCESSO — notifica equipe, equipe envia ao cliente manualmente
-    alertMsg = `📄 *NFS-e emitida com sucesso*\nCliente: ${clientName}\n\n_Equipe: enviar PDF ao cliente._`;
-    chatStatus = `NFS-e de ${firstName} emitida com sucesso. Equipe notificada para enviar ao cliente.`;
+    // SUCESSO — notifica equipe com DETALHES completos + link da prefeitura
+    const valorFmt = nfseDetails?.valorServicos
+      ? 'R$ ' + Number(nfseDetails.valorServicos).toFixed(2).replace('.', ',')
+      : '';
+    const detalhes = nfseDetails
+      ? `\nNota nº *${nfseDetails.numero}* (série ${nfseDetails.serie || '1'})`
+        + `\nPrestador: ${nfseDetails.prestadorRazaoSocial || clientName}`
+        + `\nTomador: ${nfseDetails.tomadorRazaoSocial || nfseDetails.tomadorNome || '—'} (${nfseDetails.tomadorCpfCnpj || '—'})`
+        + `\nValor: ${valorFmt}`
+        + (nfseDetails.descricaoServico ? `\nDescrição: ${nfseDetails.descricaoServico}` : '')
+        + (nfseDetails.linkUrl ? `\n\nConsulta pública:\n${nfseDetails.linkUrl}` : '')
+      : `\nCliente: ${clientName}`;
+    alertMsg = `📄 *NFS-e emitida com sucesso*${detalhes}\n\n_Equipe: nota disponível no sistema._`;
+    chatStatus = `NFS-e de ${firstName} emitida com sucesso${nfseDetails?.numero ? ' (nº ' + nfseDetails.numero + ')' : ''}. Equipe notificada.`;
+
+    // Envia também via sendNfseToGroup (formato dedicado, com link)
+    try {
+      await sendNfseToGroup({
+        pdfBase64: null, // NFS-e System não gera PDF — usa fallback (só caption)
+        clienteNome: nfseDetails?.prestadorRazaoSocial || clientName,
+        tomadorNome: nfseDetails?.tomadorRazaoSocial || nfseDetails?.tomadorNome || '—',
+        tomadorDoc: nfseDetails?.tomadorCpfCnpj || '—',
+        valor: nfseDetails?.valorServicos || 0,
+        numeroNfse: nfseDetails?.numero || null,
+        taskId: task.id,
+      });
+    } catch (e) { console.error('[orchestrator] sendNfseToGroup falhou:', e.message); }
   } else if (sucessoMatch && processandoMatch) {
     // PROCESSANDO na prefeitura — notifica equipe
-    alertMsg = `⏳ *NFS-e processando na prefeitura*\nCliente: ${clientName}\n\n_Aguardando autorização. Equipe acompanhar._`;
-    chatStatus = `NFS-e de ${firstName} enviada para a prefeitura, aguardando autorização. Equipe notificada.`;
+    const detalhes = nfseDetails
+      ? `\nNota nº *${nfseDetails.numero}*\nTomador: ${nfseDetails.tomadorRazaoSocial || nfseDetails.tomadorNome || '—'}\nValor: R$ ${Number(nfseDetails.valorServicos || 0).toFixed(2).replace('.', ',')}`
+      : `\nCliente: ${clientName}`;
+    alertMsg = `⏳ *NFS-e processando na prefeitura*${detalhes}\n\n_Aguardando autorização. Equipe acompanhar._`;
+    chatStatus = `NFS-e de ${firstName} enviada para a prefeitura. Equipe notificada.`;
   } else {
     // FALHA — notifica equipe com detalhes acionáveis
-    const detalhes = pendencia || 'Dados insuficientes para emissão';
+    // Identifica campos faltantes no parsed_fields da task (usa mesma lógica do chat do orchestrator)
+    const parsedFields = originalMeta?.parsed_fields || {};
+    const camposObrigatorios = {
+      tomador_cpf_cnpj: 'CPF/CNPJ do tomador',
+      tomador_nome: 'Nome/razão social do tomador',
+      valor: 'Valor do serviço',
+      descricao: 'Descrição do serviço',
+    };
+    const faltando = [];
+    for (const [campo, label] of Object.entries(camposObrigatorios)) {
+      const v = parsedFields?.[campo];
+      if (!v || String(v).trim() === '' || String(v).trim() === 'null') faltando.push(label);
+    }
+
+    // Motivo final — lista específica > pendencia LLM > fallback
+    let detalhes;
+    if (faltando.length > 0) {
+      detalhes = 'Faltam: ' + faltando.join(', ');
+    } else if (pendencia) {
+      detalhes = pendencia;
+    } else {
+      detalhes = 'Causa não identificada no retorno do Campelo — revisar a task no banco';
+    }
 
     // Extrai erros específicos da API do resultado
     const erroApiMatch = agentText?.match(/`([^`]{10,150})`/g)?.map(s => s.replace(/`/g, '')).filter(s => /CPF|CNPJ|campo|inválido|obrigat|DPS|série|valor|alíquota|código|tributação/i.test(s));
@@ -364,7 +535,9 @@ async function notifyClientIfNfse(task, agentText, originalMeta) {
 
     // Identifica onde corrigir
     let ondeCorrigir = '';
-    if (/CPF|CNPJ/i.test(detalhes + (errosApi || ''))) {
+    if (faltando.length > 0) {
+      ondeCorrigir = '\nOnde corrigir: Luna não coletou todos os dados — revisar fluxo de intake com o cliente';
+    } else if (/CPF|CNPJ/i.test(detalhes + (errosApi || ''))) {
       ondeCorrigir = '\nOnde corrigir: Cadastro do tomador ou pedir dado correto ao cliente';
     } else if (/série|DPS/i.test(detalhes)) {
       ondeCorrigir = '\nOnde corrigir: Configuração da série DPS no NFS-e System';
@@ -374,7 +547,16 @@ async function notifyClientIfNfse(task, agentText, originalMeta) {
       ondeCorrigir = '\nOnde corrigir: Dados de valor/alíquota informados pelo cliente';
     }
 
-    alertMsg = `⚠️ *NFS-e pendente*\nCliente: ${clientName}\nMotivo: ${detalhes}${errosApi}${ondeCorrigir}\n\n_Equipe: corrigir e reemitir._`;
+    // Resumo dos dados que CHEGARAM (pra equipe não precisar abrir a task)
+    const dadosColetados = [];
+    if (parsedFields?.tomador_cpf_cnpj) dadosColetados.push('CNPJ/CPF: ' + parsedFields.tomador_cpf_cnpj);
+    if (parsedFields?.tomador_nome) dadosColetados.push('Tomador: ' + parsedFields.tomador_nome);
+    if (parsedFields?.valor) dadosColetados.push('Valor: ' + parsedFields.valor);
+    if (parsedFields?.descricao) dadosColetados.push('Descrição: ' + String(parsedFields.descricao).slice(0, 60));
+    if (parsedFields?.prestador_cnpj) dadosColetados.push('Prestador: ' + parsedFields.prestador_cnpj);
+    const resumoDados = dadosColetados.length ? '\nDados recebidos: ' + dadosColetados.join(' | ') : '';
+
+    alertMsg = `⚠️ *NFS-e pendente*\nCliente: ${clientName}\nMotivo: ${detalhes}${errosApi}${ondeCorrigir}${resumoDados}\n\n_Equipe: corrigir e reemitir._`;
     chatStatus = `NFS-e de ${firstName} pendente. Motivo: ${detalhes}. Equipe notificada.`;
   }
 
@@ -421,9 +603,18 @@ async function findClientChatId(task, originalMeta) {
 
 function extractClientName(task, originalMeta) {
   if (originalMeta?.cliente_nome) return originalMeta.cliente_nome;
-  // Extrai do título: "[FISCAL] Solicitação de ... — Nome"
-  const match = task.title?.match(/—\s*(.+)$/);
-  return match?.[1]?.trim() || 'Cliente';
+  if (originalMeta?.prestador_nome) return originalMeta.prestador_nome;
+  // task.result pode ter client_id com nome
+  try {
+    const r = typeof task.result === 'string' ? JSON.parse(task.result) : task.result;
+    if (r?.cliente_nome) return r.cliente_nome;
+    if (r?.prestador_nome) return r.prestador_nome;
+  } catch {}
+  // Extrai do título: "[FISCAL] ... — Nome" (padrão antigo)
+  const matchDash = task.title?.match(/—\s*(.+)$/);
+  if (matchDash) return matchDash[1].trim();
+  // Sem cliente claro — retorna null (caller decide como mostrar)
+  return null;
 }
 
 // ============================================
@@ -532,3 +723,64 @@ export async function recoverStrandedTasks({ maxAgeMinutes = STRANDED_AFTER_MINU
     return { scanned: 0, retried: 0, blocked: 0, error: err.message };
   }
 }
+
+// ============================================
+// REPLY TO COMMENT — quando agente é mencionado em task_comment,
+// orchestrator carrega contexto + comment e pede resposta.
+// O texto retornado pelo agente vira um novo comment no thread.
+// ============================================
+export async function replyToComment({ task_id, agent, trigger_comment }) {
+  try {
+    // Carrega histórico da task + comments (últimos 10)
+    const { rows: taskRows } = await query('SELECT * FROM tasks WHERE id = $1', [task_id]);
+    if (!taskRows.length) return null;
+    const task = taskRows[0];
+
+    const { rows: comments } = await query(
+      `SELECT author_name, content, created_at FROM task_comments
+        WHERE task_id = $1 ORDER BY created_at ASC LIMIT 10`,
+      [task_id]
+    );
+
+    const transcript = comments.map(c => `${c.author_name}: ${c.content}`).join('\n');
+    const prompt = `Você foi mencionado em uma task do escritório Átrio.
+
+Task: ${task.title}
+Status atual: ${task.status}
+
+HISTÓRICO DE COMENTÁRIOS:
+${transcript}
+
+ÚLTIMO COMENTÁRIO (que te mencionou):
+${trigger_comment.author_name}: ${trigger_comment.content}
+
+Responda de forma direta, concisa (2-4 frases). Se precisar de mais informação, peça. Se houver alguma ação que depende de outro agente, use @NomeDoAgente.`;
+
+    const { chatWithAgent } = await import('./claude.js');
+    const { executeToolCall } = await import('../tools/registry.js');
+
+    const response = await chatWithAgent(agent, [{ role: 'user', content: prompt }], executeToolCall);
+    if (!response.success) {
+      console.error('[replyToComment]', agent.name, 'falhou:', response.error);
+      return null;
+    }
+
+    // Posta resposta como comment
+    const { addComment } = await import('./task-comments.js');
+    await addComment({
+      task_id,
+      author_type: 'agent',
+      author_id: agent.id,
+      author_name: agent.name,
+      content: response.text || 'Processado.',
+      metadata: { trigger_comment_id: trigger_comment.id, model: response.provider },
+    });
+
+    broadcastFn?.({ type: 'task_comment', task_id });
+    return response.text;
+  } catch (err) {
+    console.error('[replyToComment] erro:', err.message);
+    return null;
+  }
+}
+

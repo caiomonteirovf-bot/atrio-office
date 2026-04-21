@@ -570,7 +570,7 @@ function DetailPanel({ mem, onClose, onToggleRag, onArchive }) {
             ? { borderColor: 'rgba(34,197,94,0.3)', background: 'rgba(34,197,94,0.08)', color: '#22c55e' }
             : { borderColor: 'var(--ao-border)', background: 'transparent', color: 'var(--ao-text-secondary)' }),
         }}>
-          {mem.is_rag_enabled ? '● RAG ativo' : '○ Ativar RAG'}
+          {mem.is_rag_enabled ? '● Em uso pelos agentes' : '○ Ativar no RAG'}
         </button>
         <button onClick={onArchive} style={{
           padding: '8px 14px', borderRadius: 8, border: '1px solid rgba(248,113,113,0.2)',
@@ -921,9 +921,25 @@ function HistoryView() {
 function CreateModal({ agents, onClose, onCreated }) {
   const [mode, setMode] = useState('write')  // 'write' | 'import'
   const [form, setForm] = useState({
-    agent_id: '', category: 'general', title: '', content: '', summary: '', scope_type: 'global', priority: 0,
+    agent_id: '', category: 'general', title: '', content: '', summary: '',
+    scope_type: 'global', scope_id: null, scope_client_id: null, priority: 0,
   })
   const [saving, setSaving] = useState(false)
+  // Melhoria RAG abr/2026: permite criar memória para um cliente ou contato (sócio) específico
+  const [clients, setClients] = useState([])
+  const [contacts, setContacts] = useState([])
+  const [loadingContacts, setLoadingContacts] = useState(false)
+  useEffect(() => {
+    fetch('/api/memory/clients').then(r => r.json()).then(setClients).catch(() => setClients([]))
+  }, [])
+  useEffect(() => {
+    if (!form.scope_client_id) { setContacts([]); return }
+    setLoadingContacts(true)
+    fetch(`/api/memory/clients/${form.scope_client_id}/contacts`)
+      .then(r => r.json()).then(d => setContacts(Array.isArray(d) ? d : []))
+      .catch(() => setContacts([]))
+      .finally(() => setLoadingContacts(false))
+  }, [form.scope_client_id])
   const [importFile, setImportFile] = useState(null)
   const [importPreview, setImportPreview] = useState(null)
   const [importError, setImportError] = useState(null)
@@ -993,14 +1009,25 @@ function CreateModal({ agents, onClose, onCreated }) {
     if (!form.title || !form.content) return
     setSaving(true)
     try {
-      await fetch('/api/memory', {
+      const payload = {
+        title: form.title,
+        content: form.content,
+        summary: form.summary,
+        category: form.category,
+        scope_type: form.scope_type,
+        agent_id: form.scope_type === 'agent' ? (form.agent_id || null) : null,
+        scope_id: (form.scope_type === 'client' || form.scope_type === 'contact') ? form.scope_id : null,
+        status: 'approved',
+        priority: form.priority,
+      }
+      const resp = await fetch('/api/memory/knowledge', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...form,
-          status: 'approved',
-          metadata: importPreview ? { source_type: 'markdown_import', filename: importFile?.name, frontmatter: importPreview.frontmatter } : undefined,
-        }),
+        body: JSON.stringify(payload),
       })
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}))
+        throw new Error(err.error || `HTTP ${resp.status}`)
+      }
       onCreated?.()
     } catch (e) { console.error(e) }
     setSaving(false)
@@ -1083,17 +1110,73 @@ function CreateModal({ agents, onClose, onCreated }) {
           </div>
         )}
 
-        {/* Agent selector */}
-        <FormField label="Para quem?">
+        {/* Scope selector — Melhoria RAG abr/2026 */}
+        <FormField label="Escopo — a quem esta regra se aplica?">
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            <ChipBtn active={!form.agent_id} onClick={() => setForm(f => ({ ...f, agent_id: '', scope_type: 'global' }))}
-              color={gold}>Todos</ChipBtn>
-            {agents.map(a => (
-              <ChipBtn key={a.id} active={form.agent_id === a.id}
-                onClick={() => setForm(f => ({ ...f, agent_id: a.id, scope_type: 'agent' }))}
-                color={AGENT_COLORS[a.name] || gold}>{a.name}</ChipBtn>
-            ))}
+            <ChipBtn active={form.scope_type === 'global'}
+              onClick={() => setForm(f => ({ ...f, scope_type: 'global', agent_id: '', scope_id: null, scope_client_id: null }))}
+              color={gold}>Todos os agentes</ChipBtn>
+            <ChipBtn active={form.scope_type === 'agent'}
+              onClick={() => setForm(f => ({ ...f, scope_type: 'agent', scope_id: null, scope_client_id: null }))}
+              color={gold}>Um agente</ChipBtn>
+            <ChipBtn active={form.scope_type === 'client'}
+              onClick={() => setForm(f => ({ ...f, scope_type: 'client', agent_id: '', scope_id: null, scope_client_id: null }))}
+              color={gold}>Um cliente</ChipBtn>
+            <ChipBtn active={form.scope_type === 'contact'}
+              onClick={() => setForm(f => ({ ...f, scope_type: 'contact', agent_id: '', scope_id: null, scope_client_id: null }))}
+              color={gold}>Um contato / sócio</ChipBtn>
           </div>
+
+          {form.scope_type === 'agent' && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+              {agents.map(a => (
+                <ChipBtn key={a.id} active={form.agent_id === a.id}
+                  onClick={() => setForm(f => ({ ...f, agent_id: a.id }))}
+                  color={AGENT_COLORS[a.name] || gold}>{a.name}</ChipBtn>
+              ))}
+            </div>
+          )}
+
+          {form.scope_type === 'client' && (
+            <div style={{ marginTop: 8 }}>
+              <select value={form.scope_id || ''} onChange={e => setForm(f => ({ ...f, scope_id: e.target.value || null }))}
+                style={{ width: '100%', padding: '8px 12px', borderRadius: 8, background: 'var(--ao-input-bg)',
+                         border: '1px solid var(--ao-input-border)', color: 'var(--ao-text-primary)', fontSize: 13 }}>
+                <option value="">— Selecione o cliente —</option>
+                {clients.map(c => (
+                  <option key={c.id} value={c.id}>{c.nome}{c.cnpj ? ` (${c.cnpj})` : ''}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {form.scope_type === 'contact' && (
+            <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+              <select value={form.scope_client_id || ''} onChange={e => setForm(f => ({ ...f, scope_client_id: e.target.value || null, scope_id: null }))}
+                style={{ width: '100%', padding: '8px 12px', borderRadius: 8, background: 'var(--ao-input-bg)',
+                         border: '1px solid var(--ao-input-border)', color: 'var(--ao-text-primary)', fontSize: 13 }}>
+                <option value="">— 1º selecione a empresa —</option>
+                {clients.map(c => (
+                  <option key={c.id} value={c.id}>{c.nome}{c.cnpj ? ` (${c.cnpj})` : ''}</option>
+                ))}
+              </select>
+              {form.scope_client_id && (
+                <select value={form.scope_id || ''} onChange={e => setForm(f => ({ ...f, scope_id: e.target.value || null }))}
+                  disabled={loadingContacts || !contacts.length}
+                  style={{ width: '100%', padding: '8px 12px', borderRadius: 8, background: 'var(--ao-input-bg)',
+                           border: '1px solid var(--ao-input-border)', color: 'var(--ao-text-primary)', fontSize: 13 }}>
+                  <option value="">
+                    {loadingContacts ? 'Carregando contatos...'
+                      : contacts.length ? '— 2º selecione o contato —'
+                      : 'Nenhum contato cadastrado nesta empresa'}
+                  </option>
+                  {contacts.map(c => (
+                    <option key={c.id} value={`${form.scope_client_id}:${c.id}`}>{c.nome}{c.funcao ? ` — ${c.funcao}` : ''}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
         </FormField>
 
         {/* Category */}
@@ -1147,7 +1230,10 @@ function CreateModal({ agents, onClose, onCreated }) {
             padding: '10px 20px', borderRadius: 8, border: '1px solid var(--ao-border)',
             background: 'transparent', color: 'var(--ao-text-secondary)', fontSize: 13, cursor: 'pointer',
           }}>Cancelar</button>
-          <button onClick={handleSubmit} disabled={!form.title || !form.content || saving} style={{
+          <button onClick={handleSubmit} disabled={!form.title || !form.content || saving
+            || (form.scope_type === 'agent' && !form.agent_id)
+            || (form.scope_type === 'client' && !form.scope_id)
+            || (form.scope_type === 'contact' && (!form.scope_client_id || !form.scope_id))} style={{
             padding: '10px 24px', borderRadius: 8, border: '1px solid rgba(196,149,106,0.3)',
             background: 'rgba(196,149,106,0.12)', color: gold, fontSize: 13, fontWeight: 600,
             cursor: (!form.title || !form.content || saving) ? 'not-allowed' : 'pointer',

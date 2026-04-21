@@ -5,9 +5,12 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import { tenantMiddleware } from './services/tenant-context.js';
 import { query } from './db/pool.js';
 import { chatWithAgent, extractText } from './services/claude.js';
+import { humanizeError } from './services/error-humanizer.js';
 import { startWatchdog } from './services/luna-watchdog.js';
+import { startRegressionDetector, runDetector } from './services/luna-regression-detector.js';
 import { executeToolCall, setOnTaskCreated } from './tools/registry.js';
 import { processTask, processPendingTasks, setBroadcast, setLogChat, recoverStrandedTasks } from './services/orchestrator.js';
 import { syncAgentsFromFiles } from './services/agent-loader.js';
@@ -22,6 +25,7 @@ const PORT = process.env.PORT || 3010;
 
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
+app.use(tenantMiddleware);  // multi-tenancy: X-Atrio-Tenant header ou DEFAULT_TENANT_ID
 
 // Serve frontend estático em produção
 // Em dev: ../../client/dist, em Docker: ../client/dist
@@ -42,6 +46,17 @@ app.use(express.static(clientDist, {
 // ============================================
 // HEALTH CHECK
 // ============================================
+app.post('/api/luna/regression-scan', async (_req, res) => { try { const r = await runDetector({ hours: 24 }); res.json({ ok: true, ...r }); } catch (e) { res.status(500).json({ error: e.message }); } });
+
+app.get('/api/health/llm', async (req, res) => {
+  try {
+    const { health } = await import('./services/llm-gateway.js');
+    res.json({ status: 'ok', ...health() });
+  } catch (e) {
+    res.status(500).json({ status: 'error', error: e.message });
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   const services = {}
 
@@ -690,6 +705,162 @@ app.get('/api/tasks', async (req, res) => {
   }
 });
 
+
+// GET /api/mission-control — snapshot agregado de tudo que importa no Escritório
+app.get('/api/mission-control', async (req, res) => {
+  const tenant = req.tenant_id || 'atrio';
+  try {
+    const [active, pending, blocked, recentDone] = await Promise.all([
+      query(`
+        SELECT t.id, t.title, t.status, t.priority, t.created_at, t.updated_at,
+               tm.name AS assigned_name,
+               EXTRACT(EPOCH FROM (NOW() - t.updated_at))/60 AS age_min,
+               t.result->>'text' AS text_preview
+          FROM tasks t
+          LEFT JOIN team_members tm ON t.assigned_to = tm.id
+         WHERE t.status = 'in_progress' AND t.tenant_id = $1
+         ORDER BY t.updated_at DESC
+         LIMIT 10
+      `, [tenant]),
+      query(`
+        SELECT t.id, t.title, t.priority, t.created_at,
+               tm.name AS assigned_name, tm.type AS assigned_type,
+               EXTRACT(EPOCH FROM (NOW() - t.created_at))/60 AS waiting_min
+          FROM tasks t
+          LEFT JOIN team_members tm ON t.assigned_to = tm.id
+         WHERE t.status = 'pending' AND t.tenant_id = $1
+         ORDER BY
+           CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+           t.created_at ASC
+         LIMIT 15
+      `, [tenant]),
+      query(`
+        SELECT t.id, t.title, t.priority, t.updated_at,
+               tm.name AS assigned_name,
+               t.result->>'error' AS erro,
+               t.result->'tool_failures' AS tool_failures
+          FROM tasks t
+          LEFT JOIN team_members tm ON t.assigned_to = tm.id
+         WHERE t.status = 'blocked' AND t.tenant_id = $1
+         ORDER BY t.updated_at DESC
+         LIMIT 10
+      `, [tenant]),
+      query(`
+        SELECT t.id, t.title, t.completed_at, t.created_at,
+               tm.name AS assigned_name,
+               EXTRACT(EPOCH FROM (t.completed_at - t.created_at))/60 AS duration_min
+          FROM tasks t
+          LEFT JOIN team_members tm ON t.assigned_to = tm.id
+         WHERE t.status = 'done' AND t.tenant_id = $1
+           AND t.completed_at >= NOW() - INTERVAL '24 hours'
+         ORDER BY t.completed_at DESC
+         LIMIT 15
+      `, [tenant]),
+    ]);
+
+    res.json({
+      ok: true,
+      timestamp: new Date().toISOString(),
+      active: active.rows,
+      pending: pending.rows,
+      blocked: blocked.rows,
+      recent_done: recentDone.rows,
+      totals: {
+        active: active.rows.length,
+        pending: pending.rows.length,
+        blocked: blocked.rows.length,
+        recent_done: recentDone.rows.length,
+      },
+    });
+  } catch (err) {
+    console.error('[MissionControl]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/tasks/blocked — lista detalhada de tasks bloqueadas com motivo
+app.get('/api/tasks/blocked', async (_req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT t.id, t.title, t.status, t.priority, t.created_at, t.updated_at,
+              tm.name AS assigned_name,
+              t.result->>'error' AS erro,
+              t.result->'tool_failures' AS tool_failures,
+              t.result->>'retry_reason' AS last_retry,
+              t.result->>'stranded_retries' AS stranded_retries,
+              COALESCE(LEFT(t.result->>'text', 400), NULL) AS texto_resumo
+         FROM tasks t
+         LEFT JOIN team_members tm ON t.assigned_to = tm.id
+        WHERE t.status = 'blocked'
+        ORDER BY t.updated_at DESC
+        LIMIT 100`
+    );
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/tasks/:id/unblock — volta task blocked → pending (orquestrador reprocessa)
+app.post('/api/tasks/:id/unblock', async (req, res) => {
+  try {
+    const { note } = req.body || {};
+    const { rows } = await query(
+      `UPDATE tasks
+          SET status = 'pending',
+              result = COALESCE(result, '{}'::jsonb) || jsonb_build_object(
+                'retry_reason', COALESCE($2, 'unblocked manualmente via UI'),
+                'retried_at',  NOW(),
+                'previous_error', COALESCE(result->>'error', '')
+              )
+        WHERE id = $1 AND status = 'blocked'
+      RETURNING id, title, status`,
+      [req.params.id, note || null]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Task nao encontrada ou nao esta bloqueada' });
+
+    // Dispara reprocessamento imediato em vez de esperar loop 30s
+    setImmediate(() => {
+      processTask(rows[0].id).catch(e => console.error('[unblock] falha reprocess:', e.message));
+    });
+
+    res.json({ ok: true, task: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/tasks/:id/cancel — cancela task permanentemente
+app.post('/api/tasks/:id/cancel', async (req, res) => {
+  try {
+    const { note } = req.body || {};
+    const { rows } = await query(
+      `UPDATE tasks SET status = 'cancelled',
+              completed_at = NOW(),
+              result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('cancel_reason', $2, 'cancelled_at', NOW())
+        WHERE id = $1 AND status IN ('blocked', 'pending') RETURNING id, title`,
+      [req.params.id, note || 'cancelada manualmente via UI']
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Task nao encontrada' });
+    res.json({ ok: true, task: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/tasks/:id', async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT t.*, tm.name as assigned_name, tm.type as assigned_type, d.name as delegated_name, c.name as client_name FROM tasks t LEFT JOIN team_members tm ON t.assigned_to = tm.id LEFT JOIN team_members d ON t.delegated_by = d.id LEFT JOIN clients c ON t.client_id = c.id WHERE t.id = $1 LIMIT 1',
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Task não encontrada' });
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/tasks', async (req, res) => {
   const { title, description, assigned_to, delegated_by, client_id, priority, due_date } = req.body;
   try {
@@ -713,6 +884,84 @@ app.post('/api/tasks', async (req, res) => {
     res.status(201).json(newTask);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/tasks/:id/export-csv — baixa CSV com os CNPJs/clientes listados no description
+app.get('/api/tasks/:id/export-csv', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await query('SELECT id, title, description FROM tasks WHERE id = $1', [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Task não encontrada' });
+    const task = rows[0];
+
+    // Parse description linha-a-linha: cada linha que comeca com "-" é um item
+    const items = String(task.description || '')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l.startsWith('-'))
+      .map(l => l.replace(/^-\s*/, ''));
+
+    // Extrai CNPJ/CPF + nome + "falta: ..." — suporta 2 formatos:
+    //   A) "42.864.557 NOME DO CLIENTE — falta: email, telefone"
+    //   B) "NOME DO CLIENTE (42.864.557/0001-10)"
+    //   C) "NOME DO CLIENTE (05811705476)"  (CPF 11 digitos)
+    const linhas = items.map(line => {
+      // Procura primeiro um CNPJ COMPLETO (com /xxxx-dd) ou CPF dentro de parenteses
+      const fullCnpj = line.match(/(\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2})/);
+      const cpfMatch = line.match(/(\d{3}\.\d{3}\.\d{3}-\d{2})/);
+      // Raiz CNPJ (8 digitos formatados) quando nao tem o completo
+      const rootCnpj = !fullCnpj && !cpfMatch ? line.match(/^(\d{2}\.\d{3}\.\d{3})\s/) : null;
+      const faltaMatch = line.match(/—\s*falta:\s*(.+)$/i);
+
+      let doc = '';
+      if (fullCnpj) doc = fullCnpj[1];
+      else if (cpfMatch) doc = cpfMatch[1];
+      else if (rootCnpj) doc = rootCnpj[1];
+
+      // Nome: remove CNPJ/CPF e "— falta:..."
+      let nome = line;
+      nome = nome.replace(/\(?\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\)?/, '');
+      nome = nome.replace(/\(?\d{3}\.\d{3}\.\d{3}-\d{2}\)?/, '');
+      nome = nome.replace(/^\d{2}\.\d{3}\.\d{3}\s+/, '');
+      nome = nome.replace(/—\s*falta:.*$/i, '');
+      nome = nome.replace(/\(\s*\)/g, '').replace(/\s+/g, ' ').trim();
+
+      return { nome, doc, falta: faltaMatch ? faltaMatch[1].trim() : '' };
+    });
+
+    // Monta CSV
+    const header = 'CNPJ/CPF,Nome,Campos Faltantes\n';
+    const body = linhas.map(l =>
+      `"${(l.doc || '').replace(/"/g, '""')}","${(l.nome || '').replace(/"/g, '""')}","${(l.falta || '').replace(/"/g, '""')}"`
+    ).join('\n');
+    const csv = '\uFEFF' + header + body; // BOM pra Excel ler UTF-8
+
+    const safeTitle = String(task.title || 'task').replace(/[^\w.-]/g, '_').slice(0, 60);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/tasks/:id/enrich — enriquece automaticamente os CNPJs listados no description
+app.post('/api/tasks/:id/enrich', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { enrichTaskById } = await import('./services/task-enricher.js');
+    // Responde imediato; enrichment roda em background (20 CNPJs * 1.2s = 24s)
+    res.json({ ok: true, message: 'Enriquecimento iniciado. Acompanhe em tasks.result.enrich.' });
+    enrichTaskById(id, {
+      rewriteDescription: req.body?.rewriteDescription !== false,
+      completeIfAllOk: true,
+      logToChat: async (msg) => {
+        try { logAgentChat({ from: 'Sistema', text: msg, tag: 'enriquecimento' }); } catch {}
+      },
+    }).catch(e => console.error('[enrich] background falhou:', e.message));
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
@@ -1014,7 +1263,7 @@ app.post('/api/agent-chat', async (req, res) => {
   try {
     const { rows: agents } = await query('SELECT * FROM agents WHERE name ILIKE $1 LIMIT 1', [targetName]);
     if (!agents.length) {
-      logAgentChat({ from: 'Sistema', text: `Agente "${targetName}" não encontrado.`, tag: 'erro' });
+      logAgentChat({ from: 'Sistema', text: `Não consegui achar um agente chamado "${targetName}" no escritório. Verifique o nome e tente de novo.`, tag: 'erro' });
       return res.json({ ok: true, agentResponse: null });
     }
 
@@ -1107,7 +1356,7 @@ Responda de forma direta e honesta. Seja conciso (2-3 frases). Se ha falha/erro 
     res.json({ ok: true, agentResponse: agentText });
   } catch (err) {
     console.error('[AgentChat] Erro ao responder CEO:', err.message);
-    logAgentChat({ from: 'Sistema', text: `Erro ao processar: ${err.message}`, tag: 'erro' });
+    logAgentChat({ from: 'Sistema', text: `Não consegui processar essa mensagem: ${humanizeError(err, { maxLen: 140 })}`, tag: 'erro' });
     res.json({ ok: true, agentResponse: null });
   }
 });
@@ -1153,6 +1402,7 @@ import * as telegram from './services/telegram.js';
 import * as omie from './services/omie.js';
 import { scheduleDailyReport, generateDailyReport } from './services/daily-report.js';
 import { scheduleAuditorDaily, generateAuditorReport } from './services/auditor-daily.js';
+import { scheduleSaldanhaDaily, generateSaldanhaReport } from './services/saldanha-daily.js';
 import * as scheduler from './services/scheduler.js';
 import { startCronScheduler, registerCronHandler, executeCronJob, getCronHandler } from './services/cronScheduler.js';
 import { checkInadimplencia, checkContasPagar, checkSemHonorario, checkAlertasFiscais, checkDadosIncompletos } from './services/scheduler.js';
@@ -1160,6 +1410,13 @@ import agentsRouter from './routes/agents.mjs';
 
 app.get('/api/whatsapp/status', (req, res) => {
   res.json(whatsapp.getStatus());
+});
+
+app.get('/api/whatsapp/health', async (req, res) => {
+  try {
+    const h = await whatsapp.getHealthStatus();
+    res.json(h);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/whatsapp/qr', (req, res) => {
@@ -1373,13 +1630,13 @@ app.get('/api/memory/clients-with-memories', async (req, res) => {
       SELECT lc.id,
              COALESCE(NULLIF(lc.nome_fantasia, ''), lc.nome_legal, 'Sem nome') AS nome,
              lc.cnpj,
-             COUNT(m.id) AS total,
+             COUNT(m.id) FILTER (WHERE m.status = 'approved') AS total,
              COUNT(m.id) FILTER (WHERE m.status = 'approved') AS approved,
              COUNT(m.id) FILTER (WHERE m.is_rag_enabled = true AND m.status = 'approved') AS rag_enabled
       FROM luna_v2.clients lc
       JOIN memories m ON m.scope_id = lc.id AND m.scope_type = 'client'
       GROUP BY lc.id, lc.nome_fantasia, lc.nome_legal, lc.cnpj
-      HAVING COUNT(m.id) > 0
+      HAVING COUNT(m.id) FILTER (WHERE m.status = 'approved') > 0
       ORDER BY COUNT(m.id) DESC, nome ASC
       LIMIT 200`);
     res.json(r.rows.map(row => ({
@@ -1658,6 +1915,8 @@ import { registerSkillsRoutes } from './routes/skills.js';
 import { registerActivityRoutes } from './routes/activity.js';
 import { registerErrorsRoutes } from './routes/errors.js';
 import { registerAlertsRoutes } from './routes/alerts.js';
+import { getImpactMetrics } from './services/impact-metrics.js';
+import { addComment, listComments } from './services/task-comments.js';
 import { findConversationsToAutoResolve, markResolved } from './services/alert-config.js';
 import { installGlobalHandlers, expressErrorHandler } from './services/error-collector.js';
 import { registerDatalake } from './routes/datalake.js';
@@ -1673,6 +1932,31 @@ registerSkillsRoutes(app);
 registerActivityRoutes(app);
 registerErrorsRoutes(app);
 registerAlertsRoutes(app);
+
+// ============================================
+// TASK COMMENTS — coordenação interna, @mention dispara wake do agente
+// ============================================
+app.get('/api/tasks/:id/comments', async (req, res) => {
+  try {
+    res.json({ ok: true, data: await listComments(req.params.id) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/tasks/:id/comments', async (req, res) => {
+  try {
+    const { content, author_name, author_type = 'user', author_id = null } = req.body || {};
+    if (!content || !content.trim()) return res.status(400).json({ error: 'content obrigatorio' });
+    const comment = await addComment({
+      task_id: req.params.id,
+      author_type, author_id,
+      author_name: author_name || 'Caio',
+      content: content.trim(),
+    });
+    res.json({ ok: true, data: comment });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get("/api/metrics/impact", async (_req, res) => { try { res.json(await getImpactMetrics()); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.post('/api/saldanha/sweep', async (req, res) => { try { const txt = await generateSaldanhaReport(logAgentChat); res.json({ ok: true, texto: txt }); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.post('/api/auditor/report', async (req, res) => { try { const txt = await generateAuditorReport(logAgentChat); res.json({ ok: true, texto: txt }); } catch (e) { res.status(500).json({ error: e.message }); } });
 // Express error handler — DEVE ser o ultimo middleware registrado
 app.use(expressErrorHandler());
@@ -1727,6 +2011,7 @@ app.post('/api/orchestrator/run', async (req, res) => {
 // STARTUP
 // ============================================
 startWatchdog();
+startRegressionDetector(60);  // scan regressões Luna a cada 60min
 server.listen(PORT, async () => {
   // Conecta orchestrator ao broadcast e ao registry
   setBroadcast(broadcast);
@@ -1738,6 +2023,9 @@ server.listen(PORT, async () => {
   whatsapp.setLogChat(logAgentChat);
   whatsapp.setOnTaskCreated((taskId) => processTask(taskId));
   whatsapp.initialize().catch(err => console.error('[WhatsApp] Falha:', err.message));
+
+  // Auto-healing: monitora Chromium/Puppeteer a cada 90s e reinicia se travado
+  whatsapp.startHealthcheck(90 * 1000);
 
   // Loop periódico: processa tasks pendentes a cada 30s (safety net)
   setInterval(() => {
@@ -1752,6 +2040,7 @@ server.listen(PORT, async () => {
   // Agenda relatório diário do Rodrigo (18h)
   scheduleDailyReport();
   scheduleAuditorDaily(logAgentChat);
+  scheduleSaldanhaDaily(logAgentChat);
 
   // Limpeza automática — tasks concluídas/canceladas > 7 dias
   setInterval(async () => {

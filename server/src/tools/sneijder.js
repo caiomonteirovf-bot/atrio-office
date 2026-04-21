@@ -367,7 +367,9 @@ export const tools = {
       return { erro: 'Parâmetro obrigatório: clientes_pendentes (array com id/nome/telefone).' };
     }
     const tipoReq = tipo || 'cobranca_extrato_bpo';
-    const ref = periodo || new Date().toISOString().slice(0, 7); // YYYY-MM
+    // Valida periodo: deve ser YYYY-MM (2026-04). Se veio algo como "definicao_honorario", cai pro mes atual.
+    const periodoValido = periodo && /^\d{4}-\d{2}$/.test(String(periodo));
+    const ref = periodoValido ? periodo : new Date().toISOString().slice(0, 7); // YYYY-MM
 
     // Resolve team_members IDs (Sneijder = solicitante, Luna = executor).
     const { rows: sneiRows } = await query(

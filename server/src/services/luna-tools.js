@@ -4,8 +4,9 @@
  * Contrato: executor(toolName, args) -> string|object (serializado e devolvido pro LLM).
  */
 import { query } from '../db/pool.js';
+import { consultarCnpj as _consultarCnpjImpl } from '../tools/shared.js';
 
-async function rotear_para_rodrigo(args, ctx) {
+async function delegar_demanda(args, ctx) {
   const tipo = String(args.tipo || '').toLowerCase();
   const descricao = String(args.descricao || '').slice(0, 2000);
   const prioridade = args.prioridade || 'media';
@@ -26,7 +27,7 @@ async function rotear_para_rodrigo(args, ctx) {
           ok: false,
           erro: 'intake NFS-e incompleto',
           faltam,
-          instrucao: 'Colete os campos pendentes via atualizar_nfse_intake, apresente confirmacao estruturada ao cliente, e so chame rotear_para_rodrigo apos ele dizer sim/ok/pode emitir (use confirmar_nfse_intake).',
+          instrucao: 'Colete os campos pendentes via atualizar_nfse_intake, apresente confirmacao estruturada ao cliente, e so chame delegar_demanda apos ele dizer sim/ok/pode emitir (use confirmar_nfse_intake).',
         };
       }
     } catch (e) {
@@ -35,16 +36,94 @@ async function rotear_para_rodrigo(args, ctx) {
   }
 
   try {
-    // assigned_to referencia team_members(id), nao agents(id)
-    const { rows: rrows } = await query("SELECT id FROM public.team_members WHERE name = 'Rodrigo' LIMIT 1");
-    const rodrigoId = rrows[0]?.id || null;
+    // Mapeamento direto tipo → agente especialista (sem passar por Rodrigo pra reduzir latência)
+    const TIPO_TO_AGENT = {
+      fiscal_nfse: 'Campelo',
+      fiscal: 'Campelo',
+      financeiro: 'Sneijder',
+      societario: 'Saldanha',
+      contabil: 'Saldanha',
+      folha: 'Sneijder',
+      ti: 'André',
+      auditoria: 'Auditor',
+      // administrativo e casos ambíguos vão pra Rodrigo (orchestrator/decisor)
+      administrativo: 'Rodrigo',
+    };
+    const targetAgent = TIPO_TO_AGENT[tipo] || 'Rodrigo';
+
+    const { rows: trows } = await query(
+      "SELECT id FROM public.team_members WHERE name = $1 LIMIT 1",
+      [targetAgent]
+    );
+    const assignedId = trows[0]?.id || null;
+    if (!assignedId) {
+      return { ok: false, erro: 'agente ' + targetAgent + ' nao encontrado em team_members' };
+    }
+
+    // Carrega nfse_intake da conversa pra injetar no metadata (Campelo precisa disso)
+    let intake = null;
+    let clienteInfo = {};
+    if (ctx?.conversationId) {
+      try {
+        const r = await query('SELECT nfse_intake, client_id FROM luna_v2.conversations WHERE id = $1', [ctx.conversationId]);
+        intake = r.rows[0]?.nfse_intake || null;
+      } catch {}
+    }
+    // Resolve prestador (cliente Átrio que solicita) em 3 fallbacks:
+    // 1) luna_v2.clients via ctx.clientId (cache local)
+    // 2) Gesthub direto via ctx.phone (source of truth)
+    // 3) null (Campelo vai detectar faltante)
+    if (ctx?.clientId) {
+      try {
+        const r = await query('SELECT nome_legal, nome_fantasia, cnpj FROM luna_v2.clients WHERE id = $1', [ctx.clientId]);
+        if (r.rows[0]) {
+          clienteInfo = {
+            cliente_nome: r.rows[0].nome_fantasia || r.rows[0].nome_legal,
+            prestador_nome: r.rows[0].nome_fantasia || r.rows[0].nome_legal,
+            prestador_cnpj: r.rows[0].cnpj,
+          };
+        }
+      } catch {}
+    }
+    // Fallback Gesthub: se ainda não resolvemos, busca via telefone
+    if (!clienteInfo.prestador_cnpj && ctx?.phone) {
+      try {
+        const gh = await import('./gesthub.js');
+        const clean = String(ctx.phone).replace(/\D/g, '');
+        const cli = await gh.findClientByPhone(clean);
+        if (cli?.document) {
+          clienteInfo = {
+            cliente_nome: cli.tradeName || cli.legalName || cli.nome || null,
+            prestador_nome: cli.tradeName || cli.legalName || null,
+            prestador_cnpj: cli.document,
+          };
+          console.log('[delegar_demanda] prestador resolvido via Gesthub: ' + (clienteInfo.prestador_nome || '') + ' (' + clienteInfo.prestador_cnpj + ')');
+        }
+      } catch (e) { console.error('[delegar_demanda] gesthub lookup falhou:', e.message); }
+    }
+
+    // parsed_fields completo pra Campelo não pedir nada de novo
+    const parsedFields = {
+      ...clienteInfo,
+      cliente_phone: ctx?.phone || null,
+      // intake fields → mapeados pra formato Campelo espera
+      ...(intake ? {
+        tomador_cpf_cnpj: intake.tomador_doc,
+        tomador_nome: intake.tomador_nome || intake.tomador_razao_social,
+        valor: intake.valor,
+        descricao: intake.descricao,
+        codigo_servico: intake.codigo_servico,
+        aliquota_iss: intake.iss,
+      } : {}),
+    };
+
     const { rows } = await query(
       `INSERT INTO public.tasks (title, description, status, assigned_to, priority, result)
        VALUES ($1, $2, 'pending', $3, $4::task_priority, $5::jsonb) RETURNING id`,
       [
-        `[${tipo}] ${descricao.slice(0, 80)}`,
+        '[' + tipo + '] ' + descricao.slice(0, 80),
         descricao,
-        rodrigoId,
+        assignedId,
         ['alta','media','baixa'].includes(prioridade) ? (prioridade === 'alta' ? 'high' : prioridade === 'baixa' ? 'low' : 'medium') : 'medium',
         JSON.stringify({
           source: 'luna_rotear',
@@ -52,10 +131,18 @@ async function rotear_para_rodrigo(args, ctx) {
           conversation_id: ctx?.conversationId || null,
           client_id: ctx?.clientId || null,
           phone: ctx?.phone || null,
+          parsed_fields: parsedFields,
+          cliente_nome: clienteInfo.cliente_nome || null,
+          prestador_nome: clienteInfo.prestador_nome || null,
         }),
       ]
     );
-    return { ok: true, task_id: rows[0].id, mensagem: `Demanda ${tipo} encaminhada ao Rodrigo (task ${rows[0].id.slice(0, 8)}).` };
+    return {
+      ok: true,
+      task_id: rows[0].id,
+      agent: targetAgent,
+      mensagem: 'Demanda ' + tipo + ' delegada ao ' + targetAgent + ' (task ' + rows[0].id.slice(0, 8) + ').',
+    };
   } catch (e) {
     return { ok: false, erro: e.message };
   }
@@ -164,7 +251,7 @@ async function consultar_datalake(args, ctx) {
                       mensalidade, socio_responsavel, analyst, city, state,
                       headcount, contas_bancarias, memorias_ativas, conversas_whatsapp
                FROM datalake.cliente_360
-               WHERE regexp_replace(cnpj, '\\D', '', 'g') = $1 LIMIT 1`;
+               WHERE regexp_replace(cnpj, '$1\D', '', 'g') = $1 LIMIT 1`;
         params = [cnpjLimpo];
         break;
       }
@@ -281,10 +368,60 @@ async function confirmar_nfse_intake(args, ctx) {
   } catch (e) { return { ok: false, erro: e.message }; }
 }
 
+
+// Consulta CNPJ na Receita (BrasilAPI). Timeout 4s pra evitar travar LLM.
+// Se API cair/demorar, retorna erro estruturado que o LLM pode interpretar ("peça manualmente o nome").
+async function consultar_cnpj(args) {
+  const digits = String(args?.cnpj || '').replace(/\D/g, '');
+  if (digits.length !== 14) {
+    return { ok: false, erro: 'CNPJ invalido — precisa ter 14 digitos', recebido: args?.cnpj };
+  }
+  try {
+    const result = await Promise.race([
+      _consultarCnpjImpl({ cnpj: digits }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout apos 4s')), 4000)),
+    ]);
+    // Normaliza: extrai campos essenciais pro LLM usar direto
+    const r = result || {};
+    // Estrutura real: { encontrado, cliente_interno: {...}, receita_federal: {...} }
+    // Prioridade: cliente_interno (Gesthub) > receita_federal
+    const interno = r.cliente_interno || {};
+    const receita = r.receita_federal || {};
+    const razao = interno.razao_social || receita.razao_social || null;
+    const fantasia = receita.nome_fantasia || null;
+    if (!razao) {
+      return {
+        ok: false,
+        erro: r.mensagem || 'CNPJ nao encontrado na Receita nem na base interna',
+        fallback: 'Pergunte o nome do tomador manualmente ao cliente.',
+      };
+    }
+    return {
+      ok: true,
+      cnpj: digits,
+      razao_social: razao,
+      nome_fantasia: fantasia,
+      situacao: interno.status || receita.situacao || null,
+      municipio: receita.endereco ? (receita.endereco.split('/')[0] || '').split('-').pop().trim() : null,
+      regime: interno.regime || null,
+      _note: 'Use razao_social como nome do tomador na NFS-e. NAO pergunte o nome ao cliente novamente.',
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      erro: 'consulta indisponivel: ' + e.message,
+      fallback: 'Pergunte o nome do tomador manualmente ao cliente e registre via atualizar_nfse_intake.',
+    };
+  }
+}
+
 const REGISTRY = {
-  consultar_datalake,
+  // consultar_datalake REMOVIDA — vazava dados internos. Incidente 20/04/2026.
+  consultar_cnpj,
   registrar_memoria_cliente,
-  rotear_para_rodrigo,
+  delegar_demanda,
+  // rotear_para_rodrigo mantido como ALIAS pra compatibilidade (LLM pode chamar pelo nome antigo)
+  rotear_para_rodrigo: delegar_demanda,
   coletar_documento,
   onboarding_cliente,
   email_enviar,

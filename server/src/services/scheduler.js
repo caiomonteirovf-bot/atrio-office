@@ -361,12 +361,12 @@ async function checkDadosIncompletos() {
         if (!c.email) falta.push('email');
         if (!c.phone) falta.push('telefone');
         if (!c.city || c.city === '--') falta.push('cidade');
-        return `- ${c.legalName?.substring(0, 35)} — falta: ${falta.join(', ')}`;
+        return `- ${c.legalName?.substring(0, 50)} (${c.document || 'sem CNPJ'}) — falta: ${falta.join(', ')}`;
       }).join('\n');
 
-      await query(
+      const { rows: created } = await query(
         `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status)
-         VALUES ($1, $2, $3, $4, 'low', 'pending')`,
+         VALUES ($1, $2, $3, $4, 'low', 'in_progress') RETURNING id`,
         [
           `${incompletos.length} clientes com dados incompletos`,
           `Clientes ativos com campos faltando (enriquecer via RF ou solicitar ao cliente):\n\n${lista}${incompletos.length > 15 ? `\n... e mais ${incompletos.length - 15}` : ''}`,
@@ -374,7 +374,21 @@ async function checkDadosIncompletos() {
           rodrigo[0]?.id,
         ]
       );
-      log('Task semanal de dados incompletos criada para Luna');
+      const taskId = created[0]?.id;
+      log(`Task semanal de dados incompletos criada (${taskId}) — iniciando enrich automático`);
+
+      // Loop fechado: tenta resolver via Receita Federal, só mantém pendente o que falhar
+      if (taskId) {
+        try {
+          const { enrichTaskById } = await import('./task-enricher.js');
+          enrichTaskById(taskId, {
+            rewriteDescription: true,
+            completeIfAllOk: true,
+          }).then(sum => {
+            log(`[auto-enrich] task ${taskId}: ${sum.sucesso?.length || 0} OK, ${sum.falha?.length || 0} falhas, ${sum.naoEncontrado?.length || 0} nao_encontrados`);
+          }).catch(e => log(`[auto-enrich] falhou: ${e.message}`));
+        } catch (e) { log(`[auto-enrich] import falhou: ${e.message}`); }
+      }
     }
 
     return incompletos;

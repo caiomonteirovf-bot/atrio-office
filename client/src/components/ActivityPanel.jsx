@@ -103,17 +103,19 @@ export default function ActivityPanel() {
             <tbody>
               {events.map(ev => {
                 const sty = SEVERITY_STYLE[ev.severity] || SEVERITY_STYLE.info
-                const keys = Object.keys(ev.payload || {}).slice(0, 4).join(', ')
                 return (
                   <tr key={ev.id} className="border-t cursor-pointer hover:opacity-90"
                     style={{ borderColor: 'var(--ao-border)' }}
                     onClick={() => setDetail(ev)}>
                     <td className="p-2 opacity-70">{fmtTime(ev.ts)}</td>
                     <td className="p-2"><span style={{ color: sty.color, fontWeight: 600 }}>{ev.severity}</span></td>
-                    <td className="p-2"><span className="font-medium">{ev.event_type}</span>/<span className="opacity-60">{ev.action}</span></td>
-                    <td className="p-2 truncate max-w-[180px]" title={`${ev.actor_type}/${ev.actor_id || ''}`}>{ev.actor_name || ev.resolved_agent_name || ev.actor_type}</td>
-                    <td className="p-2 truncate max-w-[200px]" title={ev.entity_id}>{ev.entity_type ? `${ev.entity_type}:${String(ev.entity_id || '').slice(0, 14)}` : '—'}</td>
-                    <td className="p-2 opacity-60 truncate max-w-[260px]">{keys}</td>
+                    <td className="p-2" title={`${ev.event_type}/${ev.action || ''}`}>
+                      <span className="mr-1">{ev.event_icon || '•'}</span>
+                      <span className="font-medium">{ev.event_label || ev.event_type}</span>
+                    </td>
+                    <td className="p-2 truncate max-w-[180px]" title={`${ev.actor_type}/${ev.actor_id || ''}`}>{ev.resolved_agent_name || ev.actor_label || ev.actor_type}</td>
+                    <td className="p-2 truncate max-w-[220px]" title={ev.entity_id}>{ev.entity_label || '—'}</td>
+                    <td className="p-2 opacity-80 truncate max-w-[320px]">{ev.summary_text || ''}</td>
                   </tr>
                 )
               })}

@@ -15,6 +15,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../db/pool.js';
+import { recordPromptChange, auditPrompt, CRITICAL_RULES } from './prompt-auditor.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AGENTS_ROOT = path.resolve(__dirname, '..', '..', 'agents');
@@ -168,6 +169,20 @@ export async function syncAgentsFromFiles() {
         );
         report.created++;
       } else {
+        const oldPrompt = existing[0]?.system_prompt || '';
+        const promptChanged = oldPrompt !== systemPrompt;
+
+        // Pre-audit: se o prompt novo remove regras criticas, LOG mas NAO bloqueia
+        // (o agent-loader roda no boot; queremos visibilidade, nao queda de servico).
+        let preAudit = null;
+        if (promptChanged && CRITICAL_RULES[fm.name]) {
+          preAudit = auditPrompt(systemPrompt, fm.name);
+          if (preAudit.violations.length > 0) {
+            console.error('[agent-loader] ⚠️  ' + fm.name + ' — prompt novo viola ' + preAudit.violations.length + ' regra(s) critica(s):');
+            preAudit.violations.forEach(v => console.error('    ✗ ' + v.id + ': ' + v.label));
+          }
+        }
+
         await query(
           `UPDATE agents SET
              name = $2, role = $3, department = $4,
@@ -186,6 +201,21 @@ export async function syncAgentsFromFiles() {
           ]
         );
         report.updated++;
+
+        // Post-update: grava historico + audit com diff de regras criticas
+        if (promptChanged) {
+          recordPromptChange({
+            agentId: fm.id, agentName: fm.name,
+            oldPrompt, newPrompt: systemPrompt,
+            actor: 'agent-loader'
+          }).then(audit => {
+            if (audit.removedRules.length > 0) {
+              console.error('[agent-loader] 🔴 ' + fm.name + ' — REGRAS REMOVIDAS na atualizacao: ' + audit.removedRules.join(', '));
+            } else if (preAudit && preAudit.violations.length === 0) {
+              console.log('[agent-loader] ✓ ' + fm.name + ' — prompt atualizado, todas as regras criticas OK');
+            }
+          }).catch(e => console.error('[agent-loader] recordPromptChange falhou:', e.message));
+        }
       }
       report.loaded++;
     } catch (e) {

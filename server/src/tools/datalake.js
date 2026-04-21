@@ -2,7 +2,25 @@
 import { query } from '../db/pool.js';
 
 export async function consultarDatalake(args = {}) {
-  const tipo = String(args.tipo || '').toLowerCase();
+  let tipo = String(args.tipo || '').toLowerCase().trim();
+
+  // Aliases: tolera plurais, variacoes e sinonimos comuns que LLMs inventam
+  const ALIAS = {
+    'clientes_por_cnpj': 'cliente_por_cnpj',
+    'clientes_por_nome': 'cliente_por_nome',
+    'cliente_nome': 'cliente_por_nome',
+    'cnpj': 'cliente_por_cnpj',
+    'nome': 'cliente_por_nome',
+    'socio': 'carteira_socio',
+    'socios': 'carteira_socio',
+    'por_socio': 'carteira_socio',
+    'resumo': 'resumo_carteira',
+    'totais': 'resumo_carteira',
+    'sem_luna': 'clientes_sem_vinculo_luna',
+    'sem_vinculo': 'clientes_sem_vinculo_luna',
+    'total': 'total_clientes',
+  };
+  if (ALIAS[tipo]) tipo = ALIAS[tipo];
   const filtro = String(args.filtro || '').trim();
   const limite = Math.min(50, Math.max(1, parseInt(args.limite) || 10));
   try {

@@ -6,10 +6,11 @@ department: fiscal
 status: online
 reports_to: null
 model:
-  provider: anthropic
-  model: claude-sonnet-4-5-20250929
+  provider: openrouter
+  model: anthropic/claude-sonnet-4.5
   temperature: 0.2
   max_tokens: 4096
+  thinking_budget: 2000
 budget_monthly_usd: 50
 personality: Preciso, metódico, sempre com os números na ponta da língua. Nunca deixa um prazo passar.
 tools:

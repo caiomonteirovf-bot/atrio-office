@@ -367,6 +367,7 @@ Execute a tarefa usando suas ferramentas disponíveis e retorne o resultado.`;
         severity: 'warning',
         agentId: agent.id,
         taskId,
+        push: { url: `/?task=${taskId}`, tag: `task-${taskId}` },
       }).catch(() => {});
 
       // (mensagem de bloqueio já emitida acima — evita duplicata no chat)
@@ -624,24 +625,38 @@ async function notifyTeamFailure(task, errorMsg) {
   const isNfse = task.title?.includes('[NFSE]') || task.title?.includes('[FISCAL]');
   const icon = isNfse ? '🚫' : '⚠️';
 
-  // Extrai detalhes acionáveis do erro
+  // Extrai detalhes acionaveis do erro
   let onde = 'Átrio Office → Orchestrator';
-  let acao = 'Verificar logs do servidor';
-  if (errorMsg?.includes('fetch') || errorMsg?.includes('ECONNREFUSED')) {
-    onde = 'API externa (Nuvem Fiscal / Gesthub)';
-    acao = 'Verificar se a API está acessível e credenciais estão corretas';
-  } else if (errorMsg?.includes('CPF') || errorMsg?.includes('CNPJ') || errorMsg?.includes('inválido')) {
+  let acao = 'Abrir Átrio Office → Ecossistema → Tasks bloqueadas';
+  const raw = errorMsg || '';
+  const lower = raw.toLowerCase();
+
+  if (/loop\s+de\s+ferramentas|excedeu\s+\d+\s+rounds/i.test(raw)) {
+    onde = 'LLM do agente (loop de tool-use > 10 iteracoes)';
+    acao = 'IA entrou em loop. Abrir task bloqueada, ver historico de tool calls, identificar qual tool estava falhando e corrigir/ajustar o system prompt do agente';
+  } else if (lower.includes('fetch') || lower.includes('econnrefused')) {
+    onde = 'API externa (Nuvem Fiscal / Gesthub / BrasilAPI)';
+    acao = 'Verificar se API externa esta no ar. Se sim, revisar credenciais. Retry automatico no proximo ciclo';
+  } else if (lower.includes('cpf') || lower.includes('cnpj') || lower.includes('inválid') || lower.includes('invalid')) {
     onde = 'Dados do cliente/tomador';
-    acao = 'Corrigir CPF/CNPJ no cadastro ou pedir ao cliente novamente';
-  } else if (errorMsg?.includes('agent') || errorMsg?.includes('agente')) {
+    acao = 'Corrigir CPF/CNPJ no cadastro do Gesthub ou pedir dados corretos pro cliente';
+  } else if (lower.includes('agent') || lower.includes('agente')) {
     onde = 'Banco de dados → agents/team_members';
-    acao = 'Verificar se o agente existe e está disponível no seed';
-  } else if (errorMsg?.includes('tool') || errorMsg?.includes('emitir_nfse')) {
+    acao = 'Verificar se o agente existe no seed. Rodar agents sync se preciso';
+  } else if (lower.includes('tool') || lower.includes('emitir_nfse')) {
     onde = 'Tool do agente';
-    acao = 'Verificar configuração da tool e parâmetros enviados';
+    acao = 'Revisar tool em server/src/tools/*. Verificar parametros enviados';
+  } else if (lower.includes('parse_suspeito') || lower.includes('divergencia')) {
+    onde = 'Parser de extrato (PDF)';
+    acao = 'Abrir Átrio Finance → Extratos, revisar PDF e reimportar com forcar_import=true se apropriado';
+  } else if (lower.includes('rate limit') || lower.includes('429')) {
+    onde = 'Rate limit de API externa';
+    acao = 'Aguardar proximo ciclo (retry automatico). Se persistir, revisar orcamento/throttle';
   }
 
-  const alertMsg = `${icon} *Task BLOQUEADA*\n\n*Task:* ${task.title}\n*Agente:* ${task.assigned_name || 'N/A'}\n*Erro:* ${errorMsg || 'Desconhecido'}\n*Onde:* ${onde}\n*Ação:* ${acao}`;
+  // Link direto pra dashboard
+  const dashLink = (process.env.ATRIO_OFFICE_PUBLIC_URL || 'http://31.97.175.200:3010') + '/#ecossistema';
+  const alertMsg = `${icon} *Task BLOQUEADA*\n\n*Task:* ${task.title}\n*Agente:* ${task.assigned_name || 'N/A'}\n*Erro:* ${raw || 'Desconhecido'}\n*Onde:* ${onde}\n*Acao:* ${acao}\n*Dashboard:* ${dashLink}`;
 
   telegram.sendAlert(alertMsg.replace(/\*/g, ''));
   try { await sendAlertToGroup(alertMsg); } catch {}

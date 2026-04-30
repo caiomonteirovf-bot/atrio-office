@@ -35,6 +35,11 @@ const PATTERNS = [
   // --- tool-specific ---
   { match: /tool ["']?(\w+)["']? (?:falhou|failed|não implementada)/i,
     fn: (m) => `A ferramenta "${m[1]}" ainda não está implementada ou retornou erro.` },
+
+  // Loop de ferramentas (>10 rounds de tool-use sem conclusao do LLM)
+  { match: /loop\s+de\s+ferramentas\s+excedido|max.*tool.*call|excedeu\s+\d+\s+rounds/i,
+    msg: 'IA entrou em loop (>10 iteracoes chamando ferramentas). Provavelmente uma tool retornou erro e a IA tentou consertar repetidamente sem sucesso. Abrir Atrio Office > Tasks bloqueadas pra ver qual ferramenta falhou.' },
+
   { match: /cnpj.*inválid|invalid[\s_-]?cnpj/i,
     msg: 'CNPJ inválido ou mal formatado.' },
   { match: /cpf.*inválid|invalid[\s_-]?cpf/i,

@@ -208,13 +208,15 @@ async function persistMemory({ fact, toolName, ctx }) {
   );
   if (dup.rows[0]) return dup.rows[0].id;
 
+  // Gate de aprovacao: luna-observer propoe, humano aprova.
+  // Status=draft + is_rag_enabled=false ate que equipe revise na aba Revisar.
   const ins = await query(
     `INSERT INTO memories
       (agent_id, scope_type, scope_id, category, title, summary, content,
        confidence_score, status, source_type, source_ref, tags, is_rag_enabled,
        metadata, structured_facts)
      VALUES ($1, $2::memory_scope, $3, $4::memory_category, $5, $6, $7, $8,
-             'approved'::memory_status, 'tool_result'::memory_source, $9, $10, true,
+             'draft'::memory_status, 'tool_result'::memory_source, $9, $10, false,
              $11::jsonb, $12::jsonb)
      RETURNING id`,
     [

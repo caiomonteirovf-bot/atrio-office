@@ -7,6 +7,7 @@ import {
   getLegalizationHistorico,
   getLegalizationExigencias,
   addLegalizationHistorico,
+  getLearningsStats,
 } from '../services/gesthub.js';
 
 // === Helpers ===
@@ -377,6 +378,28 @@ export const tools = {
         blocos.push('✓ Nenhum sinal de atencao. Legalizacao em dia.');
       }
 
+      // --- Datalake learnings (back-sync pendente) ---
+      let learningsInfo = null;
+      try {
+        learningsInfo = await getLearningsStats();
+      } catch { /* nao bloqueia sweep */ }
+
+      if (learningsInfo) {
+        const proposed = (learningsInfo.porStatus || {}).proposed || 0;
+        const antigos = learningsInfo.pendentesAntigos7d || 0;
+        if (proposed > 0 || antigos > 0) {
+          blocos.push('');
+          blocos.push('🔗 *Datalake — back-sync pendentes:*');
+          blocos.push(`   • ${proposed} learning(s) aguardando revisao`);
+          if (antigos > 0) {
+            blocos.push(`   • 🚨 ${antigos} pendente(s) ha MAIS de 7 dias — revisar em /learnings`);
+          }
+          const sources = learningsInfo.pendentesPorSource || {};
+          const srcList = Object.entries(sources).map(([s, n]) => `${s}=${n}`).join(' · ');
+          if (srcList) blocos.push(`   • Fontes: ${srcList}`);
+        }
+      }
+
       return {
         texto: blocos.join('\n'),
         totais: {
@@ -387,6 +410,8 @@ export const tools = {
           prazo_proximo: prazoProximo.length,
           pendencias_sem_followup: pendencias.length,
           exigencias_pendentes: exigencias.length,
+          learnings_proposed: (learningsInfo?.porStatus || {}).proposed || 0,
+          learnings_antigos_7d: learningsInfo?.pendentesAntigos7d || 0,
         },
       };
     } catch (e) {

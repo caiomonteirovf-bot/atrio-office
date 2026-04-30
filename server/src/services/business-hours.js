@@ -2,16 +2,9 @@
 // Helper compartilhado de horário comercial + contexto pro LLM.
 // Evita duplicação entre whatsapp.js e webhook-handler.mjs.
 
-const FERIADOS_FIXOS = [
-  '01-01', // Ano Novo
-  '04-21', // Tiradentes
-  '05-01', // Dia do Trabalho
-  '09-07', // Independencia
-  '10-12', // N. Senhora Aparecida
-  '11-02', // Finados
-  '11-15', // Proclamacao da Republica
-  '12-25', // Natal
-];
+import { checarFeriado } from './feriados.js';
+// FERIADOS_FIXOS mantido apenas pra compat legada, nao usado diretamente mais
+const FERIADOS_FIXOS = [];
 
 function now() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Recife' }));
@@ -24,7 +17,8 @@ export function isHorarioComercial() {
   const mmdd = `${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
 
   const isWeekend = day === 0 || day === 6;
-  const isHoliday = FERIADOS_FIXOS.includes(mmdd);
+  const feriadoInfo = checarFeriado(n);
+  const isHoliday = feriadoInfo.isHoliday;
   const isLunch = hour >= 12 && hour < 13;
   const open = !isWeekend && !isHoliday && hour >= 8 && hour < 18 && !isLunch;
 
@@ -34,7 +28,7 @@ export function isHorarioComercial() {
                : (hour < 8 || hour >= 18) ? 'fora do horario'
                : null;
 
-  return { open, isLunch, reason, hour, day, isWeekend, isHoliday };
+  return { open, isLunch, reason, hour, day, isWeekend, isHoliday, feriadoNome: feriadoInfo.nome || null };
 }
 
 /**

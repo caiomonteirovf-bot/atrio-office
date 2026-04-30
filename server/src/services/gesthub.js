@@ -273,3 +273,15 @@ export async function addLegalizationHistorico(id, { texto, autor = 'Saldanha' }
 export async function getLegalizationExigencias(id) {
   return request(`/legalizations/${id}/exigencias`);
 }
+
+// ============================================
+// DATALAKE LEARNINGS (back-sync audit trail)
+// ============================================
+export async function getLearningsStats() {
+  return request('/learnings/stats');
+}
+
+export async function getLearningsPendentes(limit = 20) {
+  const qs = `?status=proposed&limit=${limit}`;
+  return request(`/learnings${qs}`);
+}

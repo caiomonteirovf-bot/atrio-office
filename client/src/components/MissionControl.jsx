@@ -86,6 +86,22 @@ export default function MissionControl({ ws }) {
     finally { setActioningId(null) }
   }
 
+  const manualResolve = async (id) => {
+    const note = prompt('Como voce resolveu? (descreva pra ficar no historico)')
+    if (note === null) return
+    setActioningId(id)
+    try {
+      const r = await fetch(`/api/tasks/${id}/manual-resolve`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note: note || 'resolvida manualmente' }),
+      })
+      const d = await r.json()
+      if (!d.ok) throw new Error(d.error || 'falha')
+      await load()
+    } catch (e) { alert('Erro: ' + e.message) }
+    finally { setActioningId(null) }
+  }
+
   if (loading && !data) {
     return (
       <div className="flex items-center justify-center py-8 opacity-60">
@@ -187,6 +203,7 @@ export default function MissionControl({ ws }) {
               task={t}
               onUnblock={() => unblock(t.id)}
               onCancel={() => cancel(t.id)}
+              onManualResolve={() => manualResolve(t.id)}
               busy={actioningId === t.id}
             />
           ))}
@@ -256,7 +273,7 @@ function TaskCard({ task, variant, onClick }) {
   )
 }
 
-function BlockedCard({ task, onUnblock, onCancel, busy, onClick }) {
+function BlockedCard({ task, onUnblock, onCancel, onManualResolve, busy, onClick }) {
   const erroTxt = task.erro || 'sem detalhe'
   const hasTool = Array.isArray(task.tool_failures) && task.tool_failures.length > 0
   return (
@@ -278,14 +295,23 @@ function BlockedCard({ task, onUnblock, onCancel, busy, onClick }) {
           </div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <button onClick={onUnblock} disabled={busy} title="Reprocessar" style={{
+          <button onClick={(e) => { e.stopPropagation(); onUnblock() }} disabled={busy} title="Reprocessar" style={{
             padding: '4px 10px', fontSize: 10, fontWeight: 600, border: 'none', borderRadius: 4,
             background: busy ? '#94a3b8' : '#10b981', color: 'white', cursor: busy ? 'wait' : 'pointer',
             display: 'inline-flex', alignItems: 'center', gap: 4,
           }}>
             <RotateCcw size={10} /> {busy ? '...' : 'Retentar'}
           </button>
-          <button onClick={onCancel} disabled={busy} title="Cancelar" style={{
+          {onManualResolve && (
+            <button onClick={(e) => { e.stopPropagation(); onManualResolve() }} disabled={busy} title="Marcar como resolvida manualmente" style={{
+              padding: '4px 10px', fontSize: 10, fontWeight: 500, borderRadius: 4,
+              border: '1px solid #6366f180', background: 'transparent', color: '#6366f1',
+              cursor: busy ? 'wait' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4,
+            }}>
+              ✓ Resolvi
+            </button>
+          )}
+          <button onClick={(e) => { e.stopPropagation(); onCancel() }} disabled={busy} title="Cancelar" style={{
             padding: '4px 10px', fontSize: 10, fontWeight: 500, borderRadius: 4,
             border: '1px solid var(--ao-border)', background: 'transparent', color: 'var(--ao-text-dim)',
             cursor: busy ? 'wait' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4,

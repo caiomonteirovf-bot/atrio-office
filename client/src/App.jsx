@@ -21,11 +21,19 @@ import HybridMemory from './components/HybridMemory'
 import DocsIngest from './components/DocsIngest'
 import ActivityPanel from './components/ActivityPanel'
 import ErrorsPanel from './components/ErrorsPanel'
-import ImpactDashboard from './components/ImpactDashboard'
+// ImpactDashboard removido — metricas nao eram confiaveis (baixa utilizacao). Arquivo mantido pra revival futuro se necessario.
+// import ImpactDashboard from './components/ImpactDashboard'
 import MissionControl from './components/MissionControl'
+import ConversasPage from './components/atendimento/ConversasPage'
+import TemplatesManager from './components/atendimento/TemplatesManager'
+import ExpiringBanner from './components/ExpiringBanner'
+import SecurityPage from './components/SecurityPage'
+import GrowthPage from './components/GrowthPage'
+// BottomNav removida — mobile foca em Atendimento, hamburger atende demais.
 import AlertsConfig from './components/AlertsConfig'
 import ErrorBoundary from './components/ErrorBoundary'
 import DatalakeViewer from './components/DatalakeViewer'
+import EcosystemDashboard from './components/EcosystemDashboard'
 import PortalLogin from './portal/PortalLogin'
 import PortalDashboard from './portal/PortalDashboard'
 
@@ -55,10 +63,15 @@ function AdminDashboard() {
   }, [lastMessage, refresh])
   const [selectedAgent, setSelectedAgent] = useState(null)
   const [searchOpen, setSearchOpen] = useState(false)
-  const [currentPage, setCurrentPage] = useState('home')
+  // Pagina inicial: celular abre direto em Atendimento (foco operacional mobile),
+  // desktop abre em Escritorio (dashboard / visao geral).
+  const [currentPage, setCurrentPage] = useState(() =>
+    (typeof window !== 'undefined' && window.innerWidth < 768) ? 'atendimento' : 'home'
+  )
   const [chatOpen, setChatOpen] = useState(false)
-  // Paginas largas (datalake, memory) nao mostram chat fixo — usa floating
-  const WIDE_PAGES = ['datalake', 'memory', 'crons', 'custos', 'sessions', 'docs', 'activity', 'errors', 'alerts']
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  // Paginas largas (datalake, memory, atendimento) nao mostram chat fixo — usa floating
+  const WIDE_PAGES = ['datalake', 'ecossistema', 'memory', 'crons', 'custos', 'sessions', 'docs', 'activity', 'errors', 'alerts', 'atendimento', 'templates', 'growth', 'seguranca']
   const isWidePage = WIDE_PAGES.includes(currentPage)
 
   // Global search shortcut (Cmd+K / Ctrl+K)
@@ -100,7 +113,8 @@ function AdminDashboard() {
   return (
     <div className="flex h-[calc(100vh-28px)] overflow-hidden" style={{ background: 'var(--ao-bg)', color: 'var(--ao-text)', transition: 'background 0.3s, color 0.3s' }}>
       <div className="flex-1 flex flex-col overflow-hidden">
-        <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} currentPage={currentPage} onNavigate={setCurrentPage} />
+        <ExpiringBanner />
+        <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} currentPage={currentPage} onNavigate={setCurrentPage} mobileMenuOpen={mobileMenuOpen} setMobileMenuOpen={setMobileMenuOpen} />
 
         {/* Main content: two-column layout */}
         <div className="flex-1 flex overflow-hidden">
@@ -108,7 +122,6 @@ function AdminDashboard() {
           <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
             {currentPage === 'home' && (
               <div className="max-w-[960px] mx-auto px-5 py-5 space-y-5">
-                <ImpactDashboard />
                 <MissionControl />
                 <StatsBar />
 
@@ -147,10 +160,15 @@ function AdminDashboard() {
             {currentPage === 'calendar' && <WeeklyCalendar />}
             {currentPage === 'memory' && <ErrorBoundary label='HybridMemory'><HybridMemory /></ErrorBoundary>}
             {currentPage === 'datalake' && <DatalakeViewer />}
+            {currentPage === 'ecossistema' && <ErrorBoundary label='EcosystemDashboard'><EcosystemDashboard /></ErrorBoundary>}
             {currentPage === 'docs' && <DocsIngest />}
             {currentPage === 'alerts' && <div className='flex-1 flex flex-col gap-4 p-4 overflow-auto' style={{ color: 'var(--ao-text)' }}><h1 className='text-2xl font-semibold'>Alertas</h1><p className='text-sm opacity-70'>Configuração dos gatilhos de escalation Luna</p><AlertsConfig /></div>}
             {currentPage === 'errors' && <div className='flex-1 flex flex-col gap-4 p-4 overflow-auto' style={{ color: 'var(--ao-text)' }}><h1 className='text-2xl font-semibold'>Erros</h1><p className='text-sm opacity-70'>Exceções e falhas capturadas — agrupadas por fingerprint</p><ErrorsPanel /></div>}
             {currentPage === 'activity' && <div className='flex-1 flex flex-col gap-4 p-4 overflow-auto' style={{ color: 'var(--ao-text)' }}><h1 className='text-2xl font-semibold'>Auditoria</h1><p className='text-sm opacity-70'>Trilha append-only de todas as operações sensíveis do sistema</p><ActivityPanel /></div>}
+            {currentPage === 'atendimento' && <ConversasPage lastWsMessage={lastMessage} />}
+            {currentPage === 'templates' && <TemplatesManager />}
+            {currentPage === 'seguranca' && <SecurityPage />}
+            {currentPage === 'growth' && <GrowthPage />}
           </div>
 
           {/* RIGHT COLUMN — Agent Chat (oculto em paginas largas) */}
@@ -161,26 +179,33 @@ function AdminDashboard() {
             </div>
           )}
 
-          {/* Floating Assistant — aparece em paginas largas */}
-          {isWidePage && (
-            <>
+          {/* Floating Assistant — so em paginas de visao geral (ecossistema, calendar, sessions, custos).
+              Escondido em paginas de gestao (memory, templates, docs, alerts, errors, activity, datalake)
+              pra nao bloquear botoes de acao que ficam no canto inferior direito (ex: Arquivar, Salvar). */}
+          {(() => {
+            const FAB_PAGES = ['ecossistema', 'calendar', 'sessions', 'custos', 'crons']
+            if (!FAB_PAGES.includes(currentPage)) return null
+            return (
+              <>
               <button
                 onClick={() => setChatOpen(v => !v)}
-                className="fixed bottom-6 right-6 z-40 rounded-full shadow-lg flex items-center justify-center transition-all hover:scale-105"
+                className="fixed right-6 z-40 rounded-full shadow-lg flex items-center justify-center transition-all hover:scale-105"
                 style={{
-                  width: 52, height: 52,
+                  width: 48, height: 48,
+                  bottom: 80,  /* sobe 80px pra nao tampar rodape/statusbar */
                   background: 'linear-gradient(135deg, #C4956A 0%, #a07a52 100%)',
                   color: '#fff',
                   boxShadow: '0 6px 20px rgba(196,149,106,0.4)',
                 }}
                 aria-label="Assistente"
               >
-                {chatOpen ? <XIcon size={22} strokeWidth={2.4}/> : <MessageCircle size={22} strokeWidth={2.2}/>}
+                {chatOpen ? <XIcon size={20} strokeWidth={2.4}/> : <MessageCircle size={20} strokeWidth={2.2}/>}
               </button>
               {chatOpen && (
-                <div className="fixed bottom-24 right-6 z-40 rounded-2xl overflow-hidden flex flex-col"
+                <div className="fixed right-6 z-40 rounded-2xl overflow-hidden flex flex-col"
                   style={{
                     width: 380, height: 'min(600px, 75vh)',
+                    bottom: 140,
                     background: 'var(--ao-card)',
                     border: '1px solid var(--ao-border)',
                     boxShadow: '0 12px 40px rgba(0,0,0,0.45)',
@@ -189,12 +214,14 @@ function AdminDashboard() {
                 </div>
               )}
             </>
-          )}
+          )
+          })()}
         </div>
       </div>
 
       <GlobalSearch isOpen={searchOpen} onClose={() => setSearchOpen(false)} />
       <StatusBar />
+      {/* BottomNav removida: mobile foca em Atendimento, hamburger no topo atende os demais. */}
 
       {/* Chat Panel overlay when agent is selected */}
       {selectedAgent && (

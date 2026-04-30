@@ -6,20 +6,39 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#08080A" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#BA7517" media="(prefers-color-scheme: light)" />
+    <!-- iOS PWA: modo standalone + barra de status preta translucida (icones brancos sobre header) -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Átrio" />
+    <link rel="apple-touch-icon" href="/pwa-icon-192.png" />
+    <link rel="apple-touch-icon" sizes="192x192" href="/pwa-icon-192.png" />
+    <link rel="apple-touch-icon" sizes="512x512" href="/pwa-icon-512.png" />
+    <!-- viewport-fit=cover + user-scalable=no => deixa UI por baixo do notch/dynamic island -->
+    <!-- interactive-widget=resizes-content => iOS Safari 17+/Chrome reduzem o viewport quando teclado abre,
+         evitando que o input fique escondido. Fallback via visualViewport API em JS. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no, shrink-to-fit=no, interactive-widget=resizes-content" />
+    <!-- Previne detecção automatica de telefone pelo iOS (evita linkar CNPJs, etc) -->
+    <meta name="format-detection" content="telephone=no" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300..800;1,9..40,300..800&family=Outfit:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <title>Átrio Office</title>
   </head>
   <body style="background-color: #08080A;">
-        <script>
-      // Kill stale service workers + caches (one-shot on every load; harmless if none)
+    <script>
+      // Registra o Service Worker (PWA). Substitui o unregister antigo (que limpava
+      // SW corrompidos de tentativas anteriores). A partir desta versao temos um SW
+      // minimalista que NAO cacheia /api/* e e seguro pra atualizacoes frequentes.
       if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
-      }
-      if (window.caches) {
-        caches.keys().then(ks => ks.forEach(k => caches.delete(k)));
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch(err => {
+            console.warn('[SW] registro falhou:', err.message);
+          });
+        });
       }
     </script>
     <div id="root"></div>

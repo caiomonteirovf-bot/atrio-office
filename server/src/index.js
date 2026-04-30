@@ -24,7 +24,7 @@ const app = express();
 const PORT = process.env.PORT || 3010;
 
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '30mb' }));  // 30mb pra base64 de anexos (PDFs ~20mb)
 app.use(tenantMiddleware);  // multi-tenancy: X-Atrio-Tenant header ou DEFAULT_TENANT_ID
 
 // Serve frontend estático em produção
@@ -93,6 +93,184 @@ app.get('/api/health', async (req, res) => {
     services
   })
 });
+
+// ============================================
+// SECURITY — kill-switch agente→cliente
+// ============================================
+app.get('/api/security/agent-outbound-status', async (req, res) => {
+  try {
+    const envEnabled = process.env.AGENT_CLIENT_OUTBOUND === 'on'
+    const { rows: ovr } = await query("SELECT value FROM app_settings WHERE key = 'agent_client_outbound'")
+    const dbEnabled = ovr[0]?.value?.enabled === true
+    const enabled = envEnabled || dbEnabled
+    const { rows } = await query(
+      `SELECT
+          COUNT(*) FILTER (WHERE blocked_at > NOW() - INTERVAL '24 hours')::int AS total_24h,
+          COUNT(*) FILTER (WHERE blocked_at > NOW() - INTERVAL '7 days')::int AS total_7d,
+          COUNT(*)::int AS total_alltime
+         FROM agent_outbound_blocks`
+    ).catch(() => ({ rows: [{ total_24h: 0, total_7d: 0, total_alltime: 0 }] }))
+    res.json({
+      kill_switch_active: !enabled,
+      agent_outbound_enabled: enabled,
+      source: envEnabled ? 'env' : (dbEnabled ? 'db' : null),
+      blocks_24h: rows[0].total_24h,
+      blocks_7d: rows[0].total_7d,
+      blocks_total: rows[0].total_alltime,
+      updated_by: ovr[0]?.value?.updated_by || null,
+      updated_at: ovr[0]?.value?.updated_at || null,
+    })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/api/security/agent-outbound-toggle', async (req, res) => {
+  try {
+    const { enabled, by } = req.body || {}
+    const val = !!enabled
+    const updatedAt = new Date().toISOString()
+    const meta = { enabled: val, updated_by: by || 'caio', updated_at: updatedAt }
+    await query(
+      `INSERT INTO app_settings (key, value, updated_by, updated_at)
+       VALUES ('agent_client_outbound', $1::jsonb, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [JSON.stringify(meta), by || 'caio']
+    )
+    // Atualiza no servico em memoria
+    const ws = await import('./services/whatsapp.js')
+    ws.setAgentOutboundOverride?.(val)
+
+    // Audit + notificacao
+    await createNotification({
+      type: 'kill_switch_toggle',
+      title: val ? '🔓 Agentes liberados pra falar com clientes' : '🔒 Kill-switch ATIVADO — agentes nao falam com clientes',
+      message: `Mudanca aplicada por ${by || 'caio'} as ${new Date().toLocaleString('pt-BR')}`,
+      severity: val ? 'warning' : 'info',
+      metadata: { handler: 'agent_outbound_toggle', enabled: val, by },
+      push: { tag: 'kill-switch' },
+    })
+    res.json({ ok: true, enabled: val })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/security/agent-outbound-blocks', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200)
+    const { rows } = await query(
+      `SELECT id, chat_id, suggested_text, blocked_at, redirected_to_group
+         FROM agent_outbound_blocks
+        ORDER BY blocked_at DESC LIMIT $1`,
+      [limit]
+    )
+    res.json({ ok: true, total: rows.length, blocks: rows })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ============================================
+// EXPIRING DATA — agrega TUDO que vence (cert NFS-e, docs clientes, contratos)
+// para o banner de alerta global na TopBar.
+// Severities:
+//   - vencido: ja venceu (data <= hoje)
+//   - critico: <= 7 dias
+//   - atencao: <= 30 dias
+// ============================================
+app.get('/api/expiring-data', async (req, res) => {
+  const out = { items: [], counts: { vencido: 0, critico: 0, atencao: 0 } }
+  const now = new Date()
+  const daysBetween = (d) => Math.floor((new Date(d).getTime() - now.getTime()) / 86400000)
+  const classify = (days) => days < 0 ? 'vencido' : days <= 7 ? 'critico' : days <= 30 ? 'atencao' : null
+
+  // 1) Certificado NFS-e proprio (Atrio)
+  try {
+    const NFSE = process.env.NFSE_SYSTEM_URL || 'http://31.97.175.200:3020'
+    const r = await fetch(`${NFSE}/api/prestador`)
+    const j = await r.json()
+    const p = j?.data
+    if (p?.certificadoValidade) {
+      const days = daysBetween(p.certificadoValidade)
+      const sev = classify(days)
+      if (sev) {
+        out.items.push({
+          id: 'nfse-cert',
+          severity: sev,
+          category: 'certificado',
+          title: `Certificado A1 ${p.razaoSocial}`,
+          subtitle: days < 0 ? `venceu ha ${Math.abs(days)}d` : `vence em ${days}d`,
+          dueDate: p.certificadoValidade,
+          daysUntil: days,
+          system: 'nfse',
+          url: 'http://31.97.175.200:3020',
+        })
+        out.counts[sev]++
+      }
+    }
+  } catch (e) { console.error('[expiring/nfse]', e.message) }
+
+  // 2) Contratos de clientes com data_fim proxima
+  try {
+    const { rows: contratos } = await query(
+      `SELECT ct.id, ct.numero_contrato, ct.data_fim, ct.valor_mensal,
+              c.legal_name, c.trade_name
+         FROM datalake_gesthub.contratos ct
+         JOIN datalake_gesthub.clients c ON c.id = ct.cliente_id
+        WHERE ct.ativo = TRUE
+          AND ct.data_fim IS NOT NULL
+          AND ct.data_fim <= CURRENT_DATE + INTERVAL '30 days'`
+    ).catch(() => ({ rows: [] }))
+    for (const ct of contratos) {
+      const days = daysBetween(ct.data_fim)
+      const sev = classify(days)
+      if (!sev) continue
+      out.items.push({
+        id: `contrato-${ct.id}`,
+        severity: sev,
+        category: 'contrato_honorarios',
+        title: `Contrato ${ct.numero_contrato} — ${ct.trade_name || ct.legal_name}`,
+        subtitle: days < 0 ? `expirou ha ${Math.abs(days)}d (R$ ${ct.valor_mensal}/mes)` : `expira em ${days}d (R$ ${ct.valor_mensal}/mes)`,
+        dueDate: ct.data_fim,
+        daysUntil: days,
+        system: 'gesthub',
+        url: 'http://31.97.175.200/contratos',
+      })
+      out.counts[sev]++
+    }
+  } catch (e) { console.error('[expiring/contratos]', e.message) }
+
+  // 3) Documentos de clientes (Gesthub)
+  try {
+    const GH = process.env.GESTHUB_API_URL || 'http://31.97.175.200'
+    const r = await fetch(`${GH}/api/client-files/expiring?days=30`)
+    const j = await r.json()
+    const docs = Array.isArray(j?.data) ? j.data : []
+    for (const d of docs) {
+      const days = d.diasParaVencer
+      const sev = classify(days)
+      if (!sev) continue
+      out.items.push({
+        id: `gesthub-doc-${d.id}`,
+        severity: sev,
+        category: 'documento_cliente',
+        title: `${d.nome} — ${d.clientName}`,
+        subtitle: days < 0 ? `venceu ha ${Math.abs(days)}d (${d.categoria})` : `vence em ${days}d (${d.categoria})`,
+        dueDate: d.dataVencimento || d.validade,
+        daysUntil: days,
+        system: 'gesthub',
+        url: `http://31.97.175.200/clientes/${d.clientId}`,
+      })
+      out.counts[sev]++
+    }
+  } catch (e) { console.error('[expiring/gesthub]', e.message) }
+
+  // Ordena: vencido > critico > atencao, depois por daysUntil asc
+  const order = { vencido: 0, critico: 1, atencao: 2 }
+  out.items.sort((a, b) => order[a.severity] - order[b.severity] || a.daysUntil - b.daysUntil)
+  res.json(out)
+})
 
 // ============================================
 // NOTIFICATIONS — Central de notificações
@@ -837,14 +1015,52 @@ app.post('/api/tasks/:id/cancel', async (req, res) => {
     const { rows } = await query(
       `UPDATE tasks SET status = 'cancelled',
               completed_at = NOW(),
-              result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('cancel_reason', $2, 'cancelled_at', NOW())
-        WHERE id = $1 AND status IN ('blocked', 'pending') RETURNING id, title`,
+              result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('cancel_reason', $2::text, 'cancelled_at', NOW()::text)
+        WHERE id = $1 AND status IN ('blocked', 'pending', 'in_progress') RETURNING id, title`,
       [req.params.id, note || 'cancelada manualmente via UI']
     );
-    if (!rows.length) return res.status(404).json({ error: 'Task nao encontrada' });
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Task nao encontrada ou nao cancelavel' });
     res.json({ ok: true, task: rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/tasks/:id/manual-resolve — marca como done com nota manual
+app.post('/api/tasks/:id/manual-resolve', async (req, res) => {
+  try {
+    const { note } = req.body || {};
+    const { rows } = await query(
+      `UPDATE tasks SET status = 'done',
+              completed_at = NOW(),
+              result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('manual_resolve_note', $2::text, 'manually_resolved_at', NOW()::text, 'manually_resolved_by', 'caio')
+        WHERE id = $1 AND status IN ('blocked', 'pending', 'in_progress') RETURNING id, title`,
+      [req.params.id, note || 'resolvida manualmente via UI']
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Task nao encontrada' });
+    broadcast({ type: 'task_completed', task: rows[0] });
+    res.json({ ok: true, task: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/tasks/:id/reassign — muda assigned_to (humano ou outro agente)
+app.post('/api/tasks/:id/reassign', async (req, res) => {
+  try {
+    const { assigned_to, note } = req.body || {};
+    if (!assigned_to) return res.status(400).json({ ok: false, error: 'assigned_to obrigatorio' });
+    const { rows } = await query(
+      `UPDATE tasks SET assigned_to = $2, status = 'pending',
+              result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('reassigned_at', NOW()::text, 'reassign_note', $3::text)
+        WHERE id = $1 RETURNING id, title, assigned_to`,
+      [req.params.id, assigned_to, note || 'reassigned via UI']
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Task nao encontrada' });
+    broadcast({ type: 'task_updated', task: rows[0] });
+    res.json({ ok: true, task: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -871,14 +1087,16 @@ app.post('/api/tasks', async (req, res) => {
     );
     const newTask = rows[0];
 
-    // Notification: nova tarefa criada
+    // Notification: nova tarefa criada + push (alta/urgente so)
+    const shouldPush = newTask.priority === 'high' || newTask.priority === 'urgent';
     createNotification({
       type: 'task_created',
       title: 'Nova tarefa criada',
-      message: newTask.title,
+      message: `${newTask.title}${assigned_to ? ` → ${assigned_to}` : ''}`,
       severity: 'info',
       taskId: newTask.id,
       metadata: { priority: newTask.priority, assigned_to },
+      push: shouldPush ? { url: `/?task=${newTask.id}`, tag: `task-${newTask.id}` } : false,
     }).catch(() => {});
 
     res.status(201).json(newTask);
@@ -989,7 +1207,7 @@ app.patch('/api/tasks/:id', async (req, res) => {
     if (status === 'done') {
       broadcast({ type: 'task_completed', task });
 
-      // Notification: tarefa concluída via API
+      // Notification: tarefa concluída via API (push só se cliente aguarda — por ora, info apenas)
       createNotification({
         type: 'task_complete',
         title: 'Tarefa concluída',
@@ -1327,6 +1545,164 @@ app.post('/api/agent-chat', async (req, res) => {
       }
     } catch {}
 
+    // === RETROALIMENTACAO: conversas WhatsApp (essencial quando pergunta e sobre atendimento) ===
+    // Se pergunta mencionar atendimento/conversa/WhatsApp/humano/intervencao OU nome de pessoa,
+    // puxa contexto de conversas da luna_v2 para responder com base em dados REAIS.
+    let whatsappContexto = '';
+    try {
+      const lowerTxt = text.toLowerCase();
+      const isSobreAtendimento = /atendiment|conversa|whats|intervenc|humano|respond|cliente|atendeu|falou\s+com/i.test(lowerTxt);
+      const mencionaNome = /\b([A-ZÁÉÍÓÚÂÊÔÃÕÇ][a-záéíóúâêôãõç]{2,})\b/.test(text);
+
+      if (isSobreAtendimento || mencionaNome) {
+        const palavras = text.match(/\b[A-ZÁÉÍÓÚÂÊÔÃÕÇ][a-záéíóúâêôãõç]{2,}\b/g) || [];
+        const nomesPossiveis = palavras.filter(p => !['Caio','Luna','Rodrigo','Campelo','Sneijder','Sofia','Natalia','Saldanha','Andre','André'].includes(p));
+
+        // Detecta numero de telefone na pergunta (6+ digitos)
+        const phoneMatch = text.match(/\b(\d{6,})\b/);
+
+        let filtroWhere = '';
+        const params = [];
+        if (phoneMatch) {
+          // Filtro por telefone especifico (match parcial — inclusao)
+          filtroWhere = ' AND c.phone ILIKE $1';
+          params.push(`%${phoneMatch[1]}%`);
+        } else if (nomesPossiveis.length > 0) {
+          const term = nomesPossiveis[0];
+          // Procura cliente luna por nome
+          const { rows: matches } = await query(
+            `SELECT id FROM luna_v2.clients WHERE nome_fantasia ILIKE $1 OR nome_legal ILIKE $1 LIMIT 3`,
+            [`%${term}%`]
+          ).catch(() => ({ rows: [] }));
+          // Ou contato gesthub — acha pessoa no Gesthub e correlaciona com luna_v2 via gesthub_id
+          if (matches.length === 0) {
+            const { rows: gh } = await query(
+              `SELECT DISTINCT cc.cliente_id, cc.telefone FROM datalake_gesthub.cliente_contatos cc
+                WHERE cc.nome ILIKE $1 LIMIT 5`,
+              [`%${term}%`]
+            ).catch(() => ({ rows: [] }));
+            if (gh.length > 0) {
+              // tenta por gesthub_id em luna_v2.clients
+              const ghIds = gh.map(r => r.cliente_id).filter(Boolean);
+              if (ghIds.length > 0) {
+                const { rows: lunaMatches } = await query(
+                  `SELECT id FROM luna_v2.clients WHERE gesthub_id = ANY($1::int[])`, [ghIds]
+                ).catch(() => ({ rows: [] }));
+                matches.push(...lunaMatches);
+              }
+              // tenta por telefone direto em conversations
+              const phones = gh.map(r => (r.telefone || '').replace(/\D/g, '')).filter(p => p.length >= 8);
+              if (phones.length > 0) {
+                // Aplica filtro por phone se nao achou cliente
+                if (matches.length === 0) {
+                  filtroWhere = ' AND (' + phones.map((_, i) => `c.phone ILIKE $${i + 1}`).join(' OR ') + ')';
+                  params.push(...phones.map(p => `%${p}%`));
+                }
+              }
+            }
+          }
+          // Tambem tenta colaboradores (Deyvison, Diogo, etc sao internos) e whatsapp_conversations.client_name
+          if (matches.length === 0 && !filtroWhere) {
+            const { rows: wac } = await query(
+              `SELECT phone, real_phone FROM whatsapp_conversations WHERE client_name ILIKE $1 LIMIT 5`,
+              [`%${term}%`]
+            ).catch(() => ({ rows: [] }));
+            const waPhones = [];
+            for (const w of wac) {
+              if (w.phone) waPhones.push(w.phone);
+              if (w.real_phone) waPhones.push(w.real_phone);
+            }
+            const { rows: colabs } = await query(
+              `SELECT telefone FROM datalake_gesthub.colaboradores WHERE nome ILIKE $1 AND telefone IS NOT NULL LIMIT 3`,
+              [`%${term}%`]
+            ).catch(() => ({ rows: [] }));
+            const colPhones = colabs.map(c => (c.telefone || '').replace(/\D/g, '')).filter(p => p.length >= 8);
+            const todos = [...new Set([...waPhones, ...colPhones])];
+            if (todos.length > 0) {
+              filtroWhere = ' AND (' + todos.map((_, i) => `c.phone ILIKE $${i + 1}`).join(' OR ') + ')';
+              params.push(...todos.map(p => `%${p}%`));
+            }
+          }
+          if (matches.length > 0 && !filtroWhere) {
+            filtroWhere = ' AND c.client_id = ANY($1::uuid[])';
+            params.push(matches.map(m => m.id));
+          }
+        }
+
+        const { rows: stats } = await query(`
+          SELECT
+            c.id as conv_id,
+            c.phone,
+            c.attendance_status,
+            c.last_message_at,
+            c.last_human_reply_at,
+            c.last_inbound_at,
+            c.last_outbound_at,
+            COALESCE(cli.nome_fantasia, cli.nome_legal, wac.client_name, '') as cliente_nome,
+            wac.real_phone,
+            wac.human_replied as wac_human_replied,
+            wac.human_replied_at as wac_human_replied_at,
+            (SELECT COUNT(*) FROM luna_v2.messages m WHERE m.conversation_id = c.id AND m.direction = 'inbound') as inbound_count,
+            (SELECT COUNT(*) FROM luna_v2.messages m WHERE m.conversation_id = c.id AND m.direction = 'outbound' AND m.sender_type = 'agent') as luna_count,
+            (SELECT COUNT(*) FROM luna_v2.messages m WHERE m.conversation_id = c.id AND m.direction = 'outbound' AND m.sender_type = 'human') as human_count,
+            (SELECT COUNT(*) FROM whatsapp_messages wm JOIN whatsapp_conversations wc2 ON wc2.id = wm.conversation_id WHERE wc2.phone = c.phone AND wm.sender = 'team') as wa_human_count
+          FROM luna_v2.conversations c
+          LEFT JOIN luna_v2.clients cli ON cli.id = c.client_id
+          LEFT JOIN whatsapp_conversations wac ON wac.phone = c.phone
+          WHERE c.last_message_at > NOW() - INTERVAL '30 days'${filtroWhere}
+          ORDER BY c.last_message_at DESC
+          LIMIT 10
+        `, params).catch((e) => { console.warn('[AgentChat] whatsapp stats:', e.message); return { rows: [] }; });
+
+        if (stats.length > 0) {
+          whatsappContexto = '\n\nCONVERSAS WHATSAPP REAIS (evidencia factual — NUNCA contradiga):\n';
+          for (const s of stats) {
+            const identif = s.cliente_nome || s.phone;
+            const humanMsgs = parseInt(s.human_count || 0);
+            const waHumanMsgs = parseInt(s.wa_human_count || 0);
+            const totalHumano = humanMsgs + waHumanMsgs;
+            const lunaMsgs = parseInt(s.luna_count || 0);
+            const inboundMsgs = parseInt(s.inbound_count || 0);
+            const teveHumano = totalHumano > 0 || !!s.last_human_reply_at || !!s.wac_human_replied;
+
+            whatsappContexto += `\n• ${identif} [${s.attendance_status || '?'}] phone=${s.phone}${s.real_phone ? ` (real: ${s.real_phone})` : ''}`;
+            whatsappContexto += `\n  Mensagens: ${inboundMsgs} do cliente, ${lunaMsgs} da Luna, ${totalHumano} da equipe (humano)`;
+            if (teveHumano) {
+              const quando = s.last_human_reply_at || s.wac_human_replied_at;
+              if (quando) {
+                whatsappContexto += `\n  => HOUVE INTERVENCAO HUMANA — ultima em ${new Date(quando).toLocaleString('pt-BR')}`;
+              } else {
+                whatsappContexto += `\n  => HOUVE INTERVENCAO HUMANA (${totalHumano} msg da equipe)`;
+              }
+            } else {
+              whatsappContexto += `\n  => Sem intervencao humana registrada na base (porem se usuario viu resposta no WA, pode ser falha de captura)`;
+            }
+            if (s.last_message_at) {
+              whatsappContexto += `\n  Ultima msg: ${new Date(s.last_message_at).toLocaleString('pt-BR')}`;
+            }
+
+            const { rows: msgsRec } = await query(`
+              SELECT direction, sender_type, agent_id, substring(content, 1, 180) as content, created_at
+                FROM luna_v2.messages
+               WHERE conversation_id = $1
+               ORDER BY created_at DESC LIMIT 6
+            `, [s.conv_id]).catch(() => ({ rows: [] }));
+            if (msgsRec.length > 0) {
+              whatsappContexto += `\n  Ultimas mensagens:`;
+              for (const m of msgsRec.reverse()) {
+                const quem = m.direction === 'inbound' ? 'CLIENTE'
+                           : m.sender_type === 'human' ? 'EQUIPE(humano)'
+                           : m.sender_type === 'agent' ? 'LUNA(bot)'
+                           : 'outbound';
+                whatsappContexto += `\n    [${quem}] ${(m.content || '').replace(/\n/g, ' ').slice(0, 180)}`;
+              }
+            }
+          }
+          whatsappContexto += '\n\nAo responder sobre intervencao humana: use os campos acima (human_count + last_human_reply_at). NAO diga "nao tenho registro" se a evidencia mostrar intervencao.';
+        }
+      }
+    } catch (e) { console.warn('[AgentChat] whatsapp context fail:', e.message); }
+
     // Monta contexto: últimas mensagens do chat + pergunta do CEO
     const recentChat = agentChatLog.slice(-20).map(m => `${m.from}: ${m.text}`).join('\n');
     const prompt = `Você está no chat interno da equipe do Átrio Contabilidade. O CEO Caio acabou de enviar uma mensagem para você.
@@ -1335,9 +1711,9 @@ REGRA ABSOLUTA — ANTI-ALUCINACAO:
 - JAMAIS afirme que emitiu, concluiu, enviou ou finalizou algo sem ter a evidencia factual abaixo.
 - Se sua propria TASK estiver BLOQUEADA/FALHOU na secao "SUAS ULTIMAS TASKS", voce DEVE reportar isso honestamente — NUNCA dizer "sim, foi emitida".
 - Se o CEO perguntar sobre status/resultado, sempre USE as tools disponiveis (ex: consultar_status_nfse) antes de afirmar.
-- Se nao tem certeza, responda "deixa eu verificar" e chame a tool apropriada.${tasksReais}${licoesAprendidas}
+- Se nao tem certeza, responda "deixa eu verificar" e chame a tool apropriada.${tasksReais}${licoesAprendidas}${whatsappContexto}
 
-CONTEXTO DAS ULTIMAS MENSAGENS DO CHAT (pode estar desatualizado — confie no estado real das tasks acima):
+CONTEXTO DAS ULTIMAS MENSAGENS DO CHAT (pode estar desatualizado — confie no estado real das tasks/conversas acima):
 ${recentChat}
 
 MENSAGEM DO CEO CAIO: ${text.trim()}
@@ -1398,11 +1774,14 @@ export function broadcast(data) {
 // WHATSAPP — Luna
 // ============================================
 import * as whatsapp from './services/whatsapp.js';
+import { cleanupExpiredAttachments, formatBytes as fmtBytes } from './services/attachment-retention.js';
+import * as pushSvc from './services/push.js';
 import * as telegram from './services/telegram.js';
 import * as omie from './services/omie.js';
 import { scheduleDailyReport, generateDailyReport } from './services/daily-report.js';
 import { scheduleAuditorDaily, generateAuditorReport } from './services/auditor-daily.js';
 import { scheduleSaldanhaDaily, generateSaldanhaReport } from './services/saldanha-daily.js';
+import { feriadosDoAno, checarFeriado } from './services/feriados.js';
 import * as scheduler from './services/scheduler.js';
 import { startCronScheduler, registerCronHandler, executeCronJob, getCronHandler } from './services/cronScheduler.js';
 import { checkInadimplencia, checkContasPagar, checkSemHonorario, checkAlertasFiscais, checkDadosIncompletos } from './services/scheduler.js';
@@ -1446,7 +1825,8 @@ app.get('/api/whatsapp/pending', (req, res) => {
 app.post('/api/whatsapp/send', async (req, res) => {
   const { phone, message } = req.body;
   try {
-    await whatsapp.sendMessage(phone, message);
+    // manual=true bypassa o kill-switch agente→cliente (este endpoint e disparado por humano via painel).
+    await whatsapp.sendMessage(phone, message, { manual: true });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1477,7 +1857,7 @@ app.get('/api/whatsapp/conversations', async (req, res) => {
 app.get('/api/whatsapp/conversations/:id/messages', async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT sender, body, metadata, created_at FROM whatsapp_messages WHERE conversation_id = $1 ORDER BY created_at`,
+      `SELECT id, sender, body, metadata, created_at FROM whatsapp_messages WHERE conversation_id = $1 ORDER BY created_at`,
       [req.params.id]
     );
     res.json(rows);
@@ -1506,10 +1886,17 @@ app.post('/api/whatsapp/mark-replied/:phone', (req, res) => {
   res.json({ success: ok });
 });
 
-app.post('/api/whatsapp/conversations/:phone/resolve', (req, res) => {
-  whatsapp.resolveConversation(req.params.phone);
-  broadcast({ type: 'whatsapp_resolved', phone: req.params.phone });
-  res.json({ success: true });
+app.post('/api/whatsapp/conversations/:phone/resolve', async (req, res) => {
+  try {
+    const result = await whatsapp.resolveConversation(req.params.phone);
+    if (!result?.ok) {
+      return res.status(404).json({ success: false, error: result?.error || 'Conversa nao encontrada' });
+    }
+    broadcast({ type: 'whatsapp_resolved', phone: req.params.phone, count: result.count });
+    res.json({ success: true, count: result.count, conversations: result.conversations });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
@@ -1528,6 +1915,935 @@ app.post('/api/whatsapp/reconnect', async (req, res) => {
     // Responde imediato — initialize sobe Puppeteer e QR chega via WebSocket
     res.json({ success: true, message: 'Reconectando... QR Code será enviado via WebSocket.' });
     whatsapp.initialize().catch(err => console.error('[WhatsApp] Falha ao reconectar:', err.message));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Atendimento — integração com Gesthub (painel direito da conversa)
+// ============================================
+
+/**
+ * GET /api/atendimento/conversation/:id/client-context
+ * Retorna dados do cliente vinculado + histórico rápido pra exibir no painel direito.
+ * Se a conversa nao esta linkada, retorna { linked: false }.
+ */
+app.get('/api/atendimento/conversation/:id/client-context', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // 1) Busca a conversa e o client_id vinculado
+    const { rows: convRows } = await query(
+      `SELECT id, phone, real_phone, client_name, gesthub_client_id, contact_type, contact_label, contact_details
+       FROM whatsapp_conversations WHERE id = $1`,
+      [id]
+    );
+    if (!convRows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
+    const conv = convRows[0];
+
+    // 2) Busca TODOS os clientes vinculados (N:M via whatsapp_conversation_clients)
+    const { rows: links } = await query(
+      `SELECT gesthub_client_id, is_primary FROM whatsapp_conversation_clients WHERE conversation_id = $1 ORDER BY is_primary DESC, created_at ASC`,
+      [id]
+    );
+
+    // Fallback retro: se ja tem gesthub_client_id mas junction vazia, considera o existente
+    const linkedIds = links.length
+      ? links.map(l => Number(l.gesthub_client_id))
+      : (conv.gesthub_client_id ? [Number(conv.gesthub_client_id)] : []);
+
+    if (linkedIds.length === 0) {
+      return res.json({ linked: false, conversation: conv, clients: [] });
+    }
+
+    const { getClients, getBootstrap } = await import('./services/gesthub.js');
+    const allClients = await getClients();
+    const linkedClients = linkedIds.map(cid => allClients.find(c => Number(c.id) === cid)).filter(Boolean);
+    if (linkedClients.length === 0) {
+      return res.json({ linked: false, conversation: conv, warning: 'client_ids invalidos', clients: [] });
+    }
+
+    const primary = linkedClients[0]; // primeiro = primary
+
+    // 3) Badges + legalizacoes + onboardings somente do primary (compat retro)
+    let badges = null;
+    try {
+      const r = await fetch(`http://localhost:3010/api/datalake/cliente-badges?ids=${linkedClients.map(c => c.id).join(',')}`);
+      if (r.ok) {
+        const j = await r.json();
+        badges = j?.[String(primary.id)] || null;
+      }
+    } catch { /* ignora */ }
+
+    const bs = await getBootstrap().catch(() => ({}));
+    const docs = linkedClients.map(c => String(c.document || '').replace(/\D/g, '')).filter(Boolean);
+    const legalizacoes = (bs?.legalizations || []).filter(l => docs.includes(String(l.document || '').replace(/\D/g, '')));
+    const onboardings = (bs?.onboardings || []).filter(o => linkedIds.includes(Number(o.clienteId)));
+
+    res.json({
+      linked: true,
+      conversation: conv,
+      client: primary,           // compat retro: primeiro cliente como client
+      clients: linkedClients,    // NOVO: array de todos os vinculados
+      badges,
+      legalizacoes,
+      onboardings,
+    });
+  } catch (err) {
+    console.error('[client-context] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/atendimento/conversation/:id/candidates
+ * Retorna TODOS os clientes Gesthub cujo telefone bate com o da conversa.
+ * Permite que o painel direito mostre switcher quando o mesmo numero pertence
+ * a mais de uma empresa (ex: socio de 2 empresas).
+ */
+app.get('/api/atendimento/conversation/:id/candidates', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows: cRows } = await query(
+      `SELECT id, phone, real_phone, display_phone, gesthub_client_id, client_name
+       FROM whatsapp_conversations WHERE id = $1`,
+      [id]
+    );
+    if (!cRows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
+    const conv = cRows[0];
+
+    // Normaliza digits11 dos identificadores
+    const toDigits11 = (s) => {
+      const d = String(s || '').replace(/\D/g, '');
+      if (!d) return null;
+      if ((d.length === 13 || d.length === 12) && d.startsWith('55')) return d.slice(2);
+      return d;
+    };
+    const candidates = [conv.phone, conv.real_phone, conv.display_phone].map(toDigits11).filter(Boolean);
+
+    const { getClients } = await import('./services/gesthub.js');
+    const all = await getClients();
+    const matches = [];
+    for (const c of all) {
+      const phones = [];
+      if (Array.isArray(c.contatos)) for (const ct of c.contatos) phones.push(ct.telefone);
+      if (c.phone) phones.push(c.phone);
+      const normalized = phones.map(toDigits11).filter(p => p && p.length >= 10);
+      if (candidates.some(q => normalized.includes(q))) {
+        matches.push({
+          id: c.id,
+          legalName: c.legalName,
+          tradeName: c.tradeName,
+          document: c.document,
+          status: c.status,
+          type: c.type,
+          taxRegime: c.taxRegime,
+          city: c.city,
+          state: c.state,
+        });
+      }
+    }
+
+    res.json({
+      data: matches,
+      current_id: conv.gesthub_client_id,
+      conversation: conv,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/atendimento/clientes/search?q=...
+ * Busca clientes no Gesthub por nome/CNPJ. Retorna top 20.
+ */
+app.get('/api/atendimento/clientes/search', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().toLowerCase();
+    if (q.length < 2) return res.json({ data: [] });
+    const { getClients } = await import('./services/gesthub.js');
+    const clients = await getClients();
+    const qDigits = q.replace(/\D/g, '');
+    const matches = clients.filter(c => {
+      const name = String(c.legalName || c.tradeName || '').toLowerCase();
+      const doc = String(c.document || '').replace(/\D/g, '');
+      if (name.includes(q)) return true;
+      if (qDigits && doc.includes(qDigits)) return true;
+      return false;
+    }).slice(0, 20).map(c => ({
+      id: c.id,
+      legalName: c.legalName,
+      tradeName: c.tradeName,
+      document: c.document,
+      status: c.status,
+      type: c.type,
+      city: c.city,
+      state: c.state,
+    }));
+    res.json({ data: matches });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/atendimento/conversation/:id/link-client
+ * Vincula uma conversa a um cliente do Gesthub.
+ * body: { client_id, update_phone?: bool }
+ *   - update_phone=true: envia PATCH pro Gesthub adicionando o número como contato do cliente
+ */
+app.post('/api/atendimento/conversation/:id/link-client', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { client_id, update_phone = true, contato_nome, contato_funcao, set_primary = true } = req.body || {};
+    if (!client_id) return res.status(400).json({ error: 'client_id obrigatorio' });
+
+    // Verifica conv existe
+    const { rows: convRows } = await query(
+      `SELECT id, phone, real_phone, client_name, gesthub_client_id FROM whatsapp_conversations WHERE id = $1`,
+      [id]
+    );
+    if (!convRows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
+
+    // Insere no junction (idempotente)
+    await query(
+      `INSERT INTO whatsapp_conversation_clients (conversation_id, gesthub_client_id, is_primary)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (conversation_id, gesthub_client_id) DO NOTHING`,
+      [id, Number(client_id), !!set_primary]
+    );
+
+    // Se eh primary, ajusta o flag e atualiza gesthub_client_id (compat retro)
+    if (set_primary) {
+      await query(
+        `UPDATE whatsapp_conversation_clients SET is_primary = (gesthub_client_id = $2) WHERE conversation_id = $1`,
+        [id, Number(client_id)]
+      );
+      await query(
+        `UPDATE whatsapp_conversations SET gesthub_client_id = $1 WHERE id = $2`,
+        [Number(client_id), id]
+      );
+    }
+
+    const { rows } = await query(
+      `SELECT id, phone, real_phone, client_name, gesthub_client_id FROM whatsapp_conversations WHERE id = $1`,
+      [id]
+    );
+    const conv = rows[0];
+
+    // Invalida cache do bootstrap pra proximo lookup puxar dados atualizados
+    try { (await import('./services/gesthub.js')).invalidateCache(); } catch {}
+
+    // Adiciona o telefone como contato do cliente no Gesthub (se ainda nao existir)
+    let contatoCriado = null
+    let contatoSkipReason = null
+    if (update_phone !== false) {
+      const phoneClean = String(conv.real_phone || conv.phone || '').replace(/\D/g, '')
+      if (phoneClean.length >= 10) {
+        try {
+          const GH = process.env.GESTHUB_API_URL || 'http://31.97.175.200'
+          // Verifica duplicatas
+          const existing = await fetch(`${GH}/api/clients/${client_id}/contatos`).then(r => r.json()).catch(() => ({}))
+          const list = existing?.data || []
+          // Dedupe tolerante: compara últimos 8 dígitos OU normaliza removendo "9" do celular BR
+          const norm = (p) => {
+            const d = String(p || '').replace(/\D/g, '')
+            // Remove DDI 55, depois remove "9" móvel se for celular BR (após DDD)
+            const noDDI = d.startsWith('55') && d.length >= 12 ? d.slice(2) : d
+            // Se tem 11 dígitos (DDD + 9 + 8) e o 3º dígito é 9, remove
+            if (noDDI.length === 11 && noDDI[2] === '9') return noDDI.slice(0,2) + noDDI.slice(3)
+            return noDDI
+          }
+          const targetNorm = norm(phoneClean)
+          const dup = list.find(c => norm(c.telefone) === targetNorm)
+          if (dup) {
+            contatoSkipReason = `Ja existe contato com este telefone (id=${dup.id}, ${dup.nome})`
+          } else {
+            const nome = contato_nome || conv.client_name || `Contato WhatsApp`
+            const funcao = contato_funcao || 'WHATSAPP'
+            const r = await fetch(`${GH}/api/clients/${client_id}/contatos`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ nome, telefone: phoneClean, funcao, email: '', cpf: '' }),
+            })
+            const j = await r.json().catch(() => ({}))
+            if (r.ok && j?.data) {
+              contatoCriado = j.data
+            } else {
+              contatoSkipReason = `Gesthub rejeitou: ${j?.error || j?.detail || `HTTP ${r.status}`}`
+            }
+          }
+        } catch (e) {
+          contatoSkipReason = `Erro ao adicionar contato: ${e.message}`
+        }
+      } else {
+        contatoSkipReason = 'telefone nao identificado (<10 digitos)'
+      }
+    }
+
+    broadcast({ type: 'conversation_linked', conversation_id: id, client_id });
+
+    res.json({
+      ok: true,
+      data: conv,
+      phone_updated: !!contatoCriado,
+      contato_criado: contatoCriado,
+      contato_skip_reason: contatoSkipReason,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/atendimento/backfill-contatos
+ * Para todas as conversations.gesthub_client_id IS NOT NULL, garante que o
+ * telefone esteja em gesthub.cliente_contatos (insere se faltar, dedupe por telefone).
+ */
+app.post('/api/atendimento/backfill-contatos', async (req, res) => {
+  const GH = process.env.GESTHUB_API_URL || 'http://31.97.175.200'
+  try {
+    const { rows: convs } = await query(
+      `SELECT id, phone, real_phone, client_name, gesthub_client_id
+         FROM whatsapp_conversations
+        WHERE gesthub_client_id IS NOT NULL AND is_group = FALSE`
+    )
+
+    let inserted = 0, skipped = 0, errors = 0
+    const detalhes = []
+
+    for (const conv of convs) {
+      const phoneClean = String(conv.real_phone || conv.phone || '').replace(/\D/g, '')
+      if (phoneClean.length < 10) { skipped++; continue }
+      try {
+        const existing = await fetch(`${GH}/api/clients/${conv.gesthub_client_id}/contatos`).then(r => r.json()).catch(() => ({}))
+        const list = existing?.data || []
+        const _norm = (p) => {
+          const d = String(p || '').replace(/\D/g, '')
+          const noDDI = d.startsWith('55') && d.length >= 12 ? d.slice(2) : d
+          if (noDDI.length === 11 && noDDI[2] === '9') return noDDI.slice(0,2) + noDDI.slice(3)
+          return noDDI
+        }
+        const targetN = _norm(phoneClean)
+        const dup = list.find(c => _norm(c.telefone) === targetN)
+        if (dup) { skipped++; continue }
+        const nome = conv.client_name || 'Contato WhatsApp'
+        const r = await fetch(`${GH}/api/clients/${conv.gesthub_client_id}/contatos`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nome, telefone: phoneClean, funcao: 'WHATSAPP', email: '', cpf: '' }),
+        })
+        if (r.ok) {
+          inserted++
+          detalhes.push({ cliente_id: conv.gesthub_client_id, nome, telefone: phoneClean })
+        } else {
+          errors++
+        }
+      } catch { errors++ }
+    }
+
+    res.json({ ok: true, total_conversas: convs.length, inserted, skipped, errors, sample: detalhes.slice(0, 10) })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+/**
+ * POST /api/atendimento/conversation/:id/save-as-contact
+ * Categoriza uma conversa que NAO e cliente (parceiro, fornecedor, prospect, pessoal, spam).
+ * body: { type, label? }
+ *   - type: 'parceiro' | 'fornecedor' | 'prospect' | 'pessoal' | 'spam'
+ *   - label: nome/descricao amigavel (ex: "WiseHub Certificados")
+ */
+app.post('/api/atendimento/conversation/:id/save-as-contact', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { type, label, details } = req.body || {};
+    const validTypes = ['equipe', 'parceiro', 'fornecedor', 'prospect', 'pessoal', 'spam', 'cliente_externo'];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({ error: `type invalido. Use: ${validTypes.join(', ')}` });
+    }
+    // Sanitiza details — so chaves esperadas, strings <= 500 char
+    const cleanDetails = {}
+    if (details && typeof details === 'object') {
+      const allowed = ['subtipo', 'descricao', 'contato_pessoa', 'contato_funcao', 'contato_email', 'site', 'cnpj', 'oque_fazem', 'como_usamos', 'observacoes']
+      for (const k of allowed) {
+        if (typeof details[k] === 'string' && details[k].trim()) {
+          cleanDetails[k] = details[k].trim().slice(0, 500)
+        }
+      }
+      cleanDetails.updated_at = new Date().toISOString()
+      cleanDetails.updated_by = 'caio' // futuro: pegar do auth
+    }
+    const { rows } = await query(
+      `UPDATE whatsapp_conversations
+       SET contact_type = $1,
+           contact_label = $2,
+           contact_details = $3::jsonb,
+           gesthub_client_id = NULL
+       WHERE id = $4
+       RETURNING id, phone, client_name, contact_type, contact_label, contact_details`,
+      [type, (label || '').slice(0, 200) || null, JSON.stringify(cleanDetails), id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
+    broadcast({ type: 'contact_saved', conversation_id: id, contact_type: type });
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/atendimento/conversation/:id/unlink-client
+ * Remove o vinculo (caso vinculo errado, ex: LID ambiguo).
+ */
+app.post('/api/atendimento/conversation/:id/unlink-client', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { client_id } = req.body || {};
+    if (client_id) {
+      // Remove só esse vínculo do junction
+      await query(
+        `DELETE FROM whatsapp_conversation_clients WHERE conversation_id = $1 AND gesthub_client_id = $2`,
+        [id, Number(client_id)]
+      );
+      // Se removeu o primary, eleger outro como primary
+      const { rows: rest } = await query(
+        `SELECT gesthub_client_id FROM whatsapp_conversation_clients WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 1`,
+        [id]
+      );
+      if (rest.length) {
+        await query(`UPDATE whatsapp_conversation_clients SET is_primary = TRUE WHERE conversation_id = $1 AND gesthub_client_id = $2`, [id, rest[0].gesthub_client_id]);
+        await query(`UPDATE whatsapp_conversations SET gesthub_client_id = $1 WHERE id = $2`, [rest[0].gesthub_client_id, id]);
+      } else {
+        await query(`UPDATE whatsapp_conversations SET gesthub_client_id = NULL WHERE id = $1`, [id]);
+      }
+    } else {
+      // Remove todos os vínculos
+      await query(`DELETE FROM whatsapp_conversation_clients WHERE conversation_id = $1`, [id]);
+      await query(`UPDATE whatsapp_conversations SET gesthub_client_id = NULL WHERE id = $1`, [id]);
+    }
+    broadcast({ type: 'conversation_unlinked', conversation_id: id });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Copilot IA — assistente interno dos operadores durante atendimento WhatsApp
+// ============================================
+/**
+ * POST /api/atendimento/copilot
+ * Body: { conversation_id, question }
+ *
+ * Coleta contexto: dados cliente (Gesthub) + ultimas 10 msgs + top 3 memorias RAG
+ * + tarefas abertas do cliente. Envia pra LLM (usa mesma config da Luna) e
+ * retorna resposta JSON simples.
+ *
+ * NAO cria memoria, NAO modifica prompts. Apenas consulta + responde.
+ */
+app.post('/api/atendimento/copilot', async (req, res) => {
+  try {
+    const { conversation_id, question } = req.body || {};
+    if (!conversation_id) return res.status(400).json({ error: 'conversation_id obrigatorio' });
+    if (!question || String(question).trim().length < 3) {
+      return res.status(400).json({ error: 'pergunta muito curta' });
+    }
+
+    // 1) Busca conversa + ultimas msgs
+    const { rows: convRows } = await query(
+      `SELECT id, phone, real_phone, client_name, gesthub_client_id
+       FROM whatsapp_conversations WHERE id = $1`,
+      [conversation_id]
+    );
+    if (!convRows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
+    const conv = convRows[0];
+
+    const { rows: msgRows } = await query(
+      `SELECT sender, body, created_at FROM whatsapp_messages
+       WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 12`,
+      [conversation_id]
+    );
+    const lastMsgs = msgRows.reverse(); // ordem cronologica
+
+    // 2) Busca cliente Gesthub (se linkado)
+    let client = null;
+    if (conv.gesthub_client_id) {
+      try {
+        const { getClients } = await import('./services/gesthub.js');
+        const all = await getClients();
+        client = all.find(c => Number(c.id) === Number(conv.gesthub_client_id));
+      } catch (e) { console.error('[copilot] gesthub falhou:', e.message); }
+    }
+
+    // 3) RAG: top memorias relevantes pra pergunta
+    let memorias = [];
+    try {
+      const { searchMemories } = await import('./services/embeddings.js');
+      memorias = await searchMemories(question, { limit: 5 });
+    } catch (e) { console.error('[copilot] RAG falhou:', e.message); }
+
+    // 4) Tasks abertas do cliente (se linkado)
+    let tasks = [];
+    if (conv.gesthub_client_id) {
+      const { rows: tRows } = await query(
+        `SELECT title, description, status, priority FROM tasks
+         WHERE (result->>'client_id' = $1::text OR result->>'cliente_id' = $1::text)
+           AND status IN ('pending', 'in_progress', 'blocked')
+         ORDER BY created_at DESC LIMIT 5`,
+        [String(conv.gesthub_client_id)]
+      ).catch(() => ({ rows: [] }));
+      tasks = tRows;
+    }
+
+    // 5) Monta prompt estruturado
+    const ctxCliente = client ? [
+      `- Razão Social: ${client.legalName || '--'}`,
+      `- CNPJ: ${client.document || '--'}`,
+      `- Tipo: ${client.type || '--'}`,
+      `- Regime Tributario: ${client.taxRegime || '--'}`,
+      client.fatorR === 'SIM' ? '- Fator R: SIM' : null,
+      client.porte ? `- Porte: ${client.porte}` : null,
+      `- Sócio responsável: ${client.officeOwner || '--'}`,
+      client.analyst ? `- Analista: ${client.analyst}` : null,
+      client.celula ? `- Célula: ${client.celula}` : null,
+      client.headcount ? `- Headcount: ${client.headcount}` : null,
+      client.monthlyFee ? `- Honorário: R$ ${client.monthlyFee}` : null,
+      client.city ? `- Local: ${client.city}/${client.state}` : null,
+      client.cnae_descricao || client.cnaeDescricao ? `- CNAE: ${client.cnae_descricao || client.cnaeDescricao}` : null,
+    ].filter(Boolean).join('\n') : '(cliente NÃO vinculado na Carteira — identificação pendente)';
+
+    const ctxMsgs = lastMsgs.length ? lastMsgs.map(m => {
+      const who = m.sender === 'client' ? 'CLIENTE' : (m.sender === 'luna' || m.sender === 'bot' ? 'LUNA' : 'EQUIPE');
+      const when = new Date(m.created_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+      return `[${when} ${who}] ${String(m.body || '').slice(0, 300)}`;
+    }).join('\n') : '(sem mensagens ainda)';
+
+    const ctxMems = memorias.length ? memorias.map((m, i) =>
+      `${i + 1}. ${m.title}\n   ${String(m.summary || m.content || '').slice(0, 250)}`
+    ).join('\n\n') : '(nenhuma regra relevante no RAG)';
+
+    const ctxTasks = tasks.length ? tasks.map(t =>
+      `- [${t.status}] ${t.title}${t.description ? ': ' + String(t.description).slice(0, 150) : ''}`
+    ).join('\n') : '(nenhuma task aberta)';
+
+    const systemPrompt = `Você é o Copilot interno da Átrio Contabilidade, assistente dos operadores ` +
+      `(Quesia, Deyvison, Caio, Diogo, Diego, Natalia) durante atendimento de clientes contábeis.\n\n` +
+      `REGRAS CRITICAS:\n` +
+      `1. Responda APENAS com dados presentes no contexto fornecido. NUNCA invente status, localização ou estado de documentos/uploads/tasks.\n` +
+      `2. Se o operador perguntar sobre um arquivo/documento/status específico que NÃO está explicitamente no contexto, responda: "Não encontrei essa informação no meu contexto. Verifica direto em [Documentos/Finance/etc]".\n` +
+      `3. Nunca afirme que algo "está pendente de aprovação", "foi salvo em X" ou "chegou em Y" se isso não está literalmente nos dados fornecidos.\n` +
+      `4. Seja CONCISO (máximo 4 frases), direto, sem floreios, sem emojis.\n` +
+      `5. Tom técnico-contábil quando apropriado.\n\n` +
+      `Se faltar informação pra responder com confiança, diga claramente o que falta.`;
+
+    const userPrompt = `=== CLIENTE (do Gesthub) ===\n${ctxCliente}\n\n` +
+      `=== ÚLTIMAS MENSAGENS DA CONVERSA WHATSAPP ===\n${ctxMsgs}\n\n` +
+      `=== REGRAS E CONHECIMENTO RELEVANTE (top ${memorias.length} do RAG) ===\n${ctxMems}\n\n` +
+      `=== TAREFAS ABERTAS DO CLIENTE ===\n${ctxTasks}\n\n` +
+      `=== PERGUNTA DO OPERADOR ===\n${question}`;
+
+    // 6) Chama LLM (usa config da Luna — Kimi K2 via OpenRouter)
+    const { query: q2 } = await import('./db/pool.js');
+    const { rows: agentRows } = await q2(`SELECT * FROM agents WHERE name = 'Luna' LIMIT 1`);
+    const luna = agentRows[0];
+    if (!luna) return res.status(500).json({ error: 'Config Luna nao encontrada' });
+
+    const { chatWithAgent } = await import('./services/claude.js');
+    const t0 = Date.now();
+    const resp = await chatWithAgent(
+      { ...luna, system_prompt: systemPrompt },
+      [{ role: 'user', content: userPrompt }]
+    );
+    const latencyMs = Date.now() - t0;
+
+    if (!resp?.success) {
+      return res.status(500).json({ error: resp?.error || 'LLM falhou' });
+    }
+
+    res.json({
+      ok: true,
+      answer: (resp.text || '').trim(),
+      model: resp.model,
+      latency_ms: latencyMs,
+      context_used: {
+        cliente_linked: !!client,
+        msgs_count: lastMsgs.length,
+        memorias_count: memorias.length,
+        tasks_count: tasks.length,
+        memorias_titulos: memorias.map(m => m.title),
+      },
+    });
+  } catch (err) {
+    console.error('[copilot] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Detectar compromisso em mensagem enviada — auto-agendamento
+// ============================================
+/**
+ * POST /api/atendimento/detect-commitment
+ * Body: { text, conversation_id? }
+ *
+ * Analisa texto da mensagem (LLM) procurando promessa com data.
+ * Exemplos detectaveis:
+ *   "até segunda te posiciono sobre o IR"
+ *   "envio amanhã"
+ *   "resposta na sexta"
+ *   "dia 30 te retorno"
+ *   "semana que vem"
+ *
+ * Retorna { commitments: [{date_iso, title, confidence}] } ou {commitments: []}.
+ */
+app.post('/api/atendimento/detect-commitment', async (req, res) => {
+  try {
+    const { text, conversation_id } = req.body || {};
+    if (!text || String(text).trim().length < 6) {
+      return res.json({ commitments: [] });
+    }
+
+    // Contexto: cliente linkado, se tiver
+    let clientName = null;
+    if (conversation_id) {
+      try {
+        const { rows } = await query(
+          `SELECT c.client_name, cl.legal_name, cl.trade_name
+           FROM whatsapp_conversations c
+           LEFT JOIN clients cl ON cl.id::text = c.gesthub_client_id::text
+           WHERE c.id = $1 LIMIT 1`,
+          [conversation_id]
+        ).catch(() => ({ rows: [] }));
+        clientName = rows[0]?.legal_name || rows[0]?.trade_name || rows[0]?.client_name || null;
+      } catch {}
+    }
+
+    const today = new Date();
+    const todayStr = today.toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' });
+
+    const systemPrompt = `Você é um detector de compromissos em texto PT-BR. Dado o texto que um colaborador da Átrio Contabilidade ENVIOU a um cliente, extraia TODOS os compromissos com data/prazo.
+
+Compromisso = promessa do tipo "te envio X na/até segunda", "posiciono amanhã", "resposta até dia 30", "semana que vem".
+
+Hoje é ${todayStr}. Converta TODAS as referências temporais em ISO date (YYYY-MM-DD). Para dias da semana, use o PRÓXIMO dia dessa semana (se hoje é quinta e alguém diz "segunda", é segunda que vem).
+
+Responda APENAS com JSON neste formato (sem texto antes/depois):
+{"commitments":[{"date_iso":"YYYY-MM-DD","title":"breve descrição","phrase":"trecho original"}]}
+
+Se NENHUM compromisso detectado, responda: {"commitments":[]}`;
+
+    const userPrompt = `CLIENTE: ${clientName || '(não identificado)'}\nTEXTO ENVIADO:\n${text}`;
+
+    // Usa config da Luna (Kimi) pra inferir
+    const { rows: agentRows } = await query(`SELECT * FROM agents WHERE name = 'Luna' LIMIT 1`);
+    const luna = agentRows[0];
+    if (!luna) return res.json({ commitments: [] });
+
+    const { chatWithAgent } = await import('./services/claude.js');
+    const resp = await chatWithAgent(
+      { ...luna, system_prompt: systemPrompt, config: { ...luna.config, max_tokens: 400, temperature: 0.1 } },
+      [{ role: 'user', content: userPrompt }]
+    );
+
+    if (!resp?.success) return res.json({ commitments: [] });
+
+    // Parse JSON da resposta da LLM (tolerante a lixo antes/depois)
+    let parsed = { commitments: [] };
+    try {
+      const raw = (resp.text || '').trim();
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (e) { console.error('[detect-commitment] parse:', e.message); }
+
+    const commitments = Array.isArray(parsed.commitments) ? parsed.commitments.filter(c => c.date_iso && c.title) : [];
+    // Filtro de sanidade: data no futuro, no maximo 6 meses adiante
+    const now = Date.now();
+    const max = now + 180 * 86400 * 1000;
+    const valid = commitments.filter(c => {
+      const d = new Date(c.date_iso).getTime();
+      return !isNaN(d) && d >= now - 86400 * 1000 && d <= max;
+    });
+
+    res.json({
+      commitments: valid,
+      client_name: clientName,
+    });
+  } catch (err) {
+    console.error('[detect-commitment] erro:', err.message);
+    res.json({ commitments: [] });  // nao quebra envio de msg
+  }
+});
+
+// ============================================
+// Download de anexo de mensagem WhatsApp
+// ============================================
+/**
+ * GET /api/whatsapp/messages/:id/attachment
+ * Serve o arquivo anexo persistido em storage/whatsapp-attachments.
+ * Body da msg deve ter metadata.attachment.storage_path.
+ */
+app.get('/api/whatsapp/messages/:id/attachment', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await query(
+      `SELECT body, metadata FROM whatsapp_messages WHERE id = $1`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'mensagem nao encontrada' });
+    const meta = typeof rows[0].metadata === 'string'
+      ? (() => { try { return JSON.parse(rows[0].metadata) } catch { return {} } })()
+      : (rows[0].metadata || {});
+    const att = meta.attachment;
+    if (!att?.storage_path) return res.status(404).json({ error: 'mensagem sem anexo' });
+
+    // Seguranca: restringe path ao diretorio de attachments
+    const fs = await import('fs');
+    const path = await import('path');
+    const allowedBase = process.env.WHATSAPP_ATTACH_DIR || '/app/storage/whatsapp-attachments';
+    const resolvedPath = path.resolve(att.storage_path);
+    if (!resolvedPath.startsWith(path.resolve(allowedBase))) {
+      return res.status(403).json({ error: 'path fora do diretorio permitido' });
+    }
+    if (!fs.existsSync(resolvedPath)) {
+      return res.status(404).json({ error: 'arquivo nao encontrado no storage' });
+    }
+
+    const filename = att.filename || 'anexo.bin';
+    const safeName = filename.replace(/[^\w.\-() ]/g, '_');
+    res.setHeader('Content-Type', att.mime_type || 'application/octet-stream');
+    // inline pra PDFs/imagens (previa), attachment pra outros (download)
+    const disposition = (att.mime_type?.startsWith('image/') || att.mime_type === 'application/pdf')
+      ? 'inline' : 'attachment';
+    res.setHeader('Content-Disposition', `${disposition}; filename="${safeName}"`);
+    res.sendFile(resolvedPath);
+  } catch (err) {
+    console.error('[attachment] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Upload + envio de anexo pelo painel
+// ============================================
+/**
+ * POST /api/whatsapp/send-media
+ * Body multipart: file, phone (ou chat_id), caption (opcional)
+ * Envia via whatsapp-web.js MessageMedia.
+ */
+app.post('/api/whatsapp/send-media', async (req, res) => {
+  try {
+    const { phone, caption } = req.body || {};
+    if (!phone) return res.status(400).json({ error: 'phone obrigatorio' });
+    // multer/busboy nao configurado globalmente — usar stream manual
+    // Espera-se que o frontend envie base64 no body JSON pra simplificar
+    const { file_base64, file_name, mime_type } = req.body || {};
+    if (!file_base64 || !file_name) return res.status(400).json({ error: 'file_base64 e file_name obrigatorios' });
+
+    const whatsappSvc = await import('./services/whatsapp.js');
+    // manual=true: humano enviando do painel
+    await whatsappSvc.sendMedia(phone, file_base64, file_name, mime_type || 'application/octet-stream', caption || '', { manual: true });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[send-media] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Apagar mensagem enviada (para todos) — usa wa_msg_id salvo no metadata
+// ============================================
+app.post('/api/whatsapp/messages/:id/delete', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Busca mensagem no nosso banco
+    const { rows } = await query(
+      `SELECT m.id, m.sender, m.body, m.metadata, m.created_at,
+              c.phone, c.chat_id
+       FROM whatsapp_messages m
+       JOIN whatsapp_conversations c ON c.id = m.conversation_id
+       WHERE m.id = $1`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'mensagem nao encontrada' });
+    const msg = rows[0];
+
+    // So apagamos mensagens NOSSAS (team/luna/bot) — cliente nao
+    if (msg.sender === 'client') {
+      return res.status(400).json({ error: 'Nao e possivel apagar mensagem do cliente' });
+    }
+
+    // Janela do WhatsApp pra "delete for everyone" e curta (~1h pra msg nova,
+    // 2 dias pra 0.31 acima). Se passou, avisa mas ainda marca como apagada localmente.
+    const ageMs = Date.now() - new Date(msg.created_at).getTime();
+    const withinWindow = ageMs < 60 * 60 * 1000; // 1h
+
+    const meta = typeof msg.metadata === 'string' ? (() => { try { return JSON.parse(msg.metadata) } catch { return {} } })() : (msg.metadata || {});
+    const waMsgId = meta.wa_msg_id;
+    const chatId = meta.chat_id || msg.chat_id;
+
+    let whatsappResult = null;
+    if (waMsgId && withinWindow) {
+      try {
+        whatsappResult = await whatsapp.deleteMessageForEveryone(waMsgId, chatId);
+      } catch (e) {
+        console.error('[delete-msg] falha WhatsApp:', e.message);
+        whatsappResult = { ok: false, error: e.message };
+      }
+    }
+
+    // Mesmo que o delete no WA falhe, marca apagada no nosso DB pra consistencia visual
+    await query(
+      `UPDATE whatsapp_messages
+       SET body = '[mensagem apagada]',
+           metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('deleted', true, 'deleted_at', NOW(), 'original_body', body)
+       WHERE id = $1`,
+      [id]
+    );
+
+    broadcast({ type: 'message_deleted', message_id: id });
+    res.json({
+      ok: true,
+      whatsapp_deleted: whatsappResult?.ok === true,
+      warning: !waMsgId ? 'Mensagem antiga sem wa_msg_id — so apagada localmente' :
+               !withinWindow ? 'Janela de exclusao WhatsApp expirou — so apagada localmente' :
+               whatsappResult?.error || null,
+    });
+  } catch (err) {
+    console.error('[delete-msg] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Message Templates — atalhos de resposta pro atendimento WhatsApp
+// ============================================
+app.get('/api/atendimento/templates', async (req, res) => {
+  try {
+    const { category, q } = req.query;
+    let sql = 'SELECT id, name, category, body, usage_count, created_at, updated_at FROM message_templates WHERE is_active = TRUE';
+    const params = [];
+    if (category) { params.push(category); sql += ` AND category = $${params.length}`; }
+    if (q) { params.push(`%${q}%`); sql += ` AND (name ILIKE $${params.length} OR body ILIKE $${params.length})`; }
+    sql += ' ORDER BY usage_count DESC NULLS LAST, name ASC LIMIT 100';
+    const { rows } = await query(sql, params);
+    res.json({ data: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/atendimento/templates', async (req, res) => {
+  try {
+    const { name, category, body, created_by } = req.body || {};
+    if (!name || !body) return res.status(400).json({ error: 'name e body sao obrigatorios' });
+    const { rows } = await query(
+      `INSERT INTO message_templates (name, category, body, created_by)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [String(name).slice(0, 120), category || 'outros', body, created_by || null]
+    );
+    res.status(201).json({ data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/atendimento/templates/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, category, body, is_active } = req.body || {};
+    const updates = [];
+    const params = [];
+    if (name !== undefined) { params.push(name); updates.push(`name = $${params.length}`); }
+    if (category !== undefined) { params.push(category); updates.push(`category = $${params.length}`); }
+    if (body !== undefined) { params.push(body); updates.push(`body = $${params.length}`); }
+    if (is_active !== undefined) { params.push(!!is_active); updates.push(`is_active = $${params.length}`); }
+    if (updates.length === 0) return res.status(400).json({ error: 'nada pra atualizar' });
+    updates.push('updated_at = NOW()');
+    params.push(id);
+    const { rows } = await query(
+      `UPDATE message_templates SET ${updates.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+    if (!rows.length) return res.status(404).json({ error: 'template nao encontrado' });
+    res.json({ data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Incrementa o uso pra ranking (chamar quando usuario insere o template no chat)
+app.post('/api/atendimento/templates/:id/track-use', async (req, res) => {
+  try {
+    await query('UPDATE message_templates SET usage_count = COALESCE(usage_count, 0) + 1 WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/atendimento/templates/:id', async (req, res) => {
+  try {
+    // soft-delete: marca is_active=FALSE (mantem historico de uso)
+    await query('UPDATE message_templates SET is_active = FALSE, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Push notifications (Web Push)
+// ============================================
+app.get('/api/push/public-key', (req, res) => {
+  const key = pushSvc.getPublicKey();
+  if (!key) return res.status(503).json({ error: 'push nao configurado' });
+  res.json({ publicKey: key });
+});
+
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { userId, subscription, userAgent } = req.body || {};
+    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+      return res.status(400).json({ error: 'subscription invalida' });
+    }
+    const r = await pushSvc.registerSubscription({
+      userId: userId || 'caio',
+      endpoint: subscription.endpoint,
+      p256dh: subscription.keys.p256dh,
+      auth: subscription.keys.auth,
+      userAgent: userAgent || req.headers['user-agent'],
+    });
+    res.json({ ok: true, id: r.id });
+  } catch (err) {
+    console.error('[push/subscribe]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/push/unsubscribe', async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint) return res.status(400).json({ error: 'endpoint obrigatorio' });
+    await pushSvc.removeSubscription(endpoint);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Disparar push manualmente (teste). Em producao, triggers estao nos handlers de eventos.
+app.post('/api/push/test', async (req, res) => {
+  try {
+    const { userId, title, body, url } = req.body || {};
+    const r = await pushSvc.sendPushToUser(userId || 'caio', {
+      title: title || 'Átrio Office',
+      body: body || 'Notificação de teste',
+      url: url || '/',
+    });
+    res.json(r);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1958,6 +3274,19 @@ app.post('/api/tasks/:id/comments', async (req, res) => {
 app.get("/api/metrics/impact", async (_req, res) => { try { res.json(await getImpactMetrics()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.post('/api/saldanha/sweep', async (req, res) => { try { const txt = await generateSaldanhaReport(logAgentChat); res.json({ ok: true, texto: txt }); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.post('/api/auditor/report', async (req, res) => { try { const txt = await generateAuditorReport(logAgentChat); res.json({ ok: true, texto: txt }); } catch (e) { res.status(500).json({ error: e.message }); } });
+// Feriados nacionais (fixos + moveis calculados via Pascoa)
+app.get('/api/feriados', (req, res) => {
+  const ano = parseInt(req.query.ano) || new Date().getFullYear();
+  try {
+    res.json({ ano, feriados: feriadosDoAno(ano) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/feriados/hoje', (req, res) => {
+  try {
+    const result = checarFeriado(new Date());
+    res.json({ data: new Date().toISOString().slice(0,10), ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 // Express error handler — DEVE ser o ultimo middleware registrado
 app.use(expressErrorHandler());
 registerDatalake(app);
@@ -2093,6 +3422,1235 @@ server.listen(PORT, async () => {
     const tasks = await query("DELETE FROM tasks WHERE status IN ('done', 'cancelled') AND completed_at < NOW() - INTERVAL '30 days'")
     const runs = await query("DELETE FROM cron_runs WHERE started_at < NOW() - INTERVAL '90 days'")
     return `Limpeza: ${msgs.rowCount || 0} mensagens, ${tasks.rowCount || 0} tasks, ${runs.rowCount || 0} cron runs removidos`
+  })
+
+  // === Inter Banking — sync diario D-1 pra todas integracoes ativas ===
+  registerCronHandler('inter_sync_diario', async () => {
+    const url = (process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000') + '/api/integracoes/cron/sincronizar-todos'
+    try {
+      const resp = await fetch(url, { method: 'POST' })
+      const j = await resp.json()
+      if (!j.ok) return `Falhou: ${j.error || 'erro desconhecido'}`
+      const d = j.data || {}
+      return `Inter sync: ${d.sucesso || 0}/${d.total_integracoes || 0} sucesso, ${d.falhas || 0} falhas`
+    } catch (e) {
+      return `Erro acionando sync Inter: ${e.message}`
+    }
+  })
+
+  // === Inter Banking — alerta diario de certificados vencendo ===
+  registerCronHandler('inter_cert_check', async () => {
+    const url = (process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000') + '/api/integracoes/certificados/vencendo'
+    try {
+      const resp = await fetch(url)
+      const j = await resp.json()
+      const items = (j.data || [])
+      if (items.length === 0) return 'Nenhum certificado proximo do vencimento'
+
+      // Monta mensagem pra cada vencimento e dispara via chat interno
+      const { chat } = await import('./services/chat-broadcaster.js').catch(() => ({ chat: null }))
+      for (const item of items) {
+        const msg = item.dias_ate_expirar <= 0
+          ? `🔴 Certificado Inter VENCIDO do cliente #${item.cliente_id} (integracao ${item.integracao_id}). Gere novo no IB e atualize.`
+          : `⚠️ Certificado Inter vence em ${item.dias_ate_expirar} dias — cliente #${item.cliente_id}. Lembrar cliente de gerar novo no IB.`
+        if (chat) chat({ from: 'Luna', text: msg, tag: 'cert-inter' })
+        console.log(`[inter_cert_check] ${msg}`)
+      }
+      return `${items.length} certificado(s) em alerta notificado(s)`
+    } catch (e) {
+      return `Erro verificando certificados: ${e.message}`
+    }
+  })
+
+  // === Continuidade contabil — audita saldos entre meses pra todos clientes ===
+  // Regra: saldo_final mes N deve bater com saldo_inicial mes N+1 (mesma conta).
+  // Divergencia = upload faltando, duplicado ou parser errado.
+  registerCronHandler('continuidade_saldos', async () => {
+    const url = (process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000') + '/api/clientes'
+    try {
+      // Busca todos clientes
+      const resp = await fetch(url)
+      const j = await resp.json()
+      const clientes = j?.data || []
+      const divergenciasGlobais = []
+
+      for (const c of clientes) {
+        const contUrl = (process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000')
+          + `/api/transacoes/continuidade?cliente_id=${c.id}`
+        try {
+          const r = await fetch(contUrl)
+          const cj = await r.json()
+          const divergentes = cj?.data?.divergencias || []
+          for (const d of divergentes) {
+            divergenciasGlobais.push({ cliente_id: c.id, cliente_nome: c.legalName || c.tradeName, ...d })
+          }
+        } catch (_e) { /* skip cliente */ }
+      }
+
+      if (divergenciasGlobais.length === 0) {
+        return `Todos clientes com saldos contabeis consistentes (${clientes.length} verificados)`
+      }
+
+      // Notifica equipe via createNotification (aparece no sino de notificacoes)
+      const top5 = divergenciasGlobais
+        .sort((a, b) => Math.abs(b.diferenca) - Math.abs(a.diferenca))
+        .slice(0, 5)
+      const resumo = top5.map(d =>
+        `  - ${d.cliente_nome}: saldo ${d.dePeriodoFim || '?'} (R$ ${d.saldoFinalAnterior}) nao bate com inicio ${d.paraPeriodoInicio || '?'} (R$ ${d.saldoInicialProximo}) diff R$ ${d.diferenca}`
+      ).join('\n')
+      const msg = `Continuidade contabil: ${divergenciasGlobais.length} divergencia(s) detectadas.\n\nTop ${top5.length} por magnitude:\n${resumo}\n\nAbrir Atrio Finance > Transacoes > filtrar cliente afetado pra investigar.`
+      try {
+        await createNotification({
+          type: 'auditoria_saldo',
+          title: `Continuidade contabil: ${divergenciasGlobais.length} divergencia(s)`,
+          message: msg,
+          severity: 'warning',
+          metadata: { handler: 'continuidade_saldos', total: divergenciasGlobais.length, top5 },
+        })
+      } catch (e) { console.error('[continuidade_saldos] notification failed:', e.message) }
+      console.log(`[continuidade_saldos] ${divergenciasGlobais.length} divergencias de ${clientes.length} clientes`)
+      return `${divergenciasGlobais.length} divergencias de saldo entre meses detectadas em ${clientes.length} clientes (top ${top5.length} notificadas)`
+    } catch (e) {
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Documentos vencendo — alerta proativo de certificados/procuracoes ===
+  // Roda diariamente 09h. Consulta Gesthub /client-files/expiring, agrupa por
+  // criticidade (vencido/critico ≤7d/atencao ≤30d) e notifica equipe.
+  registerCronHandler('docs_validade_check', async () => {
+    const url = (process.env.GESTHUB_API_URL || 'http://31.97.175.200') + '/api/client-files/expiring?days=30'
+    try {
+      const r = await fetch(url)
+      const j = await r.json()
+      const docs = Array.isArray(j?.data) ? j.data : []
+      if (docs.length === 0) return 'Nenhum documento vencendo nos proximos 30 dias'
+
+      const vencidos = docs.filter(d => d.status === 'vencido')
+      const criticos = docs.filter(d => d.status === 'critico')
+      const atencao  = docs.filter(d => d.status === 'atencao')
+
+      const linhas = []
+      if (vencidos.length) {
+        linhas.push(`VENCIDOS (${vencidos.length}):`)
+        linhas.push(...vencidos.slice(0, 5).map(d =>
+          `  - ${d.clientName}: ${d.nome} (${d.categoria}) venceu ha ${Math.abs(d.diasParaVencer)}d`
+        ))
+      }
+      if (criticos.length) {
+        linhas.push(`CRITICOS (${criticos.length}) - vence em <= 7 dias:`)
+        linhas.push(...criticos.slice(0, 5).map(d =>
+          `  - ${d.clientName}: ${d.nome} vence em ${d.diasParaVencer}d`
+        ))
+      }
+      if (atencao.length) {
+        linhas.push(`ATENCAO (${atencao.length}) - vence em 8-30 dias:`)
+        linhas.push(...atencao.slice(0, 3).map(d =>
+          `  - ${d.clientName}: ${d.nome} vence em ${d.diasParaVencer}d`
+        ))
+      }
+
+      const msg = linhas.join('\n')
+      const severity = vencidos.length > 0 || criticos.length > 0 ? 'warning' : 'info'
+
+      try {
+        await createNotification({
+          type: 'documento_validade',
+          title: `Documentos: ${vencidos.length} vencido(s), ${criticos.length} critico(s), ${atencao.length} atencao`,
+          message: msg,
+          severity,
+          metadata: { handler: 'docs_validade_check', counts: { vencidos: vencidos.length, criticos: criticos.length, atencao: atencao.length } },
+        })
+      } catch (e) { console.error('[docs_validade] notification failed:', e.message) }
+
+      console.log(`[docs_validade] ${vencidos.length} vencidos, ${criticos.length} criticos, ${atencao.length} atencao`)
+      return `${vencidos.length} vencidos, ${criticos.length} criticos, ${atencao.length} atencao (30d)`
+    } catch (e) {
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Natalia: Health-check da carteira — sinaliza clientes "frios" sem entrega de docs ===
+  // Roda semanal segunda 08h. Cliente ativo SEM upload de extrato em 60d → cria task pra Natalia.
+  registerCronHandler('natalia_health_check', async () => {
+    const NATALIA_ID = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab' // team_members
+    const FINANCE = process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000'
+    try {
+      // Clientes ATIVOS no Gesthub COM mais de 60 dias (recem-criados nao contam)
+      const { rows: ativos } = await query(
+        `SELECT id, legal_name, trade_name, status, document, monthly_fee
+           FROM datalake_gesthub.clients
+          WHERE status = 'ATIVO'
+            AND (
+              start_date IS NULL OR start_date = ''
+              OR (start_date ~ '^\\d{4}-\\d{2}-\\d{2}$' AND start_date::date < CURRENT_DATE - INTERVAL '60 days')
+            )`
+      )
+
+      // Cruza com Finance: quem nao tem upload nos ultimos 60d
+      const r = await fetch(`${FINANCE}/api/uploads?dias=60`).catch(() => null)
+      const j = await r?.json().catch(() => ({}))
+      const uploads = j?.data || j || []
+      const ativosComUpload = new Set(uploads.map(u => u.clienteGesthubId || u.cliente_gesthub_id))
+
+      const frios = ativos.filter(c => !ativosComUpload.has(c.id))
+      let criadas = 0
+
+      // Rate-limit: max 15 tasks novas por execucao pra nao inundar
+      // Ordena por monthly_fee desc → prioriza clientes mais valiosos
+      const ordenados = frios
+        .sort((a, b) => Number(b.monthly_fee || 0) - Number(a.monthly_fee || 0))
+        .slice(0, 15)
+
+      for (const c of ordenados) {
+        const taskKey = `health-${c.id}`
+        const dup = await query(
+          `SELECT id FROM tasks WHERE status IN ('pending','in_progress')
+             AND result->>'health_key' = $1 LIMIT 1`,
+          [taskKey]
+        ).catch(() => ({ rows: [] }))
+        if (dup.rows.length) continue
+
+        const cliente = c.trade_name || c.legal_name || `cliente ${c.id}`
+        const msgSugerida = `Olá! Tudo bem por aí? Notei que faz tempo que não recebemos sua movimentação financeira. Está tudo certo no escritório? Se precisar de algo, é só chamar.`
+
+        await query(
+          `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result, created_at)
+           VALUES ($1, $2, $3, NULL, 'medium', 'pending', $4::jsonb, NOW())`,
+          [
+            `Cliente frio (60d sem docs): ${cliente}`,
+            `Cliente ativo no Gesthub mas sem upload de extrato/documentos no Atrio Finance ha mais de 60 dias.\n\nPossivel sinal de churn ou apenas inatividade temporaria.\n\nMensagem sugerida (revisar antes de aprovar envio):\n"${msgSugerida}"\n\nLink Gesthub: http://31.97.175.200/clientes/${c.id}`,
+            NATALIA_ID,
+            JSON.stringify({ source: 'natalia_health_check', health_key: taskKey, gesthub_client_id: c.id, msg_sugerida: msgSugerida }),
+          ]
+        ).catch(e => console.error('[natalia_health_check] insert:', e.message))
+        criadas++
+      }
+
+      const resumo = `Carteira: ${ativos.length} ativos, ${frios.length} sem docs ha 60d → ${criadas} task(s) novas pra Natalia (top 15 por valor mensal)`
+      console.log(`[natalia_health_check] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[natalia_health_check]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Natalia: Aniversario de cliente — 6m (NPS), 12m+ (reajuste) ===
+  // Roda diario 09h. Detecta clientes que completam aniversario hoje e cria task.
+  registerCronHandler('natalia_aniversario_cliente', async () => {
+    const NATALIA_ID = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab'
+    try {
+      const { rows: clientes } = await query(
+        `SELECT id, legal_name, trade_name, start_date, monthly_fee
+           FROM datalake_gesthub.clients
+          WHERE status = 'ATIVO'
+            AND start_date IS NOT NULL
+            AND start_date <> ''
+            AND start_date ~ '^\d{4}-\d{2}-\d{2}$'
+            AND (
+              -- 6 meses exato
+              (EXTRACT(MONTH FROM AGE(CURRENT_DATE, start_date::date)) = 6
+               AND EXTRACT(YEAR FROM AGE(CURRENT_DATE, start_date::date)) = 0
+               AND EXTRACT(DAY FROM AGE(CURRENT_DATE, start_date::date)) = 0)
+              OR
+              -- multiplos de 12 meses
+              (EXTRACT(MONTH FROM start_date::date) = EXTRACT(MONTH FROM CURRENT_DATE)
+               AND EXTRACT(DAY FROM start_date::date) = EXTRACT(DAY FROM CURRENT_DATE)
+               AND DATE_PART('year', AGE(CURRENT_DATE, start_date::date)) >= 1)
+            )`
+      ).catch(() => ({ rows: [] }))
+
+      let criadas = 0
+      for (const c of clientes) {
+        const start = new Date(c.start_date)
+        const anos = Math.floor((Date.now() - start.getTime()) / (365.25 * 86400000))
+        const meses = Math.floor((Date.now() - start.getTime()) / (30.44 * 86400000))
+        const taskKey = `aniv-${c.id}-${new Date().getFullYear()}m${new Date().getMonth() + 1}`
+        const dup = await query(
+          `SELECT id FROM tasks WHERE result->>'aniv_key' = $1 LIMIT 1`,
+          [taskKey]
+        ).catch(() => ({ rows: [] }))
+        if (dup.rows.length) continue
+
+        const cliente = c.trade_name || c.legal_name || `cliente ${c.id}`
+        let titulo, msgSugerida
+        if (meses === 6) {
+          titulo = `🎉 6 meses: ${cliente} — pesquisa NPS`
+          msgSugerida = `Oi! Hoje completam 6 meses do nosso atendimento. Como tem sido pra você? Numa escala de 0 a 10, quanto recomendaria o Atrio pra outro empresario? Se tiver algum ponto que possamos melhorar, conta com a gente!`
+        } else if (anos >= 1) {
+          titulo = `🎂 ${anos} ano(s): ${cliente} — agradecimento + reajuste`
+          msgSugerida = `Oi! Hoje completam ${anos} ano(s) da nossa parceria. Obrigado pela confianca! No proximo mes vamos aplicar o reajuste anual conforme contrato (IGPM/IPCA + servicos agregados). Te envio o detalhe ate o dia 5.`
+        }
+
+        await query(
+          `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result, created_at)
+           VALUES ($1, $2, $3, NULL, 'low', 'pending', $4::jsonb, NOW())`,
+          [
+            titulo,
+            `Cliente ${cliente} (#${c.id}) completa ${meses} meses hoje.\nValor mensal atual: R$ ${c.monthly_fee || '?'}\n\nMensagem sugerida:\n"${msgSugerida}"\n\nLink: http://31.97.175.200/clientes/${c.id}`,
+            NATALIA_ID,
+            JSON.stringify({ source: 'natalia_aniversario_cliente', aniv_key: taskKey, gesthub_client_id: c.id, meses, msg_sugerida: msgSugerida }),
+          ]
+        ).catch(e => console.error('[natalia_aniversario] insert:', e.message))
+        criadas++
+      }
+
+      const resumo = `Aniversarios hoje: ${clientes.length} clientes → ${criadas} task(s) novas`
+      console.log(`[natalia_aniversario] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[natalia_aniversario]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Natalia: Qualificar leads novos (PROSPECT) ===
+  // Diario 10h. Para cada cliente tipo=PROSPECT recente, enriquece CNPJ e cria task de abordagem.
+  registerCronHandler('natalia_qualificar_leads', async () => {
+    const NATALIA_ID = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab'
+    try {
+      const { rows: prospects } = await query(
+        `SELECT id, legal_name, trade_name, document, type
+           FROM datalake_gesthub.clients
+          WHERE client_type = 'PROSPECT'
+            AND status = 'ATIVO'
+            AND created_at > NOW() - INTERVAL '7 days'`
+      ).catch(() => ({ rows: [] }))
+
+      let criadas = 0
+      for (const p of prospects) {
+        const taskKey = `lead-${p.id}`
+        const dup = await query(
+          `SELECT id FROM tasks WHERE result->>'lead_key' = $1 LIMIT 1`,
+          [taskKey]
+        ).catch(() => ({ rows: [] }))
+        if (dup.rows.length) continue
+
+        const cliente = p.trade_name || p.legal_name || `prospect ${p.id}`
+        const msgSugerida = `Ola! Vi seu CNPJ ativo e queria me apresentar. Sou Natalia do Atrio Contabilidade, atendemos empresas como a sua com BPO contabil/fiscal e financeiro. Voce ja tem contador? Posso te enviar uma analise rapida do seu regime atual?`
+
+        await query(
+          `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result, created_at)
+           VALUES ($1, $2, $3, NULL, 'medium', 'pending', $4::jsonb, NOW())`,
+          [
+            `Lead novo: ${cliente}`,
+            `Lead PROSPECT cadastrado nos ultimos 7 dias.\nCNPJ: ${p.document || 's/'}\n\nAcao Natalia: enriquecer CNPJ via consulta_cnpj (porte, regime, CNAE, idade), avaliar fit, sugerir abordagem.\n\nMensagem sugerida (revisar):\n"${msgSugerida}"\n\nLink: http://31.97.175.200/clientes/${p.id}`,
+            NATALIA_ID,
+            JSON.stringify({ source: 'natalia_qualificar_leads', lead_key: taskKey, gesthub_client_id: p.id, msg_sugerida: msgSugerida }),
+          ]
+        ).catch(e => console.error('[natalia_leads] insert:', e.message))
+        criadas++
+      }
+
+      const resumo = `Leads ultimos 7d: ${prospects.length} → ${criadas} task(s) novas pra Natalia`
+      console.log(`[natalia_qualificar_leads] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[natalia_qualificar_leads]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Aprovar e enviar mensagem sugerida (Natalia) — 1 clique ===
+  // POST /api/tasks/:id/approve-and-send
+  // body: { message?: string }   — se nao vier, usa result.msg_sugerida
+  // Resolve telefone via gesthub_client_id → contatos → primeiro com telefone valido.
+  // Envia via WhatsApp, registra historico no task result, marca task done.
+  app.post('/api/tasks/:id/approve-and-send', async (req, res) => {
+    try {
+      const { id } = req.params
+      const { message: customMsg, telefone: telefoneOverride } = req.body || {}
+
+      const { rows } = await query('SELECT * FROM tasks WHERE id = $1', [id])
+      if (!rows.length) return res.status(404).json({ error: 'task nao encontrada' })
+      const task = rows[0]
+      const result = task.result || {}
+      const msg = customMsg || result.msg_sugerida
+      if (!msg) return res.status(400).json({ error: 'sem mensagem (forneca message no body ou result.msg_sugerida)' })
+
+      // Resolve telefone
+      let telefone = telefoneOverride
+      const gesthubId = result.gesthub_client_id
+      if (!telefone && gesthubId) {
+        try {
+          const GH = process.env.GESTHUB_API_URL || 'http://31.97.175.200'
+          const r = await fetch(`${GH}/api/clients/${gesthubId}/contatos`)
+          const j = await r.json()
+          const contatos = (j?.data || []).filter(c => c.telefone && c.telefone.replace(/\D/g, '').length >= 10)
+          // Prioriza SOCIO/DIRETOR, senao primeiro
+          const primary = contatos.find(c => /socio|diretor/i.test(c.funcao || '')) || contatos[0]
+          telefone = primary?.telefone
+        } catch (e) { console.error('[approve-and-send] gesthub:', e.message) }
+      }
+      if (!telefone) return res.status(400).json({ error: 'cliente sem telefone cadastrado em contatos. Adicione o telefone no Gesthub ou passe telefone no body.' })
+
+      // Envia
+      try {
+        await whatsapp.sendMessage(telefone, msg)
+      } catch (e) {
+        return res.status(502).json({ error: `WhatsApp falhou: ${e.message}` })
+      }
+
+      // Marca task como done + registra historico
+      await query(
+        `UPDATE tasks
+            SET status = 'done',
+                completed_at = NOW(),
+                result = COALESCE(result, '{}'::jsonb) || jsonb_build_object(
+                  'approved_at', NOW(),
+                  'sent_to', $1::text,
+                  'sent_message', $2::text,
+                  'approved_by', 'caio'
+                )
+          WHERE id = $3`,
+        [telefone, msg.slice(0, 1000), id]
+      )
+      broadcast({ type: 'task_completed', task_id: id })
+      res.json({ ok: true, sent_to: telefone })
+    } catch (err) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // === Gera obrigacoes fiscais do mes (dia 1, 06h) ===
+  // Chama Gesthub /api/obrigacoes/gerar-mensal — idempotente.
+  registerCronHandler('gerar_obrigacoes_mes', async () => {
+    const GH = process.env.GESTHUB_API_URL || 'http://31.97.175.200'
+    const now = new Date()
+    // Gera obrigacoes do MES PASSADO (competencia anterior — eh sobre essa que se paga agora)
+    const tgt = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+    const ano = tgt.getFullYear()
+    const mes = tgt.getMonth() + 1
+
+    try {
+      const r = await fetch(`${GH}/api/obrigacoes/gerar-mensal?ano=${ano}&mes=${mes}`, { method: 'POST' })
+      const j = await r.json()
+      const resumo = `Obrigacoes ${mes}/${ano}: ${j.criadas} criadas em ${j.total_clientes} clientes (${j.skipped_sem_template} sem template)`
+      console.log(`[gerar_obrigacoes_mes] ${resumo}`)
+      try {
+        await createNotification({
+          type: 'obrigacoes_geradas',
+          title: `${j.criadas} obrigacoes fiscais criadas (${mes}/${ano})`,
+          message: resumo,
+          severity: 'info',
+          metadata: { handler: 'gerar_obrigacoes_mes', ano, mes, ...j },
+        })
+      } catch {}
+      return resumo
+    } catch (e) {
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Aviso obrigacoes prazo D-3, D-1, vencido ===
+  registerCronHandler('obrigacoes_aviso_prazo', async () => {
+    const GH = process.env.GESTHUB_API_URL || 'http://31.97.175.200'
+    try {
+      const r = await fetch(`${GH}/api/obrigacoes?status=pendente`)
+      const j = await r.json()
+      const obrigs = j?.data || []
+      const now = new Date()
+      const today = now.toISOString().slice(0, 10)
+      const buckets = { vencidas: [], hoje: [], d1: [], d3: [] }
+      for (const o of obrigs) {
+        if (!o.prazo) continue
+        const days = Math.ceil((new Date(o.prazo).getTime() - now.getTime()) / 86400000)
+        if (days < 0) buckets.vencidas.push(o)
+        else if (days === 0) buckets.hoje.push(o)
+        else if (days === 1) buckets.d1.push(o)
+        else if (days === 3) buckets.d3.push(o)
+      }
+      const msg = `Obrigacoes: ${buckets.vencidas.length} vencidas, ${buckets.hoje.length} hoje, ${buckets.d1.length} amanha, ${buckets.d3.length} em 3d`
+      if (buckets.vencidas.length || buckets.hoje.length) {
+        try {
+          await createNotification({
+            type: 'obrigacao_prazo',
+            title: `🚨 Obrigacoes fiscais: ${buckets.vencidas.length} vencida(s), ${buckets.hoje.length} vence(m) hoje`,
+            message: msg,
+            severity: 'warning',
+            metadata: { handler: 'obrigacoes_aviso_prazo', ...buckets },
+            push: { tag: 'obrig-prazo' },
+          })
+        } catch {}
+      }
+      console.log(`[obrigacoes_aviso] ${msg}`)
+      return msg
+    } catch (e) {
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Snapshot MRR + alerta de queda mensal ===
+  // Roda diario 23h. Salva snapshot mensal (1x/mes). No dia 1, compara com mes anterior;
+  // se MRR caiu >= 5%, alerta com push critico.
+  registerCronHandler('mrr_snapshot_e_alerta', async () => {
+    try {
+      const { rows: ag } = await query(
+        `SELECT COUNT(*)::int AS clientes_ativos, COALESCE(SUM(monthly_fee), 0)::numeric AS mrr_total
+           FROM datalake_gesthub.clients WHERE status = 'ATIVO'`
+      )
+      const c = ag[0]
+      const today = new Date().toISOString().slice(0, 10)
+
+      // Insere/atualiza snapshot do dia
+      await query(
+        `INSERT INTO mrr_snapshots (snapshot_date, clientes_ativos, mrr_brl)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (snapshot_date) DO UPDATE SET
+           clientes_ativos = EXCLUDED.clientes_ativos,
+           mrr_brl = EXCLUDED.mrr_brl`,
+        [today, c.clientes_ativos, c.mrr_total]
+      )
+
+      // Comparar com snapshot de 30d atras
+      const { rows: prev } = await query(
+        `SELECT clientes_ativos, mrr_brl, snapshot_date
+           FROM mrr_snapshots
+          WHERE snapshot_date <= CURRENT_DATE - INTERVAL '28 days'
+          ORDER BY snapshot_date DESC LIMIT 1`
+      )
+
+      let alertaMsg = null
+      if (prev.length) {
+        const p = prev[0]
+        const mrrAntes = parseFloat(p.mrr_brl)
+        const mrrAgora = parseFloat(c.mrr_total)
+        const deltaPct = mrrAntes > 0 ? ((mrrAgora - mrrAntes) / mrrAntes) * 100 : 0
+        const deltaBrl = mrrAgora - mrrAntes
+        const clientesDelta = c.clientes_ativos - p.clientes_ativos
+
+        if (deltaPct <= -5) {
+          alertaMsg = `📉 MRR caiu ${Math.abs(deltaPct).toFixed(1)}% em relacao a ${p.snapshot_date} (R$ ${mrrAntes.toLocaleString('pt-BR')} → R$ ${mrrAgora.toLocaleString('pt-BR')}, delta R$ ${deltaBrl.toLocaleString('pt-BR')}, clientes: ${clientesDelta >= 0 ? '+' : ''}${clientesDelta})`
+          await createNotification({
+            type: 'mrr_drop',
+            title: `MRR caiu ${Math.abs(deltaPct).toFixed(1)}% no mes`,
+            message: alertaMsg,
+            severity: 'error',
+            metadata: { handler: 'mrr_snapshot_e_alerta', mrr_antes: mrrAntes, mrr_agora: mrrAgora, delta_pct: deltaPct, delta_brl: deltaBrl },
+            push: { tag: 'mrr-drop' },
+          })
+        } else if (deltaPct >= 5) {
+          alertaMsg = `📈 MRR subiu ${deltaPct.toFixed(1)}% em relacao a ${p.snapshot_date} (R$ ${mrrAntes.toLocaleString('pt-BR')} → R$ ${mrrAgora.toLocaleString('pt-BR')}, +${clientesDelta} cliente(s))`
+          await createNotification({
+            type: 'mrr_growth',
+            title: `MRR cresceu ${deltaPct.toFixed(1)}% 🎉`,
+            message: alertaMsg,
+            severity: 'success',
+            metadata: { handler: 'mrr_snapshot_e_alerta', mrr_antes: mrrAntes, mrr_agora: mrrAgora, delta_pct: deltaPct },
+          })
+        } else {
+          alertaMsg = `MRR estavel: R$ ${mrrAgora.toLocaleString('pt-BR')} (${deltaPct >= 0 ? '+' : ''}${deltaPct.toFixed(1)}% vs ${p.snapshot_date})`
+        }
+      } else {
+        alertaMsg = `Snapshot inicial: ${c.clientes_ativos} ativos, R$ ${parseFloat(c.mrr_total).toLocaleString('pt-BR')} (sem comparativo ainda)`
+      }
+
+      console.log(`[mrr_snapshot] ${alertaMsg}`)
+      return alertaMsg
+    } catch (e) {
+      console.error('[mrr_snapshot]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Natalia: Acompanhar respostas — pos-envio detecta se cliente respondeu ===
+  // Roda diario 18h. Para cada task done com sent_to nas ultimas 7 dias:
+  //   - busca whatsapp_messages.sender='client' do mesmo telefone APOS approved_at
+  //   - atualiza result com response_status: 'responded' | 'silent' | 'pending'
+  //   - se silent depois de 5d, cria task de follow-up
+  registerCronHandler('natalia_acompanhar_respostas', async () => {
+    const NATALIA_ID = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab'
+    try {
+      // Tasks aprovadas (Natalia ou outras com msg_sugerida) ultimas 7d, sem response_status fechado
+      const { rows: tasks } = await query(
+        `SELECT id, title, result, completed_at
+           FROM tasks
+          WHERE status = 'done'
+            AND result->>'sent_to' IS NOT NULL
+            AND result->>'approved_at' IS NOT NULL
+            AND (result->>'approved_at')::timestamptz > NOW() - INTERVAL '7 days'
+            AND COALESCE(result->>'response_status_final', '') = ''`
+      ).catch(() => ({ rows: [] }))
+
+      let respondidas = 0, ainda_silent = 0, followup_criado = 0
+      for (const t of tasks) {
+        const r = t.result || {}
+        const phone = String(r.sent_to || '').replace(/\D/g, '')
+        const approvedAt = new Date(r.approved_at)
+        if (!phone || !approvedAt) continue
+
+        // Busca msg client desse telefone APOS approved_at
+        const { rows: resp } = await query(
+          `SELECT m.id, m.body, m.created_at
+             FROM whatsapp_messages m
+             JOIN whatsapp_conversations c ON c.id = m.conversation_id
+            WHERE m.sender = 'client'
+              AND m.created_at > $1
+              AND (
+                regexp_replace(c.phone, '\\D', '', 'g') LIKE '%' || $2
+                OR regexp_replace(COALESCE(c.real_phone, ''), '\\D', '', 'g') LIKE '%' || $2
+              )
+            ORDER BY m.created_at ASC
+            LIMIT 1`,
+          [approvedAt.toISOString(), phone.slice(-10)]
+        ).catch(() => ({ rows: [] }))
+
+        const ageDays = (Date.now() - approvedAt.getTime()) / 86400000
+
+        if (resp.length > 0) {
+          // RESPONDEU
+          await query(
+            `UPDATE tasks
+                SET result = COALESCE(result, '{}'::jsonb) || jsonb_build_object(
+                  'response_status', 'responded',
+                  'response_status_final', 'responded',
+                  'responded_at', $1::text,
+                  'response_preview', $2::text
+                )
+              WHERE id = $3`,
+            [resp[0].created_at, String(resp[0].body || '').slice(0, 500), t.id]
+          ).catch(() => {})
+          respondidas++
+        } else if (ageDays >= 5) {
+          // SILENT >= 5d — fecha como silent + cria follow-up
+          await query(
+            `UPDATE tasks
+                SET result = COALESCE(result, '{}'::jsonb) || jsonb_build_object(
+                  'response_status', 'silent',
+                  'response_status_final', 'silent',
+                  'silent_check_at', NOW()::text
+                )
+              WHERE id = $1`,
+            [t.id]
+          ).catch(() => {})
+
+          // Follow-up task
+          const followupKey = `followup-${t.id}`
+          const dup = await query(
+            `SELECT id FROM tasks WHERE result->>'followup_key' = $1 LIMIT 1`,
+            [followupKey]
+          ).catch(() => ({ rows: [] }))
+          if (!dup.rows.length) {
+            const msgFollowup = `Oi! Te mandei uma mensagem dia ${approvedAt.toLocaleDateString('pt-BR')} mas nao tive retorno. Imagino que tenha sido uma semana corrida — quando puder, me avise se faz sentido conversarmos.`
+            await query(
+              `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result, created_at)
+               VALUES ($1, $2, $3, NULL, 'low', 'pending', $4::jsonb, NOW())`,
+              [
+                `↩ Follow-up sem resposta: ${t.title}`,
+                `Task original ${t.id} foi enviada em ${approvedAt.toLocaleDateString('pt-BR')} para ${r.sent_to} mas nao recebeu resposta em 5 dias.\n\nMensagem original:\n"${r.sent_message || '(nao salva)'}"\n\nFollow-up sugerido:\n"${msgFollowup}"`,
+                NATALIA_ID,
+                JSON.stringify({ source: 'natalia_acompanhar_respostas', followup_key: followupKey, original_task_id: t.id, gesthub_client_id: r.gesthub_client_id, msg_sugerida: msgFollowup }),
+              ]
+            ).catch(e => console.error('[acompanhar] followup insert:', e.message))
+            followup_criado++
+          }
+          ainda_silent++
+        } else {
+          // Aguardando ainda — atualiza status interim sem fechar
+          await query(
+            `UPDATE tasks
+                SET result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('response_status', 'pending')
+              WHERE id = $1`,
+            [t.id]
+          ).catch(() => {})
+        }
+      }
+
+      const resumo = `Acompanhamento: ${tasks.length} aprovadas em 7d, ${respondidas} responderam, ${ainda_silent} silent (5d+), ${followup_criado} follow-up(s) criada(s)`
+      console.log(`[natalia_acompanhar] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[natalia_acompanhar]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Natalia: Upsell — Simples proximo do teto, MEI estourando, sem NFS-e ===
+  // Roda mensal dia 1, 11h.
+  registerCronHandler('natalia_upsell_oportunidades', async () => {
+    const NATALIA_ID = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab'
+    const FINANCE = process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000'
+    try {
+      // 1) MEI proximo do teto (>= R$ 70k de receita YTD = 86% de R$81k)
+      // 2) Simples Nacional proximo do sub-limite estadual (>= R$ 3.5M de R$4.8M)
+      // Vamos cruzar com Finance DRE pra ver receita acumulada YTD por cliente.
+
+      const ano = new Date().getFullYear()
+      const { rows: clientes } = await query(
+        `SELECT id, legal_name, trade_name, tax_regime, monthly_fee
+           FROM datalake_gesthub.clients
+          WHERE status = 'ATIVO'
+            AND tax_regime IN ('MEI', 'SIMPLES_NACIONAL', 'Simples Nacional', 'MICROEMPRESA')`
+      ).catch(() => ({ rows: [] }))
+
+      let criadas = 0, oportunidades = 0
+      for (const c of clientes) {
+        try {
+          const r = await fetch(`${FINANCE}/api/transacoes/dre?cliente_id=${c.id}&ano=${ano}`)
+          const j = await r.json()
+          const dre = j?.data || j || {}
+          const receitaYtd = Number(dre.receita_total || dre.receitaTotal || 0)
+          if (!receitaYtd) continue
+
+          // Limite por regime
+          const regime = (c.tax_regime || '').toUpperCase()
+          let limite, percent, alvo
+          if (regime.includes('MEI')) {
+            limite = 81000; alvo = 'Lucro Presumido (sair do MEI)'
+          } else {
+            limite = 4800000; alvo = 'Migracao para Lucro Presumido'
+          }
+          percent = receitaYtd / limite
+          if (percent < 0.7) continue // so alerta a partir de 70% do teto
+
+          oportunidades++
+          const taskKey = `upsell-${c.id}-${ano}`
+          const dup = await query(
+            `SELECT id FROM tasks WHERE result->>'upsell_key' = $1 LIMIT 1`,
+            [taskKey]
+          ).catch(() => ({ rows: [] }))
+          if (dup.rows.length) continue
+
+          const cliente = c.trade_name || c.legal_name
+          const msgSugerida = `Oi! Estamos acompanhando o crescimento do ${cliente} e ja chegamos a ${(percent * 100).toFixed(0)}% do limite anual de receita do regime ${regime}. Vale conversarmos sobre ${alvo} pra evitar surpresas. Posso te enviar uma simulacao na proxima semana?`
+
+          await query(
+            `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result, created_at)
+             VALUES ($1, $2, $3, NULL, 'high', 'pending', $4::jsonb, NOW())`,
+            [
+              `📈 Upsell: ${cliente} (${(percent * 100).toFixed(0)}% do teto)`,
+              `Cliente ${cliente} (#${c.id}) — receita YTD R$ ${receitaYtd.toLocaleString('pt-BR')} de R$ ${limite.toLocaleString('pt-BR')} (${(percent * 100).toFixed(1)}%).\nRegime atual: ${regime}\nProposta sugerida: ${alvo}\n\nMensagem (revisar):\n"${msgSugerida}"\n\nLink: http://31.97.175.200/clientes/${c.id}`,
+              NATALIA_ID,
+              JSON.stringify({ source: 'natalia_upsell_oportunidades', upsell_key: taskKey, gesthub_client_id: c.id, percent, regime, msg_sugerida: msgSugerida }),
+            ]
+          ).catch(e => console.error('[natalia_upsell] insert:', e.message))
+          criadas++
+        } catch (e) { /* skip cliente */ }
+      }
+
+      const resumo = `Upsell: ${clientes.length} clientes analisados, ${oportunidades} >70% teto, ${criadas} task(s) novas`
+      console.log(`[natalia_upsell] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[natalia_upsell]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Natalia: Recuperacao — clientes inativados nos ultimos 90d ===
+  // Mensal dia 15, 11h.
+  registerCronHandler('natalia_recuperacao', async () => {
+    const NATALIA_ID = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab'
+    try {
+      const { rows: inativos } = await query(
+        `SELECT id, legal_name, trade_name, data_inativacao, motivo_inativacao
+           FROM datalake_gesthub.clients
+          WHERE status IN ('INATIVO', 'BAIXADA')
+            AND data_inativacao IS NOT NULL AND data_inativacao <> ''
+            AND data_inativacao ~ '^\\d{4}-\\d{2}-\\d{2}$'
+            AND data_inativacao::date >= CURRENT_DATE - INTERVAL '90 days'`
+      ).catch(() => ({ rows: [] }))
+
+      let criadas = 0
+      for (const c of inativos) {
+        const taskKey = `recup-${c.id}`
+        const dup = await query(
+          `SELECT id FROM tasks WHERE result->>'recup_key' = $1 LIMIT 1`,
+          [taskKey]
+        ).catch(() => ({ rows: [] }))
+        if (dup.rows.length) continue
+
+        const cliente = c.trade_name || c.legal_name
+        const motivoTxt = c.motivo_inativacao ? ` (motivo registrado: ${c.motivo_inativacao})` : ''
+        const msgSugerida = `Oi! Aqui e a equipe Atrio. Notamos que voce saiu da nossa carteira recentemente${motivoTxt}. Queria entender com sinceridade o que faltou pra continuarmos juntos — feedback honesto so nos ajuda a melhorar. Se ainda fizer sentido conversar, estou disponivel.`
+
+        await query(
+          `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result, created_at)
+           VALUES ($1, $2, $3, NULL, 'medium', 'pending', $4::jsonb, NOW())`,
+          [
+            `Recuperar inativado: ${cliente}`,
+            `Cliente ${cliente} (#${c.id}) saiu em ${c.data_inativacao}${motivoTxt}.\n\nMensagem sugerida (revisar):\n"${msgSugerida}"\n\nLink: http://31.97.175.200/clientes/${c.id}`,
+            NATALIA_ID,
+            JSON.stringify({ source: 'natalia_recuperacao', recup_key: taskKey, gesthub_client_id: c.id, msg_sugerida: msgSugerida, motivo: c.motivo_inativacao }),
+          ]
+        ).catch(e => console.error('[natalia_recuperacao] insert:', e.message))
+        criadas++
+      }
+
+      const resumo = `Recuperacao: ${inativos.length} inativados ultimos 90d → ${criadas} task(s) novas`
+      console.log(`[natalia_recuperacao] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[natalia_recuperacao]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Endpoint Growth: KPIs da carteira ===
+  app.get('/api/growth/kpis', async (req, res) => {
+    try {
+      const FINANCE = process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000'
+
+      const { rows: ativos } = await query(
+        `SELECT COUNT(*)::int AS total, COALESCE(SUM(monthly_fee), 0)::numeric AS mrr_total
+           FROM datalake_gesthub.clients WHERE status = 'ATIVO'`
+      )
+      const { rows: prospects } = await query(
+        `SELECT COUNT(*)::int AS total
+           FROM datalake_gesthub.clients WHERE client_type = 'PROSPECT' AND status = 'ATIVO'`
+      )
+      const { rows: novos30d } = await query(
+        `SELECT COUNT(*)::int AS total
+           FROM datalake_gesthub.clients
+          WHERE status = 'ATIVO' AND start_date IS NOT NULL AND start_date <> ''
+            AND start_date::date >= CURRENT_DATE - INTERVAL '30 days'`
+      ).catch(() => ({ rows: [{ total: 0 }] }))
+      const { rows: inativos90d } = await query(
+        `SELECT COUNT(*)::int AS total
+           FROM datalake_gesthub.clients
+          WHERE status IN ('INATIVO', 'BAIXADA')
+            AND data_inativacao IS NOT NULL AND data_inativacao <> ''
+            AND data_inativacao::date >= CURRENT_DATE - INTERVAL '90 days'`
+      ).catch(() => ({ rows: [{ total: 0 }] }))
+
+      // Tasks da Natalia abertas
+      const { rows: pipelineTasks } = await query(
+        `SELECT COUNT(*)::int AS total
+           FROM tasks
+          WHERE assigned_to = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab'
+            AND status IN ('pending','in_progress')`
+      )
+
+      // Conversao 30d
+      const { rows: convTotals } = await query(
+        `SELECT
+            COUNT(*) FILTER (WHERE result->>'sent_to' IS NOT NULL)::int AS enviadas,
+            COUNT(*) FILTER (WHERE result->>'response_status' = 'responded')::int AS respondidas,
+            COUNT(*) FILTER (WHERE result->>'response_status' = 'silent')::int AS silent,
+            COUNT(*) FILTER (WHERE result->>'response_status' = 'pending')::int AS aguardando
+           FROM tasks
+          WHERE assigned_to = 'e0b37e09-d3cc-455a-a5c5-3a43d32d9cab'
+            AND (result->>'approved_at')::timestamptz > NOW() - INTERVAL '30 days'`
+      ).catch(() => ({ rows: [{ enviadas: 0, respondidas: 0, silent: 0, aguardando: 0 }] }))
+
+      // Clientes frios (sem upload 60d) — usa Finance
+      let frios = null
+      try {
+        const r = await fetch(`${FINANCE}/api/uploads?dias=60`)
+        const j = await r.json()
+        const ups = j?.data || j || []
+        const comUpload = new Set(ups.map(u => u.clienteGesthubId || u.cliente_gesthub_id))
+        const { rows: at } = await query(
+          `SELECT id FROM datalake_gesthub.clients
+            WHERE status='ATIVO'
+              AND (
+                start_date IS NULL OR start_date = ''
+                OR (start_date ~ '^\\d{4}-\\d{2}-\\d{2}$' AND start_date::date < CURRENT_DATE - INTERVAL '60 days')
+              )`
+        )
+        frios = at.filter(c => !comUpload.has(c.id)).length
+      } catch { /* finance off */ }
+
+      const conv = convTotals[0]
+      const taxaResposta = conv.enviadas > 0
+        ? Math.round((conv.respondidas / conv.enviadas) * 100)
+        : null
+
+      res.json({
+        ok: true,
+        clientes_ativos: ativos[0].total,
+        mrr_brl: parseFloat(ativos[0].mrr_total),
+        prospects: prospects[0].total,
+        novos_30d: novos30d[0].total,
+        inativos_90d: inativos90d[0].total,
+        frios_60d: frios,
+        natalia_pipeline: pipelineTasks[0].total,
+        natalia_30d: {
+          enviadas: conv.enviadas,
+          respondidas: conv.respondidas,
+          silent: conv.silent,
+          aguardando: conv.aguardando,
+          taxa_resposta_pct: taxaResposta,
+        },
+      })
+    } catch (e) {
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // === Follow-up Saldanha — varre legalizacoes ativas e cria tasks pra acoes pendentes ===
+  // Roda 2x/semana (segunda+quinta 09h). Casos surfacados:
+  //   - EM EXIGENCIA: orgao pediu correcao — alta prioridade, notificar equipe
+  //   - AGUARDANDO DOCUMENTOS: cliente precisa enviar — Saldanha cobra via WhatsApp
+  //   - PARADO sem update >14d: investigar
+  //   - AGUARDANDO ORGAO sem update >30d: cobrar status no orgao
+  registerCronHandler('saldanha_followup', async () => {
+    try {
+      const SALDANHA_ID = '073072b0-547b-46f5-8e05-4290f9ec637d' // Sofia (team_members) = Saldanha (agents)
+      const acoes = []
+      let criadas = 0
+
+      // 1) EM EXIGENCIA — todas, alta prioridade
+      const exigencias = await query(
+        `SELECT l.id, l.name, l.process_type, l.organ, l.pendencies, l.client_id, l.notes,
+                c.legal_name, c.trade_name
+           FROM datalake_gesthub.legalizations l
+           LEFT JOIN datalake_gesthub.clients c ON c.id = l.client_id
+          WHERE l.status = 'EM EXIGENCIA'`
+      ).catch(() => ({ rows: [] }))
+      for (const r of exigencias.rows) acoes.push({ ...r, motivo: 'em_exigencia', priority: 'urgent' })
+
+      // 2) AGUARDANDO DOCUMENTOS
+      const aguardDocs = await query(
+        `SELECT l.id, l.name, l.process_type, l.organ, l.pendencies, l.client_id,
+                c.legal_name, c.trade_name
+           FROM datalake_gesthub.legalizations l
+           LEFT JOIN datalake_gesthub.clients c ON c.id = l.client_id
+          WHERE l.status = 'AGUARDANDO DOCUMENTOS'`
+      ).catch(() => ({ rows: [] }))
+      for (const r of aguardDocs.rows) acoes.push({ ...r, motivo: 'aguardando_documentos', priority: 'high' })
+
+      // 3) PARADO ha >14 dias sem update
+      const parados = await query(
+        `SELECT l.id, l.name, l.process_type, l.organ, l.client_id, l.updated_at,
+                c.legal_name, c.trade_name
+           FROM datalake_gesthub.legalizations l
+           LEFT JOIN datalake_gesthub.clients c ON c.id = l.client_id
+          WHERE l.status = 'PARADO'
+            AND l.updated_at < NOW() - INTERVAL '14 days'`
+      ).catch(() => ({ rows: [] }))
+      for (const r of parados.rows) acoes.push({ ...r, motivo: 'parado_14d', priority: 'medium' })
+
+      // 4) AGUARDANDO ORGAO ha >30 dias
+      const aguardOrgao = await query(
+        `SELECT l.id, l.name, l.process_type, l.organ, l.protocol, l.client_id, l.updated_at,
+                c.legal_name, c.trade_name
+           FROM datalake_gesthub.legalizations l
+           LEFT JOIN datalake_gesthub.clients c ON c.id = l.client_id
+          WHERE l.status = 'AGUARDANDO ORGAO'
+            AND l.updated_at < NOW() - INTERVAL '30 days'`
+      ).catch(() => ({ rows: [] }))
+      for (const r of aguardOrgao.rows) acoes.push({ ...r, motivo: 'aguardando_orgao_30d', priority: 'medium' })
+
+      // Cria tasks (dedupe: nao cria se ja existe pendente pra mesma legalization_id+motivo)
+      for (const a of acoes) {
+        const taskKey = `legaliz-${a.id}-${a.motivo}`
+        const dup = await query(
+          `SELECT id FROM tasks
+            WHERE status IN ('pending','in_progress')
+              AND result->>'legaliz_key' = $1 LIMIT 1`,
+          [taskKey]
+        ).catch(() => ({ rows: [] }))
+        if (dup.rows.length) continue
+
+        const cliente = a.trade_name || a.legal_name || a.name || 'cliente'
+        const titulos = {
+          em_exigencia: `🚨 Exigencia ${a.organ}: ${cliente}`,
+          aguardando_documentos: `Cobrar documentos: ${cliente} (${a.process_type})`,
+          parado_14d: `Investigar processo PARADO: ${cliente} (${a.process_type})`,
+          aguardando_orgao_30d: `Cobrar status no ${a.organ}: ${cliente}`,
+        }
+        const desc = [
+          `Legalizacao #${a.id}: ${a.process_type}`,
+          `Cliente: ${cliente}`,
+          `Orgao: ${a.organ}`,
+          a.protocol ? `Protocolo: ${a.protocol}` : null,
+          a.pendencies ? `Pendencias: ${a.pendencies}` : null,
+          `Motivo da task: ${a.motivo.replace(/_/g, ' ')}`,
+          `Link: http://31.97.175.200/legalizations/${a.id}`,
+        ].filter(Boolean).join('\n')
+
+        await query(
+          `INSERT INTO tasks (title, description, assigned_to, delegated_by, client_id, priority, status, result)
+           VALUES ($1, $2, $3, NULL, $4, $5, 'pending', $6::jsonb)`,
+          [
+            titulos[a.motivo] || `Acao: ${cliente}`,
+            desc,
+            SALDANHA_ID,
+            null, // client_id e UUID local (tasks.clients), Gesthub usa integer — guardamos no result.gesthub_client_id
+            a.priority,
+            JSON.stringify({ source: 'saldanha_followup', legaliz_key: taskKey, legalization_id: a.id, motivo: a.motivo, gesthub_client_id: a.client_id }),
+          ]
+        ).catch(e => console.error('[saldanha_followup] insert task:', e.message))
+        criadas++
+      }
+
+      // Notifica equipe se ha urgentes
+      if (exigencias.rows.length > 0) {
+        try {
+          await createNotification({
+            type: 'legalizacao_exigencia',
+            title: `${exigencias.rows.length} legalizacao(oes) EM EXIGENCIA — orgao pediu correcao`,
+            message: exigencias.rows.slice(0, 5).map(r => `- ${r.trade_name || r.legal_name || r.name} (${r.organ}): ${r.pendencies || 'sem detalhes'}`).join('\n'),
+            severity: 'warning',
+            metadata: { handler: 'saldanha_followup', total: exigencias.rows.length },
+            push: { tag: 'legalizacao-exigencia' },
+          })
+        } catch (e) { console.error('[saldanha_followup] notif:', e.message) }
+      }
+
+      const resumo = `Legalizacoes: ${exigencias.rows.length} em exigencia, ${aguardDocs.rows.length} aguardando docs, ${parados.rows.length} parado >14d, ${aguardOrgao.rows.length} aguardando orgao >30d → ${criadas} task(s) novas pra Saldanha`
+      console.log(`[saldanha_followup] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[saldanha_followup]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Aviso proativo de vencimento — chama atencao com antecedencia (30/15/7/3/1d) ===
+  // Roda diariamente 08h. Cruza com state de "aviso ja enviado" pra nao repetir.
+  // Estado armazenado em handler_state via metadata da notification (key=cert_warning_<id>_<bucket>).
+  registerCronHandler('vencimentos_proativo', async () => {
+    try {
+      const r = await fetch(`http://localhost:${PORT}/api/expiring-data`)
+      const data = await r.json()
+      const items = data.items || []
+
+      // Buckets de aviso: dispara quando daysUntil cruza um threshold pela primeira vez.
+      // Usamos jsonb de avisos enviados por item_id pra deduplicar.
+      const buckets = [30, 15, 7, 3, 1, 0, -1] // 0=hoje, -1=ja venceu (re-aviso diario)
+
+      // Carrega historico de avisos
+      const { rows: hist } = await query(
+        `SELECT metadata->>'item_id' AS item_id, metadata->>'bucket' AS bucket
+           FROM notifications
+          WHERE type = 'vencimento_aviso'
+            AND created_at > NOW() - INTERVAL '60 days'`
+      ).catch(() => ({ rows: [] }))
+      const sent = new Set(hist.map(r => `${r.item_id}:${r.bucket}`))
+
+      let novos = 0
+      for (const it of items) {
+        // Pega o menor bucket cuja condicao casa
+        const days = it.daysUntil
+        let bucket = null
+        if (days < 0) bucket = -1
+        else if (days === 0) bucket = 0
+        else {
+          for (const b of buckets.filter(x => x > 0)) {
+            if (days <= b) { bucket = b; break }
+          }
+        }
+        if (bucket === null) continue
+
+        const key = `${it.id}:${bucket}`
+        if (sent.has(key)) continue
+
+        const titulo = bucket < 0
+          ? `🚨 VENCIDO ha ${Math.abs(days)}d: ${it.title}`
+          : bucket === 0
+            ? `🚨 VENCE HOJE: ${it.title}`
+            : `⚠️ Vence em ${days}d: ${it.title}`
+
+        const severity = bucket <= 0 ? 'error' : bucket <= 7 ? 'warning' : 'info'
+
+        await createNotification({
+          type: 'vencimento_aviso',
+          title: titulo,
+          message: `${it.subtitle}. Categoria: ${it.category}. Sistema: ${it.system}.`,
+          severity,
+          metadata: { item_id: it.id, bucket, daysUntil: days, system: it.system, url: it.url, category: it.category },
+          push: bucket <= 7 ? { tag: `venc-${it.id}`, url: it.url } : false,
+        })
+        novos++
+
+        // Auto-task quando bucket <= 7 (critico ou pior). Nao duplica: dedupe por result.metadata->>'item_id'
+        if (bucket <= 7) {
+          const dup = await query(
+            `SELECT id FROM tasks
+              WHERE status IN ('pending','in_progress')
+                AND result->>'venc_item_id' = $1
+              LIMIT 1`,
+            [it.id]
+          ).catch(() => ({ rows: [] }))
+
+          if (!dup.rows.length) {
+            // Mapeia categoria → team_member
+            const assignMap = {
+              certificado: '3c98e80e-7245-4819-aa78-24b7249a628a',          // André - TI
+              documento_cliente: '073072b0-547b-46f5-8e05-4290f9ec637d',    // Sofia (= Saldanha) - societario
+              contrato_honorarios: '9945b340-75f6-4c0d-a6f3-bcbfc7efce3b',  // Rodrigo - operacoes
+            }
+            const assignedTo = assignMap[it.category] || '9945b340-75f6-4c0d-a6f3-bcbfc7efce3b'
+            const taskTitle = bucket <= 0
+              ? `🚨 RENOVAR JA: ${it.title}`
+              : `Renovar em ${days}d: ${it.title}`
+            const taskDesc = `Item: ${it.title}\nVencimento: ${new Date(it.dueDate).toLocaleDateString('pt-BR')}\nStatus: ${it.subtitle}\nSistema: ${it.system}\nLink: ${it.url}\n\nAcao necessaria: providenciar renovacao antes do vencimento. Avisos automaticos serao enviados ate item ser resolvido.`
+
+            await query(
+              `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status, result, created_at)
+               VALUES ($1, $2, $3, NULL, $4, 'pending', $5::jsonb, NOW())`,
+              [
+                taskTitle,
+                taskDesc,
+                assignedTo,
+                bucket <= 0 ? 'urgent' : 'high',
+                JSON.stringify({ source: 'vencimentos_proativo', venc_item_id: it.id, category: it.category, daysUntil: days, url: it.url }),
+              ]
+            ).catch(e => console.error('[vencimentos_proativo] task create:', e.message))
+          }
+        }
+      }
+
+      const resumo = `Vencimentos: ${items.length} itens monitorados, ${novos} avisos novos disparados`
+      console.log(`[vencimentos_proativo] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[vencimentos_proativo]', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Cobrança mensal de extratos — Sneijder manda WhatsApp cobrando clientes pendentes ===
+  // Roda dia 5 de cada mes. Alvo = mes anterior. Status PENDENTE/PARCIAL → envia msg + marca COBRADO.
+  registerCronHandler('cobrar_extratos_mes', async () => {
+    const FINANCE = process.env.ATRIO_FINANCE_URL || 'http://atrio-banking-system-1:3000'
+    const GESTHUB = process.env.GESTHUB_API_URL || 'http://31.97.175.200'
+    const now = new Date()
+    // Target = previous month
+    const tgt = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+    const targetYear = tgt.getFullYear()
+    const targetMonth = tgt.getMonth() + 1
+    const monthName = ['janeiro','fevereiro','marco','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'][targetMonth - 1]
+
+    try {
+      const r = await fetch(`${FINANCE}/api/controle?ano=${targetYear}`)
+      const controle = await r.json()
+      const rows = Array.isArray(controle) ? controle : (controle?.data || [])
+
+      const pendentes = rows.filter(c => {
+        const m = c.meses?.[String(targetMonth)]
+        return m && (m.status === 'PENDENTE' || m.status === 'PARCIAL')
+      })
+
+      if (pendentes.length === 0) {
+        return `${monthName}/${targetYear}: nenhum cliente pendente — todos entregaram.`
+      }
+
+      // Template
+      const { rows: tplRows } = await query(
+        "SELECT body FROM message_templates WHERE name ILIKE 'Solicitacao de extrato%' AND is_active = TRUE LIMIT 1"
+      )
+      const template = tplRows[0]?.body
+        || 'Oi {nome}! Estamos fechando a contabilidade de {mes} e precisamos do extrato bancario. Pode enviar aqui no WhatsApp? Obrigado!'
+
+      let cobrados = 0, semContato = 0, erros = []
+
+      for (const c of pendentes) {
+        const cid = c.clienteGesthubId
+        try {
+          // Client info
+          const cr = await fetch(`${GESTHUB}/api/clients/${cid}`)
+          const cj = await cr.json().catch(() => ({}))
+          const client = cj?.data || cj || {}
+          if (client.status && client.status !== 'ATIVO') continue // skip inativos
+          const cname = client.tradeName || client.legalName || `cliente ${cid}`
+
+          // Contatos
+          const ctr = await fetch(`${GESTHUB}/api/clients/${cid}/contatos`)
+          const cjt = await ctr.json().catch(() => ({}))
+          const contatos = (cjt?.data || []).filter(ct => ct.telefone && ct.telefone.replace(/\D/g, '').length >= 10)
+
+          if (contatos.length === 0) {
+            semContato++
+            continue
+          }
+
+          // Prefer SOCIO/DIRETOR, senao primeiro
+          const primary = contatos.find(ct => /socio|diretor/i.test(ct.funcao || '')) || contatos[0]
+          const primeiroNome = (primary.nome || 'cliente').split(/\s+/)[0]
+          const msg = template
+            .replace(/\{nome\}/g, primeiroNome)
+            .replace(/\{mes\}/g, monthName)
+            .replace(/\{empresa\}/g, cname)
+
+          await whatsapp.sendMessage(primary.telefone, msg)
+
+          // Marca COBRADO no Finance
+          await fetch(`${FINANCE}/api/controle`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              clienteGesthubId: cid,
+              ano: targetYear,
+              mes: targetMonth,
+              status: 'COBRADO',
+              observacoes: `Cobrado via WhatsApp (Sneijder) em ${new Date().toLocaleDateString('pt-BR')} — contato: ${primary.nome}`,
+            }),
+          }).catch(() => {})
+
+          cobrados++
+          // Delay pequeno pra nao estourar WA
+          await new Promise(r => setTimeout(r, 1500))
+        } catch (e) {
+          erros.push({ cliente: cid, err: e.message })
+        }
+      }
+
+      const resumo = `${monthName}/${targetYear}: ${cobrados} cobrados via WhatsApp, ${semContato} sem telefone, ${erros.length} erros, ${pendentes.length - cobrados - semContato - erros.length} skippados (inativos)`
+
+      // Task para Sneijder acompanhar
+      if (cobrados > 0 || semContato > 0) {
+        try {
+          await query(
+            `INSERT INTO tasks (title, description, assigned_to, delegated_by, priority, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')`,
+            [
+              `Cobrança de extratos ${monthName}/${targetYear}`,
+              `${resumo}\n\nClientes sem telefone cadastrado: ${semContato}.\nAcompanhar retornos no WhatsApp e fazer upload dos extratos que chegarem.`,
+              'sneijder',
+              'sistema',
+              'medium',
+            ]
+          )
+        } catch (e) { console.error('[cobrar_extratos] task create failed:', e.message) }
+      }
+
+      // Notificacao + push
+      try {
+        await createNotification({
+          type: 'cobranca_extratos',
+          title: `Cobrança de extratos ${monthName}`,
+          message: resumo,
+          severity: semContato > 0 ? 'warning' : 'info',
+          metadata: { handler: 'cobrar_extratos_mes', targetYear, targetMonth, cobrados, semContato, erros: erros.length },
+          push: cobrados > 0 ? { tag: 'cobranca-extratos' } : false,
+        })
+      } catch (e) { console.error('[cobrar_extratos] notif failed:', e.message) }
+
+      console.log(`[cobrar_extratos] ${resumo}`)
+      return resumo
+    } catch (e) {
+      console.error('[cobrar_extratos] erro:', e)
+      return `Erro: ${e.message}`
+    }
+  })
+
+  // === Retenção anexos WhatsApp — apaga arquivos > 30d, marca metadata.expired ===
+  // Roda diariamente 03h. Mantém referência no DB pra UI mostrar "expirou".
+  registerCronHandler('whatsapp_attach_retention', async () => {
+    try {
+      const r = await cleanupExpiredAttachments({ dryRun: false })
+      const msg = `Varredura anexos WhatsApp: ${r.scanned} arquivos no disco, ${r.expired} expirados (>${r.retentionDays}d), ${r.deleted} deletados, ${fmtBytes(r.bytesLiberados)} liberados${r.erros.length ? `, ${r.erros.length} erros` : ''}`
+      if (r.deleted > 0 || r.erros.length > 0) {
+        try {
+          await createNotification({
+            type: 'whatsapp_attach_retention',
+            title: `Anexos WhatsApp: ${r.deleted} expirado(s) removido(s)`,
+            message: msg,
+            severity: r.erros.length > 0 ? 'warning' : 'info',
+            metadata: { handler: 'whatsapp_attach_retention', ...r },
+          })
+        } catch (e) { console.error('[attach_retention] notification failed:', e.message) }
+      }
+      console.log(`[attach_retention] ${msg}`)
+      return msg
+    } catch (e) {
+      console.error('[attach_retention] erro:', e)
+      return `Erro: ${e.message}`
+    }
   })
 
   startCronScheduler().catch(err => console.error('[CRON] Failed to start:', err.message))

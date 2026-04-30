@@ -35,10 +35,9 @@ export default function StatusBar() {
   if (!health) return null
 
   return (
-    <div className="fixed bottom-0 left-0 right-0 h-7 flex items-center justify-between px-4 z-40 select-none"
+    <div className="fixed bottom-0 left-0 right-0 h-7 flex items-center justify-between px-4 z-40 select-none status-bar-theme"
       style={{
-        background: 'linear-gradient(180deg, rgba(15,17,23,0.95) 0%, rgba(8,8,10,0.98) 100%)',
-        borderTop: '1px solid rgba(255,255,255,0.04)',
+        borderTop: '1px solid var(--ao-border)',
         backdropFilter: 'blur(12px)',
       }}>
 

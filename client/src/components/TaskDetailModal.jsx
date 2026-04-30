@@ -241,9 +241,59 @@ function TaskDetails({ task, onReload }) {
   const result = task?.result || {}
   const enrich = result?.enrich || null
 
+  // Mensagem aprovavel (Natalia + outros)
+  const msgSugerida = result?.msg_sugerida
+  const sentToHistorico = result?.sent_to
+  const sentMessage = result?.sent_message
+  const [editedMsg, setEditedMsg] = useState(msgSugerida || '')
+  const [overrideTelefone, setOverrideTelefone] = useState('')
+  const [sending, setSending] = useState(false)
+  const [sendStatus, setSendStatus] = useState(null)
+  const showApprove = msgSugerida && task?.status !== 'done'
+
+  const handleApproveAndSend = async () => {
+    if (!editedMsg.trim()) { setSendStatus({ ok: false, msg: 'Mensagem vazia' }); return }
+    if (!confirm(`Enviar agora?\n\n${editedMsg.slice(0, 200)}${editedMsg.length > 200 ? '...' : ''}`)) return
+    setSending(true); setSendStatus(null)
+    try {
+      const r = await fetch(`/api/tasks/${task.id}/approve-and-send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: editedMsg, telefone: overrideTelefone || undefined }),
+      })
+      const d = await r.json()
+      if (!r.ok || !d.ok) throw new Error(d.error || 'falha')
+      setSendStatus({ ok: true, msg: `Enviado para ${d.sent_to}` })
+      setTimeout(() => onReload?.(), 1200)
+    } catch (e) { setSendStatus({ ok: false, msg: e.message }) }
+    finally { setSending(false) }
+  }
+
   // Extrai lista de itens (linhas começando com "-")
   const items = description.split('\n').map(l => l.trim()).filter(l => l.startsWith('-'))
   const hasCnpjs = /\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}/.test(description)
+
+  // Enriquecer via Receita Federal so faz sentido quando a task fala de
+  // dados CADASTRAIS (que a RF de fato retorna). Tasks sobre honorario,
+  // fator R, classificacao CS, etc. nao tem nada a ver com RF.
+  const _haystack = `${task.title || ''} ${description}`.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  const ENRICHABLE_KEYWORDS = [
+    'razao social', 'nome fantasia', 'cnae', 'endereco', 'logradouro', 'bairro', 'cep',
+    'socios', 'socio', 'natureza juridica', 'porte', 'capital social', 'data abertura',
+    'situacao cadastral', 'dados cadastrais', 'cadastro incompleto', 'dados incompletos',
+    'enriquecer', 'enriquecimento', 'cadastro', 'receita federal',
+  ]
+  // Palavras que indicam "nao e dado de RF" — suprime o botao
+  const NON_ENRICHABLE_KEYWORDS = [
+    'honorario', 'honorarios', 'monthly_fee', 'mensalidade', 'valor cobrado',
+    'fator r', 'classificacao cs', 'analista', 'responsavel', 'celula',
+    'prazo', 'entrega', 'competencia', 'tipo ctr',
+  ]
+  const hasEnrichableKw = ENRICHABLE_KEYWORDS.some(k => _haystack.includes(k))
+  const hasNonEnrichableKw = NON_ENRICHABLE_KEYWORDS.some(k => _haystack.includes(k))
+  // Mostra botao se: tem CNPJ + (tem palavra cadastral OU ja foi enriquecida antes)
+  //                  E nao tem palavra indicando que e de honorario/operacional
+  const showEnrichBtn = hasCnpjs && (hasEnrichableKw || !!enrich) && !hasNonEnrichableKw
 
   const handleEnrich = async () => {
     setEnriching(true); setEnrichMsg(null)
@@ -289,6 +339,80 @@ function TaskDetails({ task, onReload }) {
         </div>
       )}
 
+      {/* Mensagem aprovavel (Natalia / outros) */}
+      {showApprove && (
+        <div style={{
+          marginBottom: 10, padding: 10, borderRadius: 8,
+          background: 'rgba(139, 92, 246, 0.08)',
+          border: '1px solid rgba(139, 92, 246, 0.3)',
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#8B5CF6', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+            ✉️ Mensagem sugerida — revise e envie
+          </div>
+          <textarea
+            value={editedMsg}
+            onChange={e => setEditedMsg(e.target.value)}
+            style={{
+              width: '100%', minHeight: 80, padding: 8, fontSize: 12.5,
+              fontFamily: 'inherit', borderRadius: 6,
+              border: '1px solid var(--ao-border)',
+              background: 'var(--ao-card)', color: 'var(--ao-text-primary)',
+              resize: 'vertical', marginBottom: 6,
+            }}
+            placeholder="Edite a mensagem antes de enviar..."
+          />
+          <input
+            value={overrideTelefone}
+            onChange={e => setOverrideTelefone(e.target.value)}
+            placeholder="(opcional) telefone — deixe vazio pra usar o do contato Gesthub"
+            style={{
+              width: '100%', padding: '6px 10px', fontSize: 11.5,
+              borderRadius: 6, border: '1px solid var(--ao-border)',
+              background: 'var(--ao-card)', color: 'var(--ao-text-primary)', marginBottom: 6,
+            }}
+          />
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <button
+              onClick={handleApproveAndSend}
+              disabled={sending || !editedMsg.trim()}
+              style={{
+                padding: '7px 14px', fontSize: 11.5, fontWeight: 700, borderRadius: 6,
+                background: sending || !editedMsg.trim() ? 'var(--ao-surface)' : '#8B5CF6',
+                color: sending || !editedMsg.trim() ? 'var(--ao-text-dim)' : '#fff',
+                border: 'none',
+                cursor: sending || !editedMsg.trim() ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {sending ? 'Enviando...' : 'Aprovar e enviar via WhatsApp'}
+            </button>
+            {sendStatus && (
+              <span style={{
+                fontSize: 11,
+                color: sendStatus.ok ? '#10B981' : '#EF4444',
+                fontWeight: 600,
+              }}>
+                {sendStatus.ok ? '✓ ' : '✗ '}{sendStatus.msg}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Histórico de envio */}
+      {sentToHistorico && (
+        <div style={{
+          marginBottom: 10, padding: 8, borderRadius: 6,
+          background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.3)',
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>✓ Mensagem enviada para {sentToHistorico}</div>
+          {sentMessage && (
+            <div style={{ fontSize: 11, opacity: 0.85, fontStyle: 'italic', whiteSpace: 'pre-wrap' }}>
+              "{sentMessage}"
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Resultado do enriquecimento (se houve) */}
       {enrich && (
         <div style={{ marginBottom: 10, padding: 8, background: 'rgba(16, 185, 129, 0.08)', borderRadius: 6, border: '1px solid rgba(16, 185, 129, 0.3)' }}>
@@ -312,18 +436,25 @@ function TaskDetails({ task, onReload }) {
 
       {/* Ações */}
       {hasCnpjs && (
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6, alignItems: 'center' }}>
           <button onClick={handleCsv} style={{
             padding: '6px 12px', fontSize: 11, fontWeight: 600, borderRadius: 6,
             border: '1px solid var(--ao-border)', background: 'var(--ao-surface)',
             color: 'var(--ao-text-primary)', cursor: 'pointer',
           }}>📥 Baixar CSV</button>
-          <button onClick={handleEnrich} disabled={enriching} style={{
-            padding: '6px 12px', fontSize: 11, fontWeight: 600, borderRadius: 6,
-            border: 'none', background: 'var(--ao-accent, #c4956a)', color: 'white',
-            cursor: enriching ? 'wait' : 'pointer', opacity: enriching ? 0.6 : 1,
-          }}>{enriching ? '⏳ Enriquecendo...' : '⚡ Enriquecer via Receita Federal'}</button>
-          {enrichMsg && <span style={{ fontSize: 11, alignSelf: 'center', opacity: 0.8 }}>{enrichMsg}</span>}
+          {showEnrichBtn && (
+            <button onClick={handleEnrich} disabled={enriching} title="Consulta Receita Federal p/ preencher dados cadastrais (razao social, CNAE, endereco, socios, situacao...)" style={{
+              padding: '6px 12px', fontSize: 11, fontWeight: 600, borderRadius: 6,
+              border: 'none', background: 'var(--ao-accent, #c4956a)', color: 'white',
+              cursor: enriching ? 'wait' : 'pointer', opacity: enriching ? 0.6 : 1,
+            }}>{enriching ? '⏳ Enriquecendo...' : '⚡ Enriquecer via Receita Federal'}</button>
+          )}
+          {!showEnrichBtn && hasNonEnrichableKw && (
+            <span style={{ fontSize: 10, opacity: 0.5, fontStyle: 'italic' }}>
+              (Enriquecer via RF indisponivel — task nao envolve dados cadastrais)
+            </span>
+          )}
+          {enrichMsg && <span style={{ fontSize: 11, opacity: 0.8 }}>{enrichMsg}</span>}
         </div>
       )}
     </div>

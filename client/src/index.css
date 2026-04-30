@@ -574,3 +574,290 @@ select:focus, input:focus, textarea:focus, button:focus-visible {
 .ao-popup, [class*="z-50"], [class*="z-[9999]"] {
   /* só uma dica visual via filter drop-shadow para dropdowns inline */
 }
+
+/* StatusBar (barra inferior fixa) — fundo respeita tema */
+.status-bar-theme {
+  background: linear-gradient(180deg, var(--ao-surface) 0%, var(--ao-bg) 100%);
+}
+[data-theme="light"] .status-bar-theme {
+  background: linear-gradient(180deg, #F5F2ED 0%, #EEEAE4 100%);
+  border-top: 1px solid rgba(0, 0, 0, 0.08) !important;
+}
+
+/* Dropdown "Sistemas" no TopBar */
+.sistemas-dropdown {
+  background: var(--ao-surface);
+  border: 1px solid var(--ao-border);
+  color: var(--ao-text);
+}
+.sistemas-dropdown button {
+  color: var(--ao-text) !important;
+}
+.sistemas-dropdown button:hover {
+  background: var(--ao-bg);
+}
+[data-theme="light"] .sistemas-dropdown {
+  background: #FFFFFF;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.14);
+}
+[data-theme="light"] .sistemas-dropdown button {
+  color: #1F2937 !important;
+}
+[data-theme="light"] .sistemas-dropdown button:hover {
+  background: #F3F4F6;
+}
+/* ============================================================
+ * Atrio Office — Mobile / PWA / iOS responsive rules
+ * ============================================================ */
+
+@keyframes slideInLeft {
+  from { transform: translateX(-100%); opacity: 0.6; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0.6; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes slideUpBottom {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+.bottom-sheet-content {
+  animation: slideUpBottom 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ============================================================
+ * Reset cross-device: elimina tap highlight azul do iOS, callouts
+ * ============================================================ */
+html, body {
+  /* Remove o flash azul ao tocar links/botoes no iOS Safari */
+  -webkit-tap-highlight-color: transparent;
+  /* Desabilita menu "callout" (copiar/pesquisar) ao segurar no iOS */
+  -webkit-touch-callout: none;
+  /* Sem overscroll bounce em paginas de chat */
+  overscroll-behavior-y: none;
+}
+
+/* Permite selecao em campos texto/bubbles de mensagens */
+input, textarea, [contenteditable], .selectable, pre, code {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+/* Inputs: font-size minimo 16px no iOS pra NAO disparar zoom automatico no focus.
+   Desktop fica bom tambem. */
+@media (max-width: 767px) {
+  input, textarea, select {
+    font-size: 16px !important;
+  }
+}
+
+/* ============================================================
+ * Safe areas (iPhone notch, dynamic island, home indicator)
+ * PWA standalone usa essas variaveis CSS que o iOS expõe.
+ * ============================================================ */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  body {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* Topbar gruda no topo; precisa do safe-area-inset-top em standalone */
+.topbar {
+  padding-top: env(safe-area-inset-top);
+  height: calc(52px + env(safe-area-inset-top)) !important;
+}
+
+/* ============================================================
+ * Fix 100vh iOS Safari: usa dvh (dynamic viewport height) onde suportado.
+ * dvh leva em conta a barra de endereço que some/aparece.
+ * ============================================================ */
+@supports (height: 100dvh) {
+  .flex.h-\[calc\(100vh-28px\)\] {
+    height: 100dvh !important;
+  }
+}
+
+/* ============================================================
+ * Mobile: foco total em Atendimento. Sem bottom nav (hamburger basta),
+ * StatusBar desktop escondida (nao faz sentido em tela pequena).
+ * ============================================================ */
+@media (max-width: 767px) {
+  .status-bar-theme {
+    display: none !important;
+  }
+}
+
+/* ============================================================
+ * Breakpoint mobile
+ * ============================================================ */
+@media (max-width: 767px) {
+  /* Hamburger visivel */
+  .topbar-hamburger {
+    display: inline-flex !important;
+  }
+
+  /* Logo compacto */
+  .topbar-logo {
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+    border-right: none !important;
+  }
+  .topbar-logo > div.flex.items-baseline {
+    display: none !important;
+  }
+
+  /* Titulo da pagina atual aparece */
+  .topbar-current-page {
+    display: block !important;
+  }
+
+  /* Links inline escondidos */
+  .topbar-links {
+    display: none !important;
+  }
+
+  /* Full viewport */
+  .flex.h-\[calc\(100vh-28px\)\] {
+    height: 100vh !important;
+    height: 100dvh !important;
+  }
+
+  /* Coluna direita AgentChat escondida — acesso via hamburger */
+  .w-\[400px\].xl\:w-\[440px\].shrink-0 {
+    display: none !important;
+  }
+
+  /* Padding das paginas */
+  .max-w-\[960px\].mx-auto.px-5.py-5 {
+    padding: 12px !important;
+  }
+
+  /* Agent cards: 1 coluna */
+  .grid.grid-cols-1.md\:grid-cols-2.xl\:grid-cols-3 {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Tap targets minimos — Apple HIG: 44px; Material: 48px. Vamos de 40px. */
+  button:not(.btn--tiny):not(.topbar-hamburger):not(.message-delete-btn), [role="button"], a.btn {
+    min-height: 40px;
+  }
+
+  /* Utility pra esconder em mobile */
+  .hide-mobile {
+    display: none !important;
+  }
+}
+
+/* ============================================================
+ * Drawer mobile — estilo iOS-like
+ * ============================================================ */
+.mobile-drawer-backdrop {
+  animation: fadeIn 0.22s ease-out;
+}
+
+.mobile-drawer {
+  animation: slideInLeft 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.mobile-drawer-item {
+  transition: background 0.12s;
+  -webkit-tap-highlight-color: transparent;
+}
+.mobile-drawer-item:active {
+  background: var(--ao-surface) !important;
+  transform: scale(0.98);
+  transition: transform 0.1s;
+}
+
+/* Scroll suave dentro do drawer */
+.mobile-drawer-content {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ============================================================
+ * PWA instalado (standalone) — polimento
+ * ============================================================ */
+@media (display-mode: standalone) {
+  /* Esconde qualquer hint "instale o app" que possa aparecer */
+  .pwa-install-hint { display: none !important; }
+}
+
+/* ============================================================
+ * Active states para botoes no mobile (compensa falta de hover)
+ * ============================================================ */
+@media (max-width: 767px) {
+  button:active, [role="button"]:active {
+    opacity: 0.75;
+    transition: opacity 0.08s;
+  }
+}
+
+/* Fix pra textarea rolarem sem problemas no iOS */
+textarea {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ============================================================
+ * Chat UX polish — tap targets, momentum scroll, icon-only mobile
+ * ============================================================ */
+
+/* Momentum scroll nas listas scrollaveis (iOS Safari) */
+.mobile-drawer-content,
+.chat-input-bar ~ * [style*='overflowY'],
+[class*='overflow-y-auto'] {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Chat header buttons: feedback tatil */
+.chat-header-btn:active,
+.chat-header-btn-action:active,
+.chat-input-btn:active,
+.chat-send-btn:active {
+  transform: scale(0.94);
+  transition: transform 0.08s;
+}
+
+@media (max-width: 767px) {
+  /* Botoes de acao no header do chat: icon-only em mobile (labels escondidos) */
+  .chat-btn-label {
+    display: none !important;
+  }
+  .chat-header-btn-action {
+    width: 40px;
+    height: 40px;
+    padding: 0 !important;
+    min-width: 40px !important;
+  }
+
+  /* Input bar: padding maior + send button mais proeminente */
+  .chat-input-bar {
+    padding: 10px 12px env(safe-area-inset-bottom, 10px) !important;
+    gap: 8px !important;
+  }
+  .chat-input-btn,
+  .chat-send-btn {
+    width: 44px !important;
+    height: 44px !important;
+  }
+  .chat-textarea {
+    min-height: 44px !important;
+    padding: 11px 12px !important;
+  }
+}
+
+/* Scroll smooth nas mensagens */
+.chat-input-bar ~ *, [ref='scrollRef'] {
+  scroll-behavior: smooth;
+}

@@ -80,17 +80,54 @@ function formatPhoneBR(phone) {
 }
 
 // Constrói mensagem natural a partir do tipo + meta
+// Formata idade em unidades naturais: 3d · 2d 5h · 1h 20min · 45min
+function formatAgeNatural(ms) {
+  if (!ms || ms < 0) return '?';
+  const min = Math.floor(ms / 60000);
+  if (min < 60) return `${min}min`;
+  const h = Math.floor(min / 60);
+  const remMin = min % 60;
+  if (h < 24) return remMin > 0 ? `${h}h ${remMin}min` : `${h}h`;
+  const d = Math.floor(h / 24);
+  const remH = h % 24;
+  return remH > 0 ? `${d}d ${remH}h` : `${d}d`;
+}
+
+// Trunca texto em limite, preservando palavras inteiras
+function truncate(text, max = 90) {
+  if (!text) return '';
+  const s = String(text).replace(/\s+/g, ' ').trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1).replace(/\s\S*$/, '') + '…';
+}
+
+// Identifica como chamar o cliente: nome_fantasia > nome_legal > primeiro_contato > phone formatado
+function buildClienteLabel(meta) {
+  if (meta.cliente_nome) return meta.cliente_nome;
+  if (meta.contato_nome) return meta.contato_nome;
+  if (meta.phone) return formatPhoneBR(meta.phone);
+  return 'WhatsApp';
+}
+
 function buildNaturalMessage(titulo, meta) {
   const tipo = meta.tipo || meta.type || 'alerta';
   const phone = meta.phone ? formatPhoneBR(meta.phone) : null;
-  const responsavel = meta.responsavel ? ` Responsável: ${meta.responsavel}.` : '';
+  const responsavel = meta.responsavel ? ` · Responsável: ${meta.responsavel}` : '';
+  const clienteLabel = buildClienteLabel(meta);
 
   if (tipo === 'stale_review') {
-    return `Uma conversa no WhatsApp está aberta há mais de 24h sem retorno. Alguém pode confirmar se o atendimento foi concluído e fechar?${responsavel}`;
+    const idade = meta.idade_ms ? formatAgeNatural(meta.idade_ms) : '24h+';
+    const ultimaMsg = meta.ultima_mensagem
+      ? ` Última msg (${meta.ultima_direcao === 'inbound' ? 'cliente' : 'nós'}): "${truncate(meta.ultima_mensagem, 100)}".`
+      : '';
+    return `${clienteLabel} está com atendimento aberto há ${idade} sem retorno.${ultimaMsg}${responsavel}. Verifique se foi resolvido e feche, ou responda.`;
   }
   if (tipo === 'sla_alert' && meta.idade_segundos) {
-    const min = Math.floor(meta.idade_segundos / 60);
-    return `Cliente ${phone || 'WhatsApp'} aguarda resposta humana há ${min} minutos.${responsavel} Passou do SLA — verifique e responda.`;
+    const idade = formatAgeNatural(meta.idade_segundos * 1000);
+    const ultimaMsg = meta.ultima_mensagem
+      ? ` Mensagem: "${truncate(meta.ultima_mensagem, 100)}".`
+      : '';
+    return `${clienteLabel} aguarda resposta humana há ${idade} — passou do SLA.${ultimaMsg}${responsavel}. Verifique e responda.`;
   }
   // fallback: titulo limpo sem prefixo [tipo]
   return titulo.replace(/^\[[^\]]+\]\s*/, '');
@@ -98,10 +135,23 @@ function buildNaturalMessage(titulo, meta) {
 
 // Constrói título amigável (sem JSON, sem phone cru)
 function buildFriendlyTitle(titulo, meta) {
-  if (!meta || !meta.phone) return titulo;
-  // substitui telefone cru no título por formato amigável
-  const formatted = formatPhoneBR(meta.phone);
-  return titulo.replace(meta.phone, formatted);
+  if (!meta) return titulo;
+  // Caso meta tenha nome de cliente → usa ele no titulo
+  if (meta.cliente_nome) {
+    const tipo = meta.tipo || meta.type;
+    const idade = meta.idade_ms ? formatAgeNatural(meta.idade_ms) : null;
+    if (tipo === 'stale_review') {
+      return `[Aberto ${idade || '24h+'}] ${meta.cliente_nome} — aguardando fechamento`;
+    }
+    if (tipo === 'sla_alert' && meta.idade_segundos) {
+      return `[SLA estourado] ${meta.cliente_nome} há ${formatAgeNatural(meta.idade_segundos * 1000)}`;
+    }
+  }
+  if (meta.phone) {
+    // substitui telefone cru no título por formato amigável
+    return titulo.replace(meta.phone, formatPhoneBR(meta.phone));
+  }
+  return titulo;
 }
 
 async function enviarPraEquipe(texto, meta = {}) {
@@ -229,11 +279,28 @@ async function tick() {
   // --- Varredura de conversas abertas muito antigas (24h) ---
   try {
     const { rows: staleConvs } = await query(`
-      SELECT id, phone, client_id, last_message_at
-      FROM luna_v2.conversations
-      WHERE attendance_status = 'open'
-        AND last_message_at < NOW() - INTERVAL '${STALE_CONV_HOURS} hours'
-        AND last_message_at > NOW() - INTERVAL '7 days'
+      SELECT
+        c.id,
+        c.phone,
+        c.client_id,
+        c.last_message_at,
+        COALESCE(g.legal_name, g.trade_name, lc.nome_fantasia, lc.nome_legal) AS cliente_nome,
+        m.content  AS ultima_mensagem,
+        m.direction AS ultima_direcao,
+        m.created_at AS ultima_mensagem_at
+      FROM luna_v2.conversations c
+      LEFT JOIN luna_v2.clients lc ON lc.id = c.client_id
+      LEFT JOIN datalake_gesthub.clients g ON g.id = lc.gesthub_id
+      LEFT JOIN LATERAL (
+        SELECT content, direction, created_at
+          FROM luna_v2.messages
+         WHERE conversation_id = c.id
+         ORDER BY created_at DESC
+         LIMIT 1
+      ) m ON true
+      WHERE c.attendance_status = 'open'
+        AND c.last_message_at < NOW() - INTERVAL '${STALE_CONV_HOURS} hours'
+        AND c.last_message_at > NOW() - INTERVAL '7 days'
       LIMIT 20
     `);
     for (const s of staleConvs) {
@@ -241,9 +308,22 @@ async function tick() {
       const last = _lastActionByConv.get(key);
       if (last && (now.getTime() - last.at) < 12 * 3600 * 1000) continue; // 1x a cada 12h
       const resp = await fetchResponsavelInterno(s.client_id);
+      const idadeMs = s.last_message_at ? (now.getTime() - new Date(s.last_message_at).getTime()) : null;
+      const idadeLabel = idadeMs ? formatAgeNatural(idadeMs) : `${STALE_CONV_HOURS}h+`;
+      const nomeCurto = s.cliente_nome || formatPhoneBR(s.phone);
       await enviarPraEquipe(
-        `[Atendimento aberto ${STALE_CONV_HOURS}h+] ${s.phone}: confirmar se foi resolvido`,
-        { conversation_id: s.id, responsavel: resp, tipo: 'stale_review' }
+        `[Aberto ${idadeLabel}] ${nomeCurto} — aguardando fechamento`,
+        {
+          conversation_id: s.id,
+          phone: s.phone,
+          client_id: s.client_id,
+          cliente_nome: s.cliente_nome,
+          responsavel: resp,
+          tipo: 'stale_review',
+          idade_ms: idadeMs,
+          ultima_mensagem: s.ultima_mensagem,
+          ultima_direcao: s.ultima_direcao,
+        }
       );
       _lastActionByConv.set(key, { acao: 'stale', at: now.getTime() });
     }

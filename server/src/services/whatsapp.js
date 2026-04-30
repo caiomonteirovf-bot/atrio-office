@@ -8,7 +8,9 @@ import { analyzeSentiment, analyzeConversation, registerNPS, classifyDemand } fr
 import { addAnalysis } from './daily-report.js';
 import { query } from '../db/pool.js';
 import { findClientByPhone } from './gesthub.js';
+import { detectTeamMember } from './team-member-guard.js';
 import { createNotification } from './notifications.js';
+import * as pushSvc from './push.js';
 import { handleWhatsAppMessage } from './whatsapp/webhook-handler.mjs';
 import { ingestFile } from './ingest.js';
 import { logEvent } from './activity-log.js';
@@ -63,11 +65,102 @@ async function dbUpdateConversation(phone, fields) {
   }
 }
 
+/**
+ * Salva midia do WhatsApp em storage local + retorna metadata {filename, mime_type, size, storage_path}.
+ * Usado tanto em receive (client->equipe) como send (equipe->client) quando msg.hasMedia.
+ *
+ * Storage: /app/storage/whatsapp-attachments/<conv_id-or-phone>/<uuid>.<ext>
+ * Retorna null se falhar.
+ */
+async function saveMsgAttachment(msg, convIdOrPhone) {
+  try {
+    if (!msg?.hasMedia) return null;
+    const { default: fs } = await import('fs/promises');
+    const { default: path } = await import('path');
+    const { randomUUID } = await import('crypto');
+
+    const media = await msg.downloadMedia();
+    if (!media?.data) return null;
+
+    const buf = Buffer.from(media.data, 'base64');
+    if (buf.length === 0) return null;
+
+    // Deriva extensao
+    const mime = media.mimetype || 'application/octet-stream';
+    const ext = mime.split(';')[0].split('/')[1]?.replace(/\W/g, '').slice(0, 10)
+      || (media.filename?.match(/\.(\w+)$/)?.[1]) || 'bin';
+
+    const STORAGE_BASE = process.env.WHATSAPP_ATTACH_DIR || '/app/storage/whatsapp-attachments';
+    const dirName = String(convIdOrPhone || 'misc').replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 40);
+    const dir = path.join(STORAGE_BASE, dirName);
+    await fs.mkdir(dir, { recursive: true }).catch(() => {});
+
+    const uuid = randomUUID();
+    const filePath = path.join(dir, `${uuid}.${ext}`);
+    await fs.writeFile(filePath, buf);
+
+    return {
+      attachment: {
+        filename: media.filename || msg.body || `arquivo.${ext}`,
+        mime_type: mime,
+        size_bytes: buf.length,
+        storage_path: filePath,
+        // URL relativa (endpoint servira pelo message_id)
+        type: mime.startsWith('image/') ? 'image'
+            : mime === 'application/pdf' ? 'pdf'
+            : mime.startsWith('audio/') ? 'audio'
+            : mime.startsWith('video/') ? 'video'
+            : 'file',
+      },
+    };
+  } catch (e) {
+    console.error('[saveMsgAttachment] erro:', e.message);
+    return null;
+  }
+}
+
 async function dbSaveMessage(conv, sender, body, metadata = {}) {
   if (!conv.dbId) return;
   try {
+    // Se caller nao passou wa_msg_id mas botSend acabou de rodar (sender=luna/bot),
+    // usa o id do ultimo envio como hint.
+    const mergedMeta = (sender === 'luna' || sender === 'bot')
+      ? { wa_msg_id: _lastSentWaMsgId, ...metadata }
+      : metadata;
+
+    // DEDUPE: evita duplicatas quando whatsapp-web.js dispara message event 2x
+    // (retry, ACK desorbitado ou LID-vs-c.us). Regra:
+    //   1. Se tem wa_msg_id, busca mesmo wa_msg_id na conv → skip
+    //   2. Senao, busca mesma body + sender nos ultimos 3 segundos → skip (burst window)
+    const waMsgId = mergedMeta?.wa_msg_id || null;
+    if (waMsgId) {
+      const dup = await query(
+        `SELECT id FROM whatsapp_messages
+         WHERE conversation_id = $1 AND metadata->>'wa_msg_id' = $2
+         LIMIT 1`,
+        [conv.dbId, waMsgId]
+      ).catch(() => ({ rows: [] }));
+      if (dup.rows.length) {
+        log(`[dedupe] msg wa_id=${waMsgId.slice(0, 30)} ja existe — skip`);
+        return;
+      }
+    } else {
+      // Fallback: dedupe por body+sender em 3s window
+      const dup = await query(
+        `SELECT id FROM whatsapp_messages
+         WHERE conversation_id = $1 AND sender = $2 AND body = $3
+           AND created_at > NOW() - INTERVAL '3 seconds'
+         LIMIT 1`,
+        [conv.dbId, sender, body]
+      ).catch(() => ({ rows: [] }));
+      if (dup.rows.length) {
+        log(`[dedupe] msg ${sender} "${String(body).slice(0, 30)}" duplicada em 3s — skip`);
+        return;
+      }
+    }
+
     await query(`INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata) VALUES ($1, $2, $3, $4)`,
-      [conv.dbId, sender, body, JSON.stringify(metadata)]);
+      [conv.dbId, sender, body, JSON.stringify(mergedMeta)]);
     await query(`UPDATE whatsapp_conversations SET last_message_at = NOW() WHERE id = $1`, [conv.dbId]);
 
     // Espelho em luna_v2.messages pro audit trail unificado (item 4, abr/2026)
@@ -96,6 +189,21 @@ async function dbSaveMessage(conv, sender, body, metadata = {}) {
         );
       }
     } catch { /* audit não deve quebrar send */ }
+
+    // Push notification pra owner quando cliente manda mensagem
+    // (skip bot/luna/team outbound, skip groups)
+    if (sender === 'client' && !conv.isGroup && pushSvc.isConfigured()) {
+      try {
+        const preview = String(body || '').slice(0, 120) || '[anexo]';
+        const name = conv.name || conv.displayPhone || conv.phone || 'Cliente';
+        pushSvc.sendPushToUser('caio', {
+          title: name,
+          body: preview,
+          url: `/atendimento?c=${conv.dbId}`,
+          tag: `conv-${conv.dbId}`, // msgs da mesma conv substituem a anterior
+        }).catch(() => {});
+      } catch { /* push nunca deve quebrar save */ }
+    }
   } catch (err) {
     log(`DB ERRO saveMessage: ${err.message}`);
   }
@@ -194,7 +302,7 @@ const NOTIFY_GROUP_ENABLED = true;
 const NOTIFY_GROUP_NAME = 'Luna_Atendimento';
 let groupChatId = null;
 
-const FERIADOS_FIXOS = ['01-01','04-21','05-01','09-07','10-12','11-02','11-15','12-25'];
+// FERIADOS_FIXOS centralizado em services/feriados.js — usado via business-hours.js
 
 const LUNA_HEADER = '';  // Removido: cliente não deve ver 'Luna assistente virtual' — Luna representa a Átrio diretamente (regra 19 do prompt mestre)
 const GREETING_DELAY_MS = 30 * 1000; // 30 segundos
@@ -250,19 +358,10 @@ function getGreeting() {
   return h < 12 ? 'Bom dia' : h < 18 ? 'Boa tarde' : 'Boa noite';
 }
 
+// isHorarioComercial agora centralizado em services/business-hours.js (que usa feriados.js)
+import { isHorarioComercial as _isHorarioComercialCentralizada } from './business-hours.js';
 function isHorarioComercial() {
-  const n = now();
-  const day = n.getDay();
-  const hour = n.getHours();
-  const mmdd = `${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
-
-  const isWeekend = day === 0 || day === 6;
-  const isHoliday = FERIADOS_FIXOS.includes(mmdd);
-  const isLunch = hour >= 12 && hour < 13;
-  const open = !isWeekend && !isHoliday && hour >= 8 && hour < 18 && !isLunch;
-
-  const reason = isWeekend ? 'final de semana' : isHoliday ? 'feriado' : isLunch ? 'horário de almoço' : (hour < 8 || hour >= 18) ? 'fora do horário' : null;
-  return { open, isLunch, reason };
+  return _isHorarioComercialCentralizada();
 }
 
 // ============================================
@@ -511,7 +610,46 @@ function formatPhone(num) {
   return num;
 }
 
-async function botSend(chatId, text) {
+// Ultimo msg.id enviado via botSend — usado pelos callers (Luna) pra gravar
+// wa_msg_id no metadata da mensagem, permitindo exclusao posterior.
+let _lastSentWaMsgId = null;
+export function getLastSentWaMsgId() { return _lastSentWaMsgId; }
+
+// ============================================================
+// KILL-SWITCH: agentes IA NAO podem enviar mensagem pra cliente externo.
+// Por default, qualquer destino @c.us (individual) e BLOQUEADO.
+// Apenas @g.us (grupos internos da equipe) sao permitidos.
+// Pra liberar (debug ou autorizacao explicita), defina AGENT_CLIENT_OUTBOUND=on no env.
+// ============================================================
+// Override em runtime — pode ser ligado/desligado pelo painel sem restart.
+// Persistido em app_settings.agent_client_outbound = { enabled: bool }
+let _agentOutboundOverride = null; // null = nao carregado ainda
+async function getAgentOutboundOverride() {
+  if (_agentOutboundOverride !== null) return _agentOutboundOverride;
+  try {
+    const { rows } = await query(
+      "SELECT value FROM app_settings WHERE key = 'agent_client_outbound'"
+    );
+    _agentOutboundOverride = rows[0]?.value?.enabled === true;
+  } catch { _agentOutboundOverride = false; }
+  return _agentOutboundOverride;
+}
+export function setAgentOutboundOverride(enabled) {
+  _agentOutboundOverride = !!enabled;
+}
+
+function isClientOutboundAllowed(chatId) {
+  if (process.env.AGENT_CLIENT_OUTBOUND === 'on') return true;
+  if (_agentOutboundOverride === true) return true;
+  if (typeof chatId !== 'string') return false;
+  // SOMENTE o grupo interno da equipe (Luna_Atendimento), NUNCA grupos de cliente.
+  // groupChatId e cacheado por findGroupChat() na primeira chamada.
+  if (!chatId.endsWith('@g.us')) return false;
+  if (groupChatId && chatId === groupChatId) return true;
+  return false;
+}
+
+async function botSend(chatId, text, opts = {}) {
   if (!client) throw new Error('WhatsApp não conectado');
 
   // NUNCA enviar para status/broadcast/stories
@@ -520,9 +658,24 @@ async function botSend(chatId, text) {
     return null;
   }
 
+  // KILL-SWITCH agente → cliente. opts.manual=true bypassa (humano enviando do painel).
+  if (!opts.manual && !isClientOutboundAllowed(chatId)) {
+    log(`KILL-SWITCH: agente bloqueado de enviar pra cliente ${chatId}`);
+    // Audit no DB
+    query(
+      `INSERT INTO agent_outbound_blocks (chat_id, suggested_text, redirected_to_group)
+       VALUES ($1, $2, TRUE)`,
+      [chatId, String(text || '').slice(0, 1000)]
+    ).catch(() => {});
+    // Redireciona o que seria resposta automatica pra grupo interno
+    redirectToTeamGroup(chatId, text, opts).catch(e => log(`[redirect] falha: ${e.message}`));
+    return null;
+  }
+
   botIsSending = true;
   try {
     const sent = await client.sendMessage(chatId, text);
+    _lastSentWaMsgId = sent?.id?._serialized || sent?.id || null;
     // Espera o message_create processar antes de liberar
     await new Promise(r => setTimeout(r, 500));
     return sent;
@@ -531,10 +684,15 @@ async function botSend(chatId, text) {
   }
 }
 
-async function botSendMedia(chatId, base64Data, filename, mimetype, caption) {
+async function botSendMedia(chatId, base64Data, filename, mimetype, caption, opts = {}) {
   if (!client) throw new Error('WhatsApp não conectado');
   if (!chatId || chatId === 'status@broadcast' || chatId.includes('@broadcast')) {
     log(`BLOQUEADO: tentativa de enviar mídia para ${chatId}`);
+    return null;
+  }
+
+  if (!opts.manual && !isClientOutboundAllowed(chatId)) {
+    log(`KILL-SWITCH: agente bloqueado de enviar midia pra cliente ${chatId}`);
     return null;
   }
 
@@ -629,20 +787,43 @@ export async function markAsReplied(rawPhone) {
   return false;
 }
 
-export function resolveConversation(rawPhone) {
+export async function resolveConversation(rawPhone) {
   const phone = normalizePhone(rawPhone);
+  // 1) Limpa estado em-memoria SE houver (so existe pra individuais ativas)
   const conv = conversations.get(phone);
   if (conv) {
     conv.timers.forEach(t => clearTimeout(t));
     conv.timers = [];
     if (conv.greetingTimer) clearTimeout(conv.greetingTimer);
     conv.resolved = true;
-    dbResolveConversation(phone);
     dbLogMetric('Luna', 'conversation_resolved', { phone, name: conv.name, escalationLevel: conv.escalationLevel });
-    log(`${conv.name} (${phone}) — conversa resolvida`);
-    return true;
+    log(`${conv.name} (${phone}) — conversa resolvida (in-memory + DB)`);
   }
-  return false;
+
+  // 2) SEMPRE atualiza DB — funciona pra grupos, conversas inativas e qualquer caso
+  // Match tolerante: phone, real_phone OU chat_id incluindo o numero
+  try {
+    const result = await query(
+      `UPDATE whatsapp_conversations
+          SET resolved = TRUE, resolved_at = NOW(), closed_at = NOW(),
+              resolution_reason = COALESCE(resolution_reason, 'manual_painel')
+        WHERE (regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = $1
+            OR regexp_replace(COALESCE(real_phone, ''), '\\D', '', 'g') = $1
+            OR chat_id LIKE '%' || $1 || '%')
+          AND resolved = FALSE
+       RETURNING id, client_name, chat_id`,
+      [phone]
+    );
+    if (result.rows.length === 0) {
+      log(`[resolve] nenhuma conv encontrada/aberta pra ${phone}`);
+      return { ok: false, error: 'Conversa nao encontrada ou ja resolvida' };
+    }
+    log(`[resolve] resolvidas ${result.rows.length} conv(s) pra ${phone}: ${result.rows.map(r => r.client_name).join(', ')}`);
+    return { ok: true, count: result.rows.length, conversations: result.rows };
+  } catch (e) {
+    log(`[resolve] erro DB: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
 }
 
 // ============================================
@@ -651,6 +832,10 @@ export function resolveConversation(rawPhone) {
 export async function initialize() {
   if (client) return;
   log('Inicializando...');
+
+  // Carrega override do kill-switch agente→cliente (DB > env)
+  await getAgentOutboundOverride();
+  log(`Kill-switch agente→cliente: ${_agentOutboundOverride ? 'DESATIVADO (envios liberados)' : 'ATIVO (apenas grupos)'}`);
 
   // Limpar lock files do Chromium que podem travar entre restarts
   const sessionDir = './whatsapp-session/session';
@@ -679,6 +864,13 @@ export async function initialize() {
     isReady = true;
     qrCodeData = null;
     broadcastFn?.({ type: 'whatsapp_ready', phone: client.info?.wid?.user });
+
+    // Resolve o grupo interno da equipe (Luna_Atendimento) — necessario pro kill-switch
+    // saber quem e o "grupo permitido" vs grupos de cliente.
+    try {
+      const internalGroup = await findGroupChat();
+      log(`Grupo interno (${NOTIFY_GROUP_NAME}): ${internalGroup || 'NAO ENCONTRADO — todos grupos sao tratados como cliente'}`);
+    } catch (e) { log(`findGroupChat erro: ${e.message}`); }
 
     // Rehydrate buffer persistido no PG (post-restart)
     try {
@@ -710,6 +902,24 @@ export async function initialize() {
     }
   });
 
+  // Message ACK: atualiza status de entrega/leitura da msg.
+  // whatsapp-web.js ack codes: 0=pending, 1=sent, 2=delivered, 3=read, 4=played (audio).
+  // Armazena no metadata.ack pra UI mostrar ✓ (sent), ✓✓ (delivered), ✓✓ azul (read).
+  client.on('message_ack', async (msg, ack) => {
+    try {
+      const waId = msg.id?._serialized || msg.id;
+      if (!waId) return;
+      const status = ack === 1 ? 'sent' : ack === 2 ? 'delivered' : ack === 3 ? 'read' : ack === 4 ? 'played' : null;
+      if (!status) return;
+      await query(
+        `UPDATE whatsapp_messages
+         SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('ack', $1, 'ack_status', $2)
+         WHERE metadata->>'wa_msg_id' = $3`,
+        [ack, status, waId]
+      ).catch(() => {});
+    } catch (e) { /* silencioso */ }
+  });
+
   client.on('disconnected', (reason) => {
     log(`Desconectado: ${reason}`);
     isReady = false;
@@ -736,21 +946,152 @@ export async function initialize() {
     // Se é mensagem que o bot enviou, ignora
     if (botIsSending) return;
 
+    // === GRUPOS: persiste outbound separado ===
+    // Conversa individual segue abaixo com toda logica Luna. Grupo e mais simples:
+    // upsert conv (is_group=true) + insert msg com sender='team'.
+    const isGroupOut = String(msg.to).endsWith('@g.us');
+    if (isGroupOut) {
+      try {
+        const phone = normalizePhone(msg.to);
+        const chat = await msg.getChat().catch(() => null);
+        const groupName = chat?.name || 'Grupo WhatsApp';
+        await query(
+          `INSERT INTO whatsapp_conversations (phone, chat_id, client_name, is_group, started_at, last_message_at)
+           VALUES ($1, $2, $3, true, NOW(), NOW())
+           ON CONFLICT (phone) DO UPDATE SET
+             client_name = COALESCE(whatsapp_conversations.client_name, EXCLUDED.client_name),
+             is_group = true,
+             last_message_at = NOW()`,
+          [phone, msg.to, groupName]
+        ).catch(e => log('[group-out] upsert falhou: ' + e.message));
+        const { rows } = await query(
+          `SELECT id FROM whatsapp_conversations WHERE phone = $1 LIMIT 1`, [phone]
+        ).catch(() => ({ rows: [] }));
+        const convId = rows[0]?.id;
+        if (convId) {
+          const waId = msg.id?._serialized || msg.id || null;
+          // Dedupe por wa_msg_id
+          const dup = waId ? await query(
+            `SELECT id FROM whatsapp_messages WHERE conversation_id = $1 AND metadata->>'wa_msg_id' = $2 LIMIT 1`,
+            [convId, waId]
+          ).catch(() => ({ rows: [] })) : { rows: [] };
+          if (!dup.rows.length) {
+            // Salva anexo se houver
+            const attachMeta = msg.hasMedia ? await saveMsgAttachment(msg, convId) : null;
+            await query(
+              `INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata)
+               VALUES ($1, 'team', $2, $3)`,
+              [convId, msg.body || '', JSON.stringify({
+                is_group: true,
+                group_name: groupName,
+                wa_msg_id: waId,
+                chat_id: msg.to,
+                ...(attachMeta || {}),
+              })]
+            ).catch(e => log('[group-out] insert msg falhou: ' + e.message));
+          }
+        }
+        broadcastFn?.({ type: 'conversation_updated', phone, isGroup: true });
+        log(`[group-out] ${groupName}: ${(msg.body || '').slice(0, 60)}`);
+      } catch (e) {
+        log('[group-out] erro: ' + e.message);
+      }
+      return; // NAO prossegue no fluxo de individual
+    }
+
     const phone = normalizePhone(msg.to);
-    // Busca conv pelo phone direto OU por realPhone (caso WA Web use numero diferente do LID)
+    // Busca conv comparando contra TODOS os identificadores conhecidos.
+    // WhatsApp manda msg.to em formatos diferentes dependendo do device que respondeu:
+    //  - celular BR: 5511981030038@c.us  -> phone = 5511981030038
+    //  - WA Web/LID: 126053079081028@lid -> phone = 126053079081028
+    // Se a Map foi criada com uma chave e o humano respondeu via outro device,
+    // o get direto falha. Precisa bater contra phone | chatId | realPhone | displayPhone.
+    const _digits = (s) => String(s || '').replace(/\D/g, '');
+    const phoneDigits = _digits(phone);
     let conv = conversations.get(phone);
     if (!conv) {
       for (const [k, c] of conversations) {
-        if (c.realPhone === phone || normalizePhone(c.realPhone || '') === phone) {
+        const candidates = [c.phone, c.chatId, c.realPhone, c.displayPhone, k]
+          .map(v => normalizePhone(String(v || '')))
+          .filter(Boolean);
+        const digitSet = new Set(candidates.map(_digits).filter(d => d.length >= 10));
+        if (candidates.includes(phone) || digitSet.has(phoneDigits)) {
           conv = c;
           break;
         }
       }
     }
-    if (!conv || conv.resolved) return;
+
+    // FIX (abr/2026+): quando conv nao esta em memoria (bot reiniciou, device
+    // diferente, LID vs c.us), persistir a intervencao humana em AMBAS as tabelas:
+    //   - luna_v2 (historico)
+    //   - whatsapp_conversations (o que a UI le atraves de getPendingMessages
+    //     — sem este UPDATE, a conv aparece eternamente como "aguardando")
+    if (!conv) {
+      try {
+        // 1) grava em luna_v2 (historico)
+        let lunaConvId = null;
+        const ex = await query(
+          `SELECT id FROM luna_v2.conversations WHERE phone = $1 ORDER BY last_message_at DESC NULLS LAST LIMIT 1`,
+          [phone]
+        ).catch(() => ({ rows: [] }));
+        if (ex.rows[0]) {
+          lunaConvId = ex.rows[0].id;
+        } else {
+          const ins = await query(
+            `INSERT INTO luna_v2.conversations (phone, attendance_status, last_message_at, last_outbound_at, last_human_reply_at)
+             VALUES ($1, 'open', NOW(), NOW(), NOW()) RETURNING id`,
+            [phone]
+          ).catch(() => ({ rows: [] }));
+          lunaConvId = ins.rows[0]?.id || null;
+        }
+        if (lunaConvId) {
+          await query(
+            `INSERT INTO luna_v2.messages (conversation_id, direction, sender_type, content)
+             VALUES ($1, 'outbound', 'human', $2)`,
+            [lunaConvId, msg.body]
+          ).catch(() => {});
+          await query(
+            `UPDATE luna_v2.conversations SET last_human_reply_at = NOW(), last_outbound_at = NOW(), last_message_at = NOW() WHERE id = $1`,
+            [lunaConvId]
+          ).catch(() => {});
+        }
+
+        // 2) marca whatsapp_conversations como respondida — match por qualquer identificador.
+        //    Busca por phone, real_phone, chat_id (aceita prefixo) ou display_phone (digits).
+        const upd = await query(
+          `UPDATE whatsapp_conversations
+           SET human_replied = true,
+               human_replied_at = COALESCE(human_replied_at, NOW()),
+               last_human_reply_at = NOW(),
+               last_message_at = NOW()
+           WHERE phone = $1
+              OR real_phone = $1
+              OR chat_id LIKE $1 || '@%'
+              OR regexp_replace(COALESCE(display_phone,''), '\\D', '', 'g') = $1
+              OR regexp_replace(COALESCE(real_phone,''),    '\\D', '', 'g') = $1
+           RETURNING id, client_name`,
+          [phone]
+        ).catch(e => { log('fallback wc update: ' + e.message); return { rowCount: 0 }; });
+
+        if (upd.rowCount > 0) {
+          log(`[fallback] Humano respondeu pra ${phone} — ${upd.rowCount} conv(s) marcadas como respondidas no banco`);
+        } else {
+          log(`[fallback] Humano respondeu pra ${phone} — sem conv no banco tambem (so luna_v2)`);
+        }
+      } catch (e) { log('fallback humano sem conv: ' + e.message); }
+      return;
+    }
+    if (conv.resolved) return;
 
     conv.messages.push({ body: msg.body, from: 'team', at: new Date().toISOString() });
-    dbSaveMessage(conv, 'team', msg.body);
+    // Persiste o ID do WhatsApp (wa_msg_id) + anexo (se houver) em metadata.
+    const attachOutMeta = msg.hasMedia ? await saveMsgAttachment(msg, conv.dbId || conv.phone) : null;
+    dbSaveMessage(conv, 'team', msg.body, {
+      wa_msg_id: msg.id?._serialized || msg.id || null,
+      chat_id: msg.to,
+      ...(attachOutMeta || {}),
+    });
     markAsReplied(msg.to);
     // Watchdog hook: humano respondeu — marca luna_v2.conversations
     try {
@@ -767,7 +1108,8 @@ export async function initialize() {
   // Mensagem recebida de cliente
   client.on('message', async (msg) => {
     if (msg.fromMe) return;
-    if (msg.from?.includes('@g.us')) return; // ignora grupos
+    // Grupos: deixa entrar pro Atendimento MAS Luna nao responde (guard em handleIncoming).
+    // Antes ignorava totalmente (@g.us). Agora surge no painel read-mostly + send manual.
     if (msg.from === 'status@broadcast') return; // ignora status/stories
 
     // Ignora reações (reactions) — não são mensagens reais
@@ -777,6 +1119,29 @@ export async function initialize() {
     // MAS: se tem mídia (PDF/imagem), deixa passar mesmo sem body — auto-ingest vai capturar
     if (msg.type === 'sticker') return;
     if (!msg.body?.trim() && !msg.hasMedia) return;
+
+    // Detecta URL Gestta no corpo (gestta.com.br/.../download) — auto-baixa o doc fiscal
+    try {
+      const ingestModule = await import('./ingest.js');
+      const gesttaUrl = ingestModule.extractGesttaUrl?.(msg.body);
+      if (gesttaUrl && !msg.hasMedia) {
+        log(`[GesttaURL] detectada em msg: ${gesttaUrl.slice(0, 80)}...`);
+        const fetched = await ingestModule.fetchGesttaDoc(gesttaUrl);
+        if (fetched.ok) {
+          log(`[GesttaURL] baixado ${fetched.filename} (${fetched.buffer.length} bytes)`);
+          // Reusa o pipeline de auto-ingest passando o buffer baixado
+          // Cria um pseudo-msg pra reutilizar handleAutoIngest
+          const pseudoMsg = { ...msg, body: msg.body, _gesttaBuffer: fetched.buffer, _gesttaFilename: fetched.filename, _gesttaMime: fetched.mime };
+          // Chama handleIncoming normal — o auto-ingest abaixo vai usar o buffer Gestta no lugar de baixar mídia
+          await handleIncoming(pseudoMsg);
+          return;
+        } else {
+          log(`[GesttaURL] falha download: ${fetched.error}`);
+        }
+      }
+    } catch (e) {
+      log(`[GesttaURL] erro: ${e.message}`);
+    }
 
     try {
       await handleIncoming(msg);
@@ -862,14 +1227,19 @@ async function __fireGroupAlert(phone) {
         ultimasMsgs = mrows.reverse();
       } catch {}
     }
-    const isLead = !clientInfo?.id && !clientInfo?.gesthub_id;
-    const nomeCliente = clientInfo?.razao_social || clientInfo?.legalName
-      || clientInfo?.nome_fantasia || clientInfo?.trade_name
-      || clientInfo?.name || name || contact?.pushname || 'Sem nome cadastrado';
+    const isColaborador = clientInfo?.isColaborador === true;
+    const isLead = !isColaborador && !clientInfo?.id && !clientInfo?.gesthub_id;
+    const nomeCliente = isColaborador
+      ? (clientInfo?.name || 'Colaborador interno')
+      : (clientInfo?.razao_social || clientInfo?.legalName
+        || clientInfo?.nome_fantasia || clientInfo?.trade_name
+        || clientInfo?.name || name || contact?.pushname || 'Sem nome cadastrado');
     const cnpjLinha = clientInfo?.cnpj ? ('\nCNPJ: ' + clientInfo.cnpj) : '';
-    const statusLinha = isLead
-      ? '\n🟡 *LEAD NOVO* — nao cadastrado no Gesthub'
-      : (clientInfo?.regime ? '\nRegime: ' + clientInfo.regime : '');
+    const statusLinha = isColaborador
+      ? ('\n🟢 *TIME INTERNO* — colaborador Átrio' + (clientInfo?.areas?.length ? ' (' + clientInfo.areas.join(', ') + ')' : ''))
+      : (isLead
+        ? '\n🟡 *LEAD NOVO* — nao cadastrado no Gesthub'
+        : (clientInfo?.regime ? '\nRegime: ' + clientInfo.regime : ''));
     const contatoNome = clientInfo?.contato?.nome;
     const contatoFuncao = clientInfo?.contato?.funcao;
     const contatoLinha = contatoNome
@@ -1096,6 +1466,22 @@ async function upsertLunaClient(g) {
 }
 
 async function getClientInfo(phone) {
+  // 0) Colaborador interno — se o phone bate com algum colaborador Atrio,
+  // trata como comunicacao interna (nao e LEAD NOVO)
+  try {
+    const team = await detectTeamMember(phone);
+    if (team && team.nome) {
+      return {
+        isColaborador: true,
+        name: team.nome,
+        colaborador_nome: team.nome,
+        areas: team.areas || [],
+        source: 'colaborador',
+      };
+    }
+  } catch (err) {
+    log(`[Luna v2] detectTeamMember falhou: ${err.message}`);
+  }
   // 1) Gesthub e o master: procura empresa cujo CONTATO da carteira tem esse numero
   try {
     const g = await findClientByPhone(phone);
@@ -1180,6 +1566,30 @@ async function getConversationInfo(chatId, clientInfo) {
 }
 
 
+// Padroes que indicam que o CLIENTE resolveu a demanda sozinho (ou desistiu).
+// Match conservador — so quando a mensagem carrega sinal CLARO de encerramento.
+// Se casar, cancelamos escalation + marcamos conv resolved pra Luna parar de mandar msg.
+const SELF_RESOLUTION_PATTERNS = [
+  /\bvou (eu mesm[oa] )?(emitir|fazer|resolver|ver|cuidar|providenciar)\b/i,
+  /\beu mesm[oa] (vou )?(emitir|fazer|resolver|ver|cuidar)\b/i,
+  /\bj[aá] (resolv[ií]|consegu[ií]|fiz|emiti|vi)\b/i,
+  /\bdeixa (pra l[aá]|comigo|quieto|assim)\b/i,
+  /\besquec[ae]\b/i,
+  /\bresolvido\b/i,
+  /\btudo certo\b/i,
+  /\bn[aã]o precis[ao] mais\b/i,
+  /\bn[aã]o precisa (mais|n[aã]o)\b/i,
+  /\btranquil[oa]s?,? (obrigad|valeu|vlw|tudo)/i,
+  /\bj[aá] resolvi\b/i,
+];
+
+function detectSelfResolution(text) {
+  if (!text || text.length < 3) return false;
+  const clean = text.trim();
+  if (clean.length > 300) return false; // muito longo provavelmente nao e sinal de encerramento
+  return SELF_RESOLUTION_PATTERNS.some(p => p.test(clean));
+}
+
 async function handleIncoming(msg) {
   const from = msg.from;
 
@@ -1188,15 +1598,161 @@ async function handleIncoming(msg) {
   if (msg.type === 'reaction' || msg.type === 'reaction_sent' || msg.type === 'sticker') return;
 
   const phone = normalizePhone(from);
-  const body = msg.body || '';
+  let body = msg.body || '';
   if (!body.trim() && !msg.hasMedia) return;
+
+  const isGroup = String(from).endsWith('@g.us');
+
+  // ========== GRUPOS ==========
+  // Surgem no Atendimento pra visibilidade, MAS:
+  //   - Luna NAO processa (nao responde)
+  //   - Sem first-touch
+  //   - Sem auto-resolution detection
+  //   - Sem escalation
+  //   - Sem auto-ingest de midia (seria barulho)
+  //   - author (quem mandou) vira metadata da msg
+  if (isGroup) {
+    try {
+      const chat = await msg.getChat().catch(() => null);
+      const groupName = chat?.name || 'Grupo WhatsApp';
+      const authorContact = msg.author ? await (async () => {
+        try { return (await client.getContactById(msg.author)); } catch { return null; }
+      })() : null;
+      const authorName = authorContact?.pushname || authorContact?.name || msg.author?.replace('@c.us', '') || 'membro';
+
+      // Upsert conversation (is_group=true)
+      await query(
+        `INSERT INTO whatsapp_conversations (phone, chat_id, client_name, is_group, started_at, last_message_at)
+         VALUES ($1, $2, $3, true, NOW(), NOW())
+         ON CONFLICT (phone) DO UPDATE SET
+           client_name = COALESCE(whatsapp_conversations.client_name, EXCLUDED.client_name),
+           is_group = true,
+           last_message_at = NOW()`,
+        [phone, from, groupName]
+      ).catch(e => log('[group] upsert conv falhou: ' + e.message));
+
+      // Persiste msg com author no metadata
+      const { rows } = await query(
+        `SELECT id FROM whatsapp_conversations WHERE phone = $1 LIMIT 1`, [phone]
+      ).catch(() => ({ rows: [] }));
+      const convId = rows[0]?.id;
+      if (convId) {
+        const waId = msg.id?._serialized || msg.id || null;
+        // Dedupe por wa_msg_id (evita duplicacao em burst/retry do whatsapp-web.js)
+        const dup = waId ? await query(
+          `SELECT id FROM whatsapp_messages WHERE conversation_id = $1 AND metadata->>'wa_msg_id' = $2 LIMIT 1`,
+          [convId, waId]
+        ).catch(() => ({ rows: [] })) : { rows: [] };
+        if (!dup.rows.length) {
+          // Salva anexo do grupo (PDF, imagem, etc) se houver
+          const attachMeta = msg.hasMedia ? await saveMsgAttachment(msg, convId) : null;
+          await query(
+            `INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata)
+             VALUES ($1, 'client', $2, $3)`,
+            [convId, body, JSON.stringify({
+              is_group: true,
+              group_name: groupName,
+              author: authorName,
+              author_id: msg.author,
+              wa_msg_id: waId,
+              ...(attachMeta || {}),
+            })]
+          ).catch(e => log('[group] insert msg falhou: ' + e.message));
+        }
+      }
+      broadcastFn?.({ type: 'conversation_updated', phone, isGroup: true });
+      log(`[group] ${groupName}: ${authorName}: ${body.slice(0, 60)}`);
+    } catch (e) {
+      log('[group] erro processando: ' + e.message);
+    }
+    return; // NAO prossegue — sem Luna, sem first-touch, sem escalation
+  }
+  // ========== FIM GRUPOS ==========
 
   const contact = await msg.getContact().catch(() => null);
   const name = contact?.pushname || contact?.name || phone;
   // Pega número real — contact.id.user ou contact.number têm o número limpo
   const realPhone = contact?.id?.user || contact?.number || phone;
 
+  // === TRANSCREVE AUDIO ===
+  // Se for audio/ptt (voice note), baixa e transcreve via OpenAI Whisper.
+  // Resultado vira o body da msg — seguimos o fluxo normal (Luna ve texto, UI mostra).
+  // Guarda metadata pra UI renderizar icone 🎤 + duracao.
+  let audioMeta = null;
+  if (msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio') && !body.trim()) {
+    try {
+      log(`[audio] baixando de ${name}... (type=${msg.type})`);
+      const media = await msg.downloadMedia();
+      if (media?.data) {
+        const audioBuffer = Buffer.from(media.data, 'base64');
+        const { transcribeAudio } = await import('./transcription.js');
+        const tr = await transcribeAudio(audioBuffer, media.mimetype || 'audio/ogg');
+        if (tr?.text) {
+          body = tr.text;
+          audioMeta = {
+            is_audio: true,
+            transcribed: true,
+            duration_sec: tr.duration,
+            language: tr.language,
+          };
+          log(`[audio] ${name}: "${tr.text.slice(0, 80)}" (${tr.duration}s)`);
+        } else {
+          body = '[audio recebido — nao transcrito]';
+          audioMeta = { is_audio: true, transcribed: false };
+        }
+      }
+    } catch (e) {
+      log(`[audio] erro transcrevendo: ${e.message}`);
+      body = '[audio recebido — erro na transcricao]';
+      audioMeta = { is_audio: true, transcribed: false, error: e.message };
+    }
+    // Coloca no objeto msg pra downstream pegar
+    msg.body = body;
+    // Marca metadata pra dbSaveMessage identificar que e audio transcrito
+    msg._atrioAudioMeta = audioMeta;
+  }
+
   log(`${name} (${phone}): ${body.substring(0, 80)}`);
+
+  // Auto-resolucao: cliente sinalizou que ele mesmo vai resolver ou desistiu.
+  // Cancela escalation + marca resolved pra Luna parar de enviar lembretes.
+  if (detectSelfResolution(body)) {
+    log(`[auto-resolve] ${name} (${phone}) sinalizou auto-resolucao: "${body.slice(0, 80)}"`);
+    try {
+      // Cancela timers de escalation na Map em memoria
+      const existing = conversations.get(phone);
+      if (existing) {
+        existing.timers?.forEach(t => clearTimeout(t));
+        existing.timers = [];
+        existing.resolved = true;
+        existing.resolvedAt = new Date().toISOString();
+      }
+      // Cancela first-touch timer se pendente
+      try {
+        const ft = await import('./luna-first-touch.js');
+        ft.cancelLunaFirstTouch(phone, log);
+        if (realPhone && realPhone !== phone) ft.cancelLunaFirstTouch(realPhone, log);
+      } catch {}
+      // Marca no banco — match amplo por qualquer identificador
+      await query(
+        `UPDATE whatsapp_conversations
+         SET resolved = true,
+             resolved_at = COALESCE(resolved_at, NOW()),
+             resolution_reason = COALESCE(resolution_reason, 'cliente auto-resolveu'),
+             last_message_at = NOW()
+         WHERE phone = $1 OR real_phone = $1 OR chat_id LIKE $1 || '@%'
+            OR regexp_replace(COALESCE(display_phone,''), '\\D', '', 'g') = $1`,
+        [phone]
+      ).catch(e => log('[auto-resolve] update falhou: ' + e.message));
+      // Fecha tambem na luna_v2
+      await query(
+        `UPDATE luna_v2.conversations SET attendance_status = 'resolved'
+         WHERE phone = $1 AND attendance_status = 'open'`,
+        [phone]
+      ).catch(() => {});
+    } catch (e) { log('[auto-resolve] erro: ' + e.message); }
+    // NAO retorna — cliente pode mandar mais uma msg depois, mas nao haverá nova escalation.
+  }
 
     // ====== NOVO: Tentar Luna v2 primeiro ======
     try {
@@ -1205,6 +1761,60 @@ async function handleIncoming(msg) {
       const clientInfo = await getClientInfo(phoneForLookup);
       log(`[lookup] phone=${phone} realPhone=${realPhone} usado=${phoneForLookup} gesthub=${clientInfo?.gesthub_id || 'nenhum'}`);
       const conversationInfo = await getConversationInfo(from, clientInfo);
+
+      // Persiste vinculo phone -> gesthub_client_id na conversa (se nao estava setado).
+      // Usado pelo painel direito do Atendimento pra mostrar dados do cliente.
+      const ghId = clientInfo?.gesthub_id || clientInfo?.id;
+      if (ghId && (phone || realPhone)) {
+        try {
+          await query(
+            `UPDATE whatsapp_conversations
+             SET gesthub_client_id = COALESCE(gesthub_client_id, $1)
+             WHERE (phone = $2 OR real_phone = $2 OR phone = $3 OR real_phone = $3)
+               AND (gesthub_client_id IS NULL OR gesthub_client_id = $1)`,
+            [Number(ghId), phone, realPhone]
+          );
+        } catch (e) { log('[link-gesthub] falha: ' + e.message); }
+      }
+
+      // Se NAO linkou cliente, tenta identificar como COLABORADOR (membro da equipe Átrio)
+      // via telefone. Match em colaboradores.ativo=true do Gesthub.
+      // Marca contact_type='equipe' + contact_label com nome + areas + cargo.
+      if (!ghId && !clientInfo?.is_team_member) {
+        try {
+          const { getColaboradores } = await import('./gesthub.js');
+          const colabs = await getColaboradores().catch(() => []);
+          const toDigits11 = (s) => {
+            let d = String(s || '').replace(/\D/g, '');
+            if (!d) return null;
+            if ((d.length === 13 || d.length === 12) && d.startsWith('55')) d = d.slice(2);
+            // Strip mobile "9" prefix (81997140391 -> 8197140391) pra casar com fixo (10 digits)
+            if (d.length === 11 && d[2] === '9') d = d.slice(0, 2) + d.slice(3);
+            return d;
+          };
+          const candidates = [phone, realPhone].map(toDigits11).filter(d => d && d.length >= 10);
+          const match = (colabs || []).find(c => {
+            if (!c.ativo) return false;
+            const tel = toDigits11(c.telefone);
+            return tel && candidates.includes(tel);
+          });
+          if (match) {
+            const areas = match.areas || match.area || '';
+            const cargo = match.cargo || '';
+            const label = [match.nome, areas, cargo].filter(Boolean).join(' — ').slice(0, 200);
+            await query(
+              `UPDATE whatsapp_conversations
+               SET contact_type = COALESCE(contact_type, 'equipe'),
+                   contact_label = COALESCE(contact_label, $1)
+               WHERE (phone = $2 OR real_phone = $2 OR phone = $3 OR real_phone = $3)
+                 AND gesthub_client_id IS NULL
+                 AND contact_type IS NULL`,
+              [label, phone, realPhone]
+            );
+            log(`[auto-team] ${match.nome} (${match.telefone}) detectado como equipe`);
+          }
+        } catch (e) { log('[auto-team] falha: ' + e.message); }
+      }
 
       // Auto-ingest de PDF/imagem — fire-and-forget, nao bloqueia Luna
       if (msg.hasMedia) {
@@ -1237,7 +1847,13 @@ async function handleIncoming(msg) {
                 await dbSaveConversation(phone, conv);
               }
               conv.messages.push({ body: aggMsg.body, from: 'client', at: new Date().toISOString() });
-              await dbSaveMessage(conv, 'client', aggMsg.body);
+              // Audio transcrito + anexos (PDF/imagem) viram metadata persistida
+              const cliMeta = aggMsg._atrioAudioMeta ? { ...aggMsg._atrioAudioMeta } : {};
+              if (aggMsg.hasMedia && !aggMsg._atrioAudioMeta) {
+                const att = await saveMsgAttachment(aggMsg, conv.dbId || conv.phone);
+                if (att) Object.assign(cliMeta, att);
+              }
+              await dbSaveMessage(conv, 'client', aggMsg.body, cliMeta);
               if (processedByLunaV2.reply) {
                 conv.messages.push({ body: processedByLunaV2.reply, from: 'bot', at: new Date().toISOString() });
                 await dbSaveMessage(conv, 'bot', processedByLunaV2.reply);
@@ -2063,6 +2679,48 @@ async function routeDemandToAgent(phone, name, chatId, body, conv, classificatio
 
   // Evita task duplicada na mesma conversa
   if (conv.demandTaskCreated) return;
+
+  // GUARD 1: Colaborador interno — Luna NAO abre task cliente-facing
+  // (ex: Caio manda PDF, Luna nao deve tratar como cliente solicitando nota fiscal)
+  let ehColaborador = conv.clientInfo?.isColaborador || conv.isColaborador;
+  if (!ehColaborador) {
+    try {
+      const team = await detectTeamMember(phone) || (conv.realPhone && await detectTeamMember(conv.realPhone));
+      if (team && team.nome) {
+        ehColaborador = true;
+        conv.isColaborador = true;
+        log(`[routeDemand] Detectado colaborador interno: ${team.nome}`);
+      }
+    } catch {}
+  }
+  if (ehColaborador) {
+    log(`[routeDemand] Pulado: ${name} eh colaborador interno, nao abre task de demanda`);
+    return;
+  }
+
+  // GUARD 2: PDF de extrato bancario ja roteado pro Finance — nao duplicar em outro setor
+  if (conv.bankStatementRouted) {
+    log(`[routeDemand] Pulado: PDF de extrato ja roteado pro Finance, nao criar task ${tipo}`);
+    return;
+  }
+
+  // GUARD 3: fiscal (NFS-e) precisa de intent EXPLICITO do cliente no texto.
+  // Evita falso positivo quando cliente so manda PDF de extrato com palavras tipo "nota" no conteudo.
+  if (tipo === 'fiscal') {
+    const textoCliente = String(body || '').toLowerCase();
+    const temIntentFiscalExplicito = /(emitir|gerar|preciso|fazer|quero|solicitar)\s+(uma\s+)?(nota|nfs|\bnf\b)/i.test(textoCliente)
+      || /emiss[aã]o\s+de\s+(nota|nfs|\bnf\b)/i.test(textoCliente)
+      || /\b(nfs-?e|nfe)\b.*\b(emitir|gerar|preciso|quero)\b/i.test(textoCliente);
+    if (!temIntentFiscalExplicito) {
+      log(`[routeDemand] Fiscal descartado: cliente nao pediu emissao explicitamente. Msg: "${textoCliente.slice(0, 150)}"`);
+      try {
+        const alertMsg = `🔍 *Classificacao fiscal descartada automaticamente*\n\nCliente: ${name}\nMotivo: LLM classificou como fiscal mas cliente NAO pediu emissao explicitamente (pode ter sido PDF de extrato com palavra "nota" no conteudo).\n\nMensagem cliente: "${textoCliente.slice(0, 200)}"\n\n_Equipe: revisar manualmente se realmente era pedido de nota._`;
+        await sendAlertToGroup(alertMsg);
+      } catch {}
+      return;
+    }
+  }
+
   conv.demandTaskCreated = true;
 
   try {
@@ -2246,8 +2904,24 @@ async function analyzeAndReport(phone) {
     registerNPS(result, phone, conv.name).catch(() => {});
     addAnalysis(result, conv.name, phone);
 
-    if (result.demanda_atendida && !result.precisa_followup) {
+    // Auto-resolve SO quando:
+    //  1. Luna analisou e disse "demanda_atendida + !precisa_followup", E
+    //  2. HOUVE resposta (humano OU Luna) — ninguem respondeu = nao pode estar resolvido
+    // Bug antigo: Luna marcava boas-vindas de parceiro como "atendida" mesmo sem resposta.
+    const teveResposta = conv.humanReplied === true
+      || (conv.messages || []).some(m => m.from === 'team' || m.from === 'bot' || m.from === 'luna');
+    if (result.demanda_atendida && !result.precisa_followup && teveResposta) {
       resolveConversation(phone);
+      // Marca a razao no banco pra ser rastreavel
+      try {
+        await query(
+          `UPDATE whatsapp_conversations SET resolution_reason = COALESCE(resolution_reason, 'luna_analysis_demanda_atendida')
+           WHERE phone = $1 AND resolution_reason IS NULL`,
+          [phone]
+        );
+      } catch {}
+    } else if (result.demanda_atendida && !teveResposta) {
+      log(`[analyze] ${conv.name}: Luna disse 'atendida' mas ninguem respondeu — NAO auto-resolvendo`);
     }
   } catch (err) {
     log(`ERRO análise ${conv.name}: ${err.message}`);
@@ -2293,15 +2967,229 @@ async function findGroupChat() {
   } catch { return null; }
 }
 
+// ============================================================
+// Redireciona resposta bloqueada pelo kill-switch pro grupo interno.
+// Posta um aviso curto + cria/atualiza task na conversa pra alguem responder.
+// Throttle: nao posta mais de 1x por minuto pra mesma conversa (evita flood).
+// ============================================================
+const _redirectThrottle = new Map(); // chatId -> lastSentMs
+async function redirectToTeamGroup(clientChatId, suggestedText, opts = {}) {
+  try {
+    // Throttle 60s por chat
+    const now = Date.now();
+    const last = _redirectThrottle.get(clientChatId) || 0;
+    if (now - last < 60_000) return;
+    _redirectThrottle.set(clientChatId, now);
+
+    // Busca contexto da conversa
+    const phoneClean = String(clientChatId).split('@')[0].replace(/\D/g, '');
+    const { rows } = await query(
+      `SELECT id, client_name, display_phone, contact_label, contact_type, real_phone
+         FROM whatsapp_conversations
+        WHERE phone = $1 OR real_phone = $1
+          OR phone = $2 OR real_phone = $2
+        ORDER BY last_message_at DESC NULLS LAST LIMIT 1`,
+      [phoneClean, phoneClean.replace(/^55/, '')]
+    ).catch(() => ({ rows: [] }));
+    const conv = rows[0] || {};
+    const who = conv.contact_label || conv.client_name || conv.display_phone || phoneClean;
+
+    const grupo = await findGroupChat();
+    if (!grupo) return; // sem grupo configurado, nada a fazer
+
+    const trimmed = String(suggestedText || '').trim().slice(0, 600);
+    const aviso =
+      `🤖 *Luna* (modo interno — kill-switch ativo)\n` +
+      `Cliente: *${who}* (${phoneClean})\n` +
+      `Resposta sugerida (NAO enviada):\n` +
+      `> ${trimmed.split('\n').join('\n> ')}\n\n` +
+      `Responder pelo painel: http://31.97.175.200:3010/atendimento` + (conv.id ? `?c=${conv.id}` : '');
+
+    botIsSending = true;
+    try {
+      await client.sendMessage(grupo, aviso);
+      await new Promise(r => setTimeout(r, 300));
+    } finally {
+      botIsSending = false;
+    }
+    log(`[redirect] aviso postado no grupo interno sobre ${who}`);
+  } catch (e) {
+    log(`[redirect] erro: ${e.message}`);
+  }
+}
+
 // ============================================
 // ENVIAR MENSAGEM (via dashboard/API)
 // ============================================
-export async function sendMessage(phone, message) {
+export async function sendMessage(phone, message, opts = {}) {
   if (!isReady || !client) throw new Error('WhatsApp não conectado');
-  const chatId = phone.includes('@') ? phone : `${phone.replace(/\D/g, '')}@c.us`;
-  await botSend(chatId, message);
-  markAsReplied(phone);
-  log(`Enviado para ${phone}`);
+  let chatId;
+  if (phone.includes('@')) {
+    // Ja tem suffix — usa direto (chat_id canonico)
+    chatId = phone;
+  } else {
+    // So digits — precisa decidir suffix. Grupo OU individual?
+    // Checa no banco: se is_group, usa @g.us; senao @c.us.
+    const cleanPhone = phone.replace(/\D/g, '');
+    try {
+      const { rows } = await query(
+        `SELECT is_group, chat_id FROM whatsapp_conversations
+         WHERE phone = $1 OR real_phone = $1 LIMIT 1`,
+        [cleanPhone]
+      );
+      if (rows[0]?.chat_id?.includes('@')) {
+        chatId = rows[0].chat_id;
+      } else if (rows[0]?.is_group) {
+        chatId = `${cleanPhone}@g.us`;
+      } else {
+        chatId = `${cleanPhone}@c.us`;
+      }
+    } catch {
+      chatId = `${cleanPhone}@c.us`;
+    }
+  }
+  const sent = await botSend(chatId, message, { manual: opts.manual === true });
+  if (sent === null && !opts.manual) {
+    throw new Error('Envio bloqueado: kill-switch agente→cliente ativo. Apenas envios manuais (do painel) podem comunicar com clientes externos.');
+  }
+  // markAsReplied so faz sentido em conversas individuais (nao grupo)
+  if (chatId.endsWith('@c.us')) markAsReplied(phone);
+
+  // Persiste explicitamente no DB pra envios manuais (humano via painel).
+  // Antes dependiamos do message_create handler, mas ele e bloqueado quando
+  // botIsSending=true causando race condition. Agora gravamos diretamente.
+  if (opts.manual && sent) {
+    try {
+      const phoneClean = String(chatId).split('@')[0].replace(/\D/g, '');
+      const { rows } = await query(
+        `SELECT id FROM whatsapp_conversations
+          WHERE phone = $1 OR real_phone = $1 OR chat_id = $2
+          ORDER BY last_message_at DESC NULLS LAST LIMIT 1`,
+        [phoneClean, chatId]
+      );
+      const convId = rows[0]?.id;
+      if (convId) {
+        const waMsgId = sent?.id?._serialized || sent?.id || null;
+        // Dedupe por wa_msg_id (caso message_create tambem tenha gravado)
+        const dup = waMsgId ? await query(
+          `SELECT id FROM whatsapp_messages WHERE conversation_id = $1 AND metadata->>'wa_msg_id' = $2 LIMIT 1`,
+          [convId, waMsgId]
+        ).catch(() => ({ rows: [] })) : { rows: [] };
+        if (!dup.rows.length) {
+          await query(
+            `INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata)
+             VALUES ($1, 'team', $2, $3::jsonb)`,
+            [convId, message, JSON.stringify({ wa_msg_id: waMsgId, chat_id: chatId, manual: true, source: 'panel' })]
+          );
+          await query(`UPDATE whatsapp_conversations SET last_message_at = NOW(), human_replied = TRUE, last_human_reply_at = NOW() WHERE id = $1`, [convId]);
+          broadcastFn?.({ type: 'conversation_updated', phone: phoneClean });
+          broadcastFn?.({ type: 'message_added', conversation_id: convId });
+        }
+      }
+    } catch (e) {
+      log(`[manual-persist] falha: ${e.message}`);
+    }
+  }
+  log(`Enviado para ${chatId}`);
+}
+
+// ============================================
+// ENVIAR MIDIA (PDF, imagem, audio) via painel Atendimento
+// ============================================
+export async function sendMedia(phone, base64Data, filename, mimetype, caption = '', opts = {}) {
+  if (!isReady || !client) throw new Error('WhatsApp não conectado');
+
+  // Resolve chatId usando mesma logica do sendMessage (suporta grupo)
+  let chatId;
+  if (phone.includes('@')) {
+    chatId = phone;
+  } else {
+    const cleanPhone = phone.replace(/\D/g, '');
+    try {
+      const { rows } = await query(
+        `SELECT is_group, chat_id FROM whatsapp_conversations WHERE phone = $1 OR real_phone = $1 LIMIT 1`,
+        [cleanPhone]
+      );
+      if (rows[0]?.chat_id?.includes('@')) chatId = rows[0].chat_id;
+      else if (rows[0]?.is_group) chatId = `${cleanPhone}@g.us`;
+      else chatId = `${cleanPhone}@c.us`;
+    } catch { chatId = `${cleanPhone}@c.us`; }
+  }
+
+  const sent = await botSendMedia(chatId, base64Data, filename, mimetype, caption, { manual: opts.manual === true });
+  if (sent === null && !opts.manual) {
+    throw new Error('Envio bloqueado: kill-switch agente→cliente ativo.');
+  }
+  if (chatId.endsWith('@c.us')) markAsReplied(phone);
+
+  // Persiste explicitamente pra mídia manual (mesmo motivo do sendMessage)
+  if (opts.manual && sent) {
+    try {
+      const phoneClean = String(chatId).split('@')[0].replace(/\D/g, '');
+      const { rows } = await query(
+        `SELECT id FROM whatsapp_conversations
+          WHERE phone = $1 OR real_phone = $1 OR chat_id = $2
+          ORDER BY last_message_at DESC NULLS LAST LIMIT 1`,
+        [phoneClean, chatId]
+      );
+      const convId = rows[0]?.id;
+      if (convId) {
+        const waMsgId = sent?.id?._serialized || sent?.id || null;
+        const dup = waMsgId ? await query(
+          `SELECT id FROM whatsapp_messages WHERE conversation_id = $1 AND metadata->>'wa_msg_id' = $2 LIMIT 1`,
+          [convId, waMsgId]
+        ).catch(() => ({ rows: [] })) : { rows: [] };
+        if (!dup.rows.length) {
+          await query(
+            `INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata)
+             VALUES ($1, 'team', $2, $3::jsonb)`,
+            [convId, caption || filename, JSON.stringify({
+              wa_msg_id: waMsgId, chat_id: chatId, manual: true, source: 'panel',
+              attachment: { filename, mime_type: mimetype, type: mimetype.startsWith('image/') ? 'image' : mimetype.startsWith('video/') ? 'video' : mimetype.startsWith('audio/') ? 'audio' : 'file' }
+            })]
+          );
+          await query(`UPDATE whatsapp_conversations SET last_message_at = NOW(), human_replied = TRUE, last_human_reply_at = NOW() WHERE id = $1`, [convId]);
+          broadcastFn?.({ type: 'conversation_updated', phone: phoneClean });
+          broadcastFn?.({ type: 'message_added', conversation_id: convId });
+        }
+      }
+    } catch (e) {
+      log(`[manual-persist-media] falha: ${e.message}`);
+    }
+  }
+  log(`Enviada midia ${filename} (${mimetype}) para ${chatId}`);
+}
+
+// ============================================
+// APAGAR MENSAGEM (para todos, via WhatsApp — janela limitada pelo WhatsApp)
+// ============================================
+// Recebe o wa_msg_id (ex: "true_5581999999@c.us_AB12CD34") e o chat_id.
+// Usa whatsapp-web.js: busca a msg no chat e chama msg.delete(true).
+// Retorna { ok: true } OU { ok: false, error: string }.
+export async function deleteMessageForEveryone(waMsgId, chatId) {
+  if (!isReady || !client) throw new Error('WhatsApp não conectado');
+  if (!waMsgId) throw new Error('wa_msg_id ausente');
+
+  // Deriva chat_id do proprio wa_msg_id se nao veio explicito
+  // Formato: "true_<chatId>_<hash>"  ou  "false_<chatId>_<hash>"
+  let resolvedChatId = chatId;
+  if (!resolvedChatId && typeof waMsgId === 'string') {
+    const parts = waMsgId.split('_');
+    if (parts.length >= 3) resolvedChatId = parts[1];
+  }
+  if (!resolvedChatId) throw new Error('chat_id nao pode ser derivado do wa_msg_id');
+
+  const chat = await client.getChatById(resolvedChatId);
+  if (!chat) throw new Error('Chat nao encontrado');
+
+  // Pega as ultimas 100 mensagens do chat procurando a nossa
+  const msgs = await chat.fetchMessages({ limit: 100 });
+  const target = msgs.find(m => (m.id?._serialized || m.id) === waMsgId);
+  if (!target) throw new Error('Mensagem nao encontrada no chat (pode ter sido apagada ou estar muito antiga)');
+
+  await target.delete(true); // true = delete for everyone
+  log(`Mensagem apagada para todos: ${waMsgId}`);
+  return { ok: true };
 }
 
 // ============================================
@@ -2519,13 +3407,23 @@ async function uploadExtratoToFinance({ buffer, filename, clienteId, ano, mes })
 }
 
 export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo) {
-  if (!msg?.hasMedia) return null;
+  // Pseudo-msg de URL Gestta: usa buffer pre-baixado em vez de hasMedia
+  let media, buffer, mime, filename;
+  if (msg?._gesttaBuffer) {
+    buffer = msg._gesttaBuffer;
+    mime = msg._gesttaMime || 'application/pdf';
+    filename = msg._gesttaFilename || `gestta_${Date.now()}.pdf`;
+    log(`[AutoIngest] usando buffer Gestta pre-baixado: ${filename}`);
+  } else {
+    if (!msg?.hasMedia) return null;
+    try {
+      media = await msg.downloadMedia();
+      if (!media || !media.data) return null;
+    } catch (e) { log(`[AutoIngest] downloadMedia falhou: ${e.message}`); return null; }
+    mime = media.mimetype || '';
+    filename = media.filename || `whatsapp_${Date.now()}`;
+  }
   try {
-    const media = await msg.downloadMedia();
-    if (!media || !media.data) return null;
-
-    const mime = media.mimetype || '';
-    const filename = media.filename || `whatsapp_${Date.now()}`;
     const fnameLower = filename.toLowerCase();
     // Tipos aceitos: PDF, imagem, OFX (extratos bancarios), CSV (extratos Nubank etc)
     const isPdf = mime === 'application/pdf' || fnameLower.endsWith('.pdf');
@@ -2537,7 +3435,7 @@ export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo)
       return null;
     }
 
-    const buffer = Buffer.from(media.data, 'base64');
+    if (!buffer) buffer = Buffer.from(media.data, 'base64');
 
     // Fast-path pra OFX/CSV: assume extrato bancario e vai direto pro Atrio Finance /auto
     if (isOfx || isCsv) {
@@ -2602,7 +3500,10 @@ export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo)
       client_id: clientInfo?.id ? String(clientInfo.id) : null,
       agent_id: lunaAgentId,
       title: msg.body?.trim() || filename,
+      msg_body: msg.body || '',  // pra classificador de doc fiscal usar texto da msg
       tags: ['whatsapp', isPdf ? 'pdf' : 'imagem'],
+      source_channel: 'whatsapp',    // gate: whatsapp SEMPRE vai pra draft
+      forceDraft: true,              // reforco: midia de cliente exige revisao humana
       metadata: {
         whatsapp_msg_id: msg.id?._serialized || msg.id,
         conversation_id: conversationInfo?.id || null,
@@ -2624,16 +3525,70 @@ export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo)
     log(`[AutoIngest] ${filename} → ${result.ok ? 'ok' : 'fail'} (${result.type}${result.ok ? (result.memory_id ? ', mem='+result.memory_id.slice(0,8) : (result.memory_ids?.length ? ', chunks='+result.memory_ids.length : '')) : ': '+result.error})`);
 
     // Notifica equipe no chat interno (NAO responde o cliente — regra feedback_nfse_notificacao)
-    if (result.ok && typeof chat === "function") {
-      const preview = result.type === 'image'
-        ? `${result.doc_type || 'imagem'}: ${result.summary?.slice(0, 160) || ''}`
-        : `PDF ${result.pages}p, ${result.chunks} chunks — ${result.preview?.slice(0, 160) || ''}`;
+    // Mensagem varia conforme destino real do PDF:
+    //   1. Extrato roteado com sucesso pro Finance → info
+    //   2. Extrato detectado MAS Finance rejeitou (sem conta/cliente) → delega task pro Sneijder
+    //   3. Doc normal pro RAG → pendente aprovacao
+    if (typeof chat === "function") {
+      const who = clientInfo?.name || clientInfo?.legalName || 'Cliente';
       try {
-        chat({
-          from: 'Luna',
-          text: `📎 ${clientInfo?.name || 'Cliente'} enviou ${isPdf ? 'PDF' : 'imagem'}: ${filename}\n${preview}\n(Pendente de aprovacao na aba Documentos)`,
-          tag: 'ingest'
-        });
+        if (result.ok && result.routed === 'banking') {
+          // Sucesso no Finance
+          const bancoTxt = result.banco ? ` (${result.banco.toUpperCase()})` : '';
+          const txt = result.imported != null
+            ? `✅ Extrato${bancoTxt} importado: ${result.imported} transações${result.skipped ? `, ${result.skipped} duplicadas ignoradas` : ''}${result.contaCriada ? ' — conta criada automaticamente' : ''}`
+            : `✅ Extrato${bancoTxt} enviado ao Atrio Finance`;
+          chat({ from: 'Luna', text: `📎 ${who} enviou ${filename}\n${txt}`, tag: 'ingest' });
+        } else if (!result.ok && result.skipped_memory) {
+          // Extrato detectado mas precisa intervenção — cria task pro Sneijder
+          const banco = result.classification?.bankHint || 'banco';
+          const clienteInfo = result.cliente_id ? `cliente #${result.cliente_id}` : '(cliente nao identificado)';
+          try {
+            await query(
+              `INSERT INTO tasks (title, description, client_id, assigned_to, priority, status, result, created_at)
+               VALUES ($1, $2, $3, $4, 'high', 'pending', $5::jsonb, NOW())`,
+              [
+                `Extrato ${banco.toUpperCase()} precisa ação — ${who}`,
+                `Extrato PDF recebido via WhatsApp nao pode ser importado automaticamente.\n\n` +
+                `Arquivo: ${filename}\n` +
+                `Cliente: ${clienteInfo}\n` +
+                `Motivo: ${result.error || 'sem detalhes'}\n\n` +
+                `Ação: abrir Atrio Finance > Extratos e importar manualmente ou cadastrar conta primeiro.`,
+                result.cliente_id || null,
+                'a0000001-0000-0000-0000-000000000003',  // Sneijder
+                JSON.stringify({
+                  source: 'whatsapp_auto_ingest',
+                  filename,
+                  phone: msg.from,
+                  classification: result.classification,
+                  file_path: result.file_path,
+                }),
+              ]
+            );
+            chat({
+              from: 'Luna',
+              text: `📎 ${who} enviou extrato ${banco.toUpperCase()} (${filename})\n⚠️ Nao importei automaticamente: ${result.error}\n→ Criei task pro *Sneijder* processar em Finance`,
+              tag: 'ingest'
+            });
+          } catch (e) {
+            log('[auto-ingest] falha ao criar task Sneijder: ' + e.message);
+            chat({
+              from: 'Luna',
+              text: `📎 ${who} enviou extrato ${banco.toUpperCase()} (${filename})\n⚠️ Nao consegui importar nem criar task: ${e.message}`,
+              tag: 'ingest'
+            });
+          }
+        } else if (result.ok && result.type === 'image') {
+          // Imagem vai pra RAG como sempre
+          const preview = `${result.doc_type || 'imagem'}: ${result.summary?.slice(0, 160) || ''}`;
+          chat({ from: 'Luna', text: `📎 ${who} enviou imagem: ${filename}\n${preview}\n(Pendente de aprovação na aba Documentos)`, tag: 'ingest' });
+        } else if (result.ok && result.memory_ids) {
+          // PDF comum foi pra RAG
+          const preview = `PDF ${result.pages || '?'}p, ${result.chunks || result.memory_ids?.length || 0} chunks — ${result.preview?.slice(0, 160) || ''}`;
+          chat({ from: 'Luna', text: `📎 ${who} enviou PDF: ${filename}\n${preview}\n(Pendente de aprovação na aba Documentos)`, tag: 'ingest' });
+        } else if (!result.ok) {
+          chat({ from: 'Luna', text: `📎 ${who} enviou ${filename}\n⚠️ Erro na ingestão: ${result.error || 'desconhecido'}`, tag: 'ingest' });
+        }
       } catch {}
     }
 

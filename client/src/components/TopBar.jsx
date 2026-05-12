@@ -93,14 +93,14 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
       {/* Logo */}
       <div className="topbar-logo flex items-center gap-3 px-5 h-full" style={{ borderRight: `1px solid var(--ao-border)` }}>
         <div className="w-8 h-8 rounded-xl flex items-center justify-center" style={{
-          background: 'linear-gradient(135deg, #C4956A 0%, #A67B52 100%)',
-          boxShadow: '0 2px 12px rgba(196, 149, 106, 0.25)',
+          background: 'linear-gradient(135deg, #6366F1 0%, #A67B52 100%)',
+          boxShadow: '0 2px 12px rgba(99, 102, 241, 0.25)',
         }}>
           <span className="text-white text-[12px] font-black tracking-tight">A</span>
         </div>
         <div className="flex items-baseline gap-1">
           <span className="text-[16px] font-bold tracking-tight" style={{ fontFamily: 'Outfit', color: 'var(--ao-text)' }}>Atrio</span>
-          <span className="text-[#C4956A] text-[16px] font-bold tracking-tight" style={{ fontFamily: 'Outfit' }}>Office</span>
+          <span className="text-[#6366F1] text-[16px] font-bold tracking-tight" style={{ fontFamily: 'Outfit' }}>Office</span>
         </div>
       </div>
 
@@ -147,7 +147,7 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
             }}>
               <div style={{
                 width: 40, height: 40, borderRadius: 12,
-                background: 'linear-gradient(135deg, #C4956A 0%, #A67B52 100%)',
+                background: 'linear-gradient(135deg, #6366F1 0%, #A67B52 100%)',
                 boxShadow: '0 4px 14px rgba(196,149,106,0.35)',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
               }}>
@@ -156,7 +156,7 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 16, fontWeight: 700, lineHeight: 1.1 }}>
                   <span style={{ color: 'var(--ao-text)' }}>Átrio </span>
-                  <span style={{ color: '#C4956A' }}>Office</span>
+                  <span style={{ color: '#6366F1' }}>Office</span>
                 </div>
                 <div style={{ fontSize: 10.5, color: 'var(--ao-text-dim)', marginTop: 2 }}>
                   {onlineCount}/{agents?.length || 0} agentes · {connected ? 'ao vivo' : 'offline'}
@@ -282,8 +282,8 @@ export default function TopBar({ agents, connected, onAction, onSearchOpen, curr
               {link.label}
               {active && (
                 <span className="absolute bottom-0 left-4 right-4 h-[2px] rounded-t-full" style={{
-                  background: 'linear-gradient(90deg, #C4956A, #C4956A80)',
-                  boxShadow: '0 0 8px rgba(196, 149, 106, 0.3)',
+                  background: 'linear-gradient(90deg, #6366F1, #6366F180)',
+                  boxShadow: '0 0 8px rgba(99, 102, 241, 0.3)',
                 }} />
               )}
             </button>
@@ -423,15 +423,15 @@ function DrawerItem({ link, active, onClick }) {
       {active && (
         <span style={{
           position: 'absolute', left: 0, top: 8, bottom: 8, width: 3,
-          background: '#C4956A', borderRadius: '0 2px 2px 0',
+          background: '#6366F1', borderRadius: '0 2px 2px 0',
         }} />
       )}
       <div style={{
         width: 30, height: 30, borderRadius: 8,
-        background: active ? 'rgba(196, 149, 106, 0.12)' : 'var(--ao-bg)',
-        border: active ? '1px solid rgba(196, 149, 106, 0.35)' : '1px solid var(--ao-border)',
+        background: active ? 'rgba(99, 102, 241, 0.12)' : 'var(--ao-bg)',
+        border: active ? '1px solid rgba(99, 102, 241, 0.35)' : '1px solid var(--ao-border)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        color: active ? '#C4956A' : 'var(--ao-text-dim)', flexShrink: 0,
+        color: active ? '#6366F1' : 'var(--ao-text-dim)', flexShrink: 0,
         transition: 'background 0.15s, color 0.15s',
       }}>
         {Icon ? <Icon size={14} strokeWidth={active ? 2.4 : 2} /> : null}
@@ -486,7 +486,7 @@ function PushToggle() {
       style={{
         background: 'var(--ao-input-bg)',
         border: `1px solid ${active ? 'rgba(186,117,23,0.5)' : 'var(--ao-border)'}`,
-        color: active ? '#BA7517' : 'var(--ao-text-muted)',
+        color: active ? '#6366F1' : 'var(--ao-text-muted)',
         opacity: loading ? 0.6 : 1,
       }}
     >

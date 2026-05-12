@@ -11,6 +11,7 @@ import AttendanceQueue from './components/AttendanceQueue'
 import AgentChat from './components/AgentChat'
 import GlobalSearch from './components/GlobalSearch'
 import StatusBar from './components/StatusBar'
+import WhatsAppAlertBanner from './components/WhatsAppAlertBanner'
 import ActivityHeatmap from './components/ActivityHeatmap'
 import CronManager from './components/CronManager'
 import CostAnalytics from './components/CostAnalytics'
@@ -40,13 +41,22 @@ import PortalDashboard from './portal/PortalDashboard'
 export const ThemeContext = createContext()
 
 function useTheme() {
-  const [theme, setTheme] = useState(() => localStorage.getItem('atrio-office-theme') || 'dark')
+  // Embed (carregado via iframe do Gesthub) FORCA light theme pra harmonizar
+  // com o Gesthub e nao gerar clash visual dark/light.
+  const isEmbedTheme = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('embed') === '1'
+  const [theme, setTheme] = useState(() => {
+    if (isEmbedTheme) return 'light'
+    return localStorage.getItem('atrio-office-theme') || 'light'
+  })
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
-    localStorage.setItem('atrio-office-theme', theme)
-  }, [theme])
-  const toggle = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
-  return { theme, toggle }
+    if (!isEmbedTheme) localStorage.setItem('atrio-office-theme', theme)
+  }, [theme, isEmbedTheme])
+  const toggle = () => {
+    if (isEmbedTheme) return // bloqueado em embed
+    setTheme(t => t === 'dark' ? 'light' : 'dark')
+  }
+  return { theme, toggle, isEmbedTheme }
 }
 
 function AdminDashboard() {
@@ -63,16 +73,52 @@ function AdminDashboard() {
   }, [lastMessage, refresh])
   const [selectedAgent, setSelectedAgent] = useState(null)
   const [searchOpen, setSearchOpen] = useState(false)
-  // Pagina inicial: celular abre direto em Atendimento (foco operacional mobile),
-  // desktop abre em Escritorio (dashboard / visao geral).
-  const [currentPage, setCurrentPage] = useState(() =>
-    (typeof window !== 'undefined' && window.innerWidth < 768) ? 'atendimento' : 'home'
-  )
+  // Modo embed: quando carregado via iframe (ex: do Gesthub) com ?embed=1,
+  // esconde TopBar/StatusBar e abre direto em Atendimento.
+  const isEmbed = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('embed') === '1'
+  // Pagina inicial: celular abre direto em Atendimento; desktop em Escritorio.
+  // Embed: sempre Atendimento.
+  const [currentPage, setCurrentPage] = useState(() => {
+    if (isEmbed) return 'atendimento'
+    return (typeof window !== 'undefined' && window.innerWidth < 768) ? 'atendimento' : 'home'
+  })
   const [chatOpen, setChatOpen] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   // Paginas largas (datalake, memory, atendimento) nao mostram chat fixo — usa floating
   const WIDE_PAGES = ['datalake', 'ecossistema', 'memory', 'crons', 'custos', 'sessions', 'docs', 'activity', 'errors', 'alerts', 'atendimento', 'templates', 'growth', 'seguranca']
   const isWidePage = WIDE_PAGES.includes(currentPage)
+  // ── Embed mode: integracao com Gesthub via postMessage ───────────────
+  // Quando rodando dentro do iframe (?embed=1):
+  //   - Marca <body data-embed="1"> pra CSS adapter pegar
+  //   - Avisa parent quando deve abrir outro modulo (Cliente 360, Carteira, IRPF)
+  //   - Envia contador de pendentes (mostra badge "Atendimento [3]" no menu Gesthub)
+  //   - Recebe info do user logado no Gesthub (pra exibir 'colaborador_nome' nas msgs)
+  useEffect(() => {
+    if (!isEmbed) return
+    document.body.setAttribute('data-embed', '1')
+    document.body.classList.add('atrio-embed-active')
+
+    // Listener: parent (Gesthub) manda info do user / theme
+    const onMsg = (ev) => {
+      try {
+        const data = ev?.data
+        if (!data || typeof data !== 'object') return
+        if (data.type === 'atrio_set_user' && data.user) {
+          window.__atrioGesthubUser = data.user
+        }
+        if (data.type === 'atrio_set_theme' && (data.mode === 'light' || data.mode === 'dark')) {
+          document.documentElement.setAttribute('data-theme', data.mode)
+        }
+      } catch {}
+    }
+    window.addEventListener('message', onMsg)
+
+    // Handshake: avisa parent que tamos prontos
+    try { window.parent?.postMessage({ type: 'atrio_embed_ready' }, '*') } catch {}
+
+    return () => window.removeEventListener('message', onMsg)
+  }, [isEmbed])
+
 
   // Global search shortcut (Cmd+K / Ctrl+K)
   useEffect(() => {
@@ -111,15 +157,15 @@ function AdminDashboard() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-28px)] overflow-hidden" style={{ background: 'var(--ao-bg)', color: 'var(--ao-text)', transition: 'background 0.3s, color 0.3s' }}>
+    <div className={`flex overflow-hidden ${isEmbed ? 'h-screen' : 'h-[calc(100vh-28px)]'}`} style={{ background: 'var(--ao-bg)', color: 'var(--ao-text)', transition: 'background 0.3s, color 0.3s' }}>
       <div className="flex-1 flex flex-col overflow-hidden">
         <ExpiringBanner />
-        <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} currentPage={currentPage} onNavigate={setCurrentPage} mobileMenuOpen={mobileMenuOpen} setMobileMenuOpen={setMobileMenuOpen} />
+        {!isEmbed && <TopBar agents={agents} connected={connected} onAction={handleAction} onSearchOpen={() => setSearchOpen(true)} currentPage={currentPage} onNavigate={setCurrentPage} mobileMenuOpen={mobileMenuOpen} setMobileMenuOpen={setMobileMenuOpen} />}
 
         {/* Main content: two-column layout */}
         <div className="flex-1 flex overflow-hidden">
           {/* LEFT COLUMN — 60% */}
-          <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
+          <div className="flex-1" style={{ minWidth: 0, overflowY: currentPage === 'atendimento' ? 'hidden' : 'auto', display: 'flex', flexDirection: 'column' }}>
             {currentPage === 'home' && (
               <div className="max-w-[960px] mx-auto px-5 py-5 space-y-5">
                 <MissionControl />
@@ -193,7 +239,7 @@ function AdminDashboard() {
                 style={{
                   width: 48, height: 48,
                   bottom: 80,  /* sobe 80px pra nao tampar rodape/statusbar */
-                  background: 'linear-gradient(135deg, #C4956A 0%, #a07a52 100%)',
+                  background: 'linear-gradient(135deg, #6366F1 0%, #a07a52 100%)',
                   color: '#fff',
                   boxShadow: '0 6px 20px rgba(196,149,106,0.4)',
                 }}
@@ -220,7 +266,8 @@ function AdminDashboard() {
       </div>
 
       <GlobalSearch isOpen={searchOpen} onClose={() => setSearchOpen(false)} />
-      <StatusBar />
+      <WhatsAppAlertBanner />
+      {!isEmbed && <StatusBar />}
       {/* BottomNav removida: mobile foca em Atendimento, hamburger no topo atende os demais. */}
 
       {/* Chat Panel overlay when agent is selected */}
@@ -242,7 +289,7 @@ function AdminDashboard() {
             <div className="flex items-center justify-between px-5 py-4 shrink-0" style={{ borderBottom: '1px solid var(--ao-border)' }}>
               <div className="flex items-center gap-3">
                 <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{
-                  background: 'linear-gradient(135deg, #C4956A 0%, #A67B52 100%)',
+                  background: 'linear-gradient(135deg, #6366F1 0%, #A67B52 100%)',
                 }}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10,9 9,9 8,9"/>

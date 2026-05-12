@@ -1,0 +1,196 @@
+/* ============================================================
+   Gesthub theme adapter pro Atrio Office
+   - Adota palette completa do Gesthub (incluindo accent indigo)
+   - Mapeia --ao-* legacy pras novas vars (compat com componentes Office)
+   - Aplica fontes do Gesthub (DM Sans + Outfit)
+   - Carregado APÓS index.css, então sobrescreve.
+   ============================================================ */
+
+:root, [data-theme="light"] {
+  /* ─── Gesthub palette (light) ─── */
+  --bg: #F8FAFF;
+  --surface: #FFFFFF;
+  --surface-2: #F8FAFF;
+  --surface-3: #EEF2FF;
+  --border: #E2E8F0;
+  --border-accent: #C7D2FE;
+  --text-primary: #0F172A;
+  --text-secondary: #475569;
+  --text-muted: #94A3B8;
+  --text-faint: #CBD5E1;
+
+  /* ─── ACCENT (indigo do Gesthub) ─── */
+  --accent: #6366F1;
+  --accent-light: #A78BFA;
+  --accent-bg: #EEF2FF;
+  --accent-bg-2: #E0E7FF;
+  --accent-text: #4338CA;
+
+  /* ─── Status (light) ─── */
+  --success: #059669;
+  --success-bg: #ECFDF5;
+  --success-border: #A7F3D0;
+  --warning: #D97706;
+  --warning-bg: #FFFBEB;
+  --warning-border: #FDE68A;
+  --danger: #DC2626;
+  --danger-bg: #FEF2F2;
+  --danger-border: #FECACA;
+  --info: #3B82F6;
+  --info-bg: #EFF6FF;
+  --info-border: #BFDBFE;
+  --neutral: #6B7280;
+  --bg-hover: #F1F5F9;
+
+  /* ─── Mapeia --ao-* legacy ─── */
+  --ao-bg: var(--bg);
+  --ao-text: var(--text-primary);
+  --ao-text-xs: rgba(15, 23, 42, 0.25);
+  --ao-text-dim: var(--text-faint);
+  --ao-text-muted: var(--text-muted);
+  --ao-text-secondary: var(--text-secondary);
+  --ao-text-primary: var(--text-primary);
+  --ao-surface: var(--surface);
+  --ao-card: var(--surface-2);
+  --ao-card-hover: var(--bg-hover);
+  --ao-border: var(--border);
+  --ao-border-hover: var(--border-accent);
+  --ao-border-subtle: rgba(15, 23, 42, 0.04);
+  --ao-topbar: rgba(255, 255, 255, 0.97);
+  --ao-glass: rgba(255, 255, 255, 0.9);
+  --ao-glass-half: rgba(255, 255, 255, 0.7);
+  --ao-glass-hover: rgba(248, 250, 255, 0.95);
+  --ao-glass-hover-half: rgba(248, 250, 255, 0.85);
+  --ao-input-bg: rgba(15, 23, 42, 0.04);
+  --ao-input-border: var(--border);
+  --ao-badge-bg: rgba(15, 23, 42, 0.06);
+  --ao-hover-bg: rgba(15, 23, 42, 0.04);
+  --ao-separator: rgba(15, 23, 42, 0.08);
+  --ao-shadow: rgba(0, 0, 0, 0.08);
+  --ao-scrollbar: rgba(99, 102, 241, 0.25);
+  --ao-scrollbar-hover: rgba(99, 102, 241, 0.45);
+  --ao-popup-bg: var(--surface);
+  --ao-accent: var(--accent);
+  --ao-accent-light: var(--accent-light);
+  --ao-accent-bg: var(--accent-bg);
+  --ao-accent-text: var(--accent-text);
+}
+
+[data-theme="dark"] {
+  /* ─── Gesthub palette (dark) ─── */
+  --bg: #0F1117;
+  --surface: #1A1D27;
+  --surface-2: #1E2130;
+  --surface-3: #252836;
+  --border: #2D3148;
+  --border-accent: #4338CA;
+  --text-primary: #E8ECF4;
+  --text-secondary: #A0AEC0;
+  --text-muted: #6B7A90;
+  --text-faint: #3D4A5C;
+
+  /* ─── ACCENT (indigo dark do Gesthub) ─── */
+  --accent: #818CF8;
+  --accent-light: #A78BFA;
+  --accent-bg: #1E1B4B;
+  --accent-bg-2: #272366;
+  --accent-text: #C4B5FD;
+
+  /* ─── Status (dark) ─── */
+  --success: #34D399;
+  --success-bg: #064E3B;
+  --success-border: #065F46;
+  --warning: #FBBF24;
+  --warning-bg: #451A03;
+  --warning-border: #78350F;
+  --danger: #F87171;
+  --danger-bg: #450A0A;
+  --danger-border: #7F1D1D;
+  --info: #60A5FA;
+  --info-bg: #1E3A5F;
+  --info-border: #1E40AF;
+  --neutral: #9CA3AF;
+  --bg-hover: #252836;
+
+  /* ─── --ao-* legacy (dark) ─── */
+  --ao-bg: var(--bg);
+  --ao-text: var(--text-primary);
+  --ao-text-xs: rgba(255, 255, 255, 0.12);
+  --ao-text-dim: var(--text-faint);
+  --ao-text-muted: var(--text-muted);
+  --ao-text-secondary: var(--text-secondary);
+  --ao-text-primary: var(--text-primary);
+  --ao-surface: var(--surface);
+  --ao-card: var(--surface-2);
+  --ao-card-hover: var(--bg-hover);
+  --ao-border: var(--border);
+  --ao-border-hover: rgba(255, 255, 255, 0.1);
+  --ao-border-subtle: rgba(255, 255, 255, 0.04);
+  --ao-topbar: rgba(15, 17, 23, 0.95);
+  --ao-glass: rgba(26, 29, 39, 0.8);
+  --ao-glass-half: rgba(26, 29, 39, 0.5);
+  --ao-glass-hover: rgba(30, 33, 48, 0.9);
+  --ao-glass-hover-half: rgba(30, 33, 48, 0.7);
+  --ao-input-bg: rgba(255, 255, 255, 0.04);
+  --ao-input-border: rgba(255, 255, 255, 0.05);
+  --ao-badge-bg: rgba(255, 255, 255, 0.06);
+  --ao-hover-bg: rgba(255, 255, 255, 0.02);
+  --ao-separator: rgba(255, 255, 255, 0.025);
+  --ao-shadow: rgba(0, 0, 0, 0.3);
+  --ao-scrollbar: rgba(129, 140, 248, 0.25);
+  --ao-scrollbar-hover: rgba(129, 140, 248, 0.45);
+  --ao-popup-bg: #1a1b1f;
+  --ao-accent: var(--accent);
+  --ao-accent-light: var(--accent-light);
+  --ao-accent-bg: var(--accent-bg);
+  --ao-accent-text: var(--accent-text);
+}
+
+/* ============================================================
+   Tipografia (alinha com Gesthub)
+   ============================================================ */
+body {
+  font-family: 'DM Sans', 'Outfit', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Outfit', system-ui, sans-serif;
+  letter-spacing: -0.01em;
+}
+
+/* Embed mode: garante body claro */
+body[data-embed="1"] {
+  background: var(--bg) !important;
+}
+
+
+/* ============================================================
+   Embed mode: garante cadeia de altura 100vh sem extrapolar.
+   Resolve "input some em zoom 100%" — em qualquer resolucao o
+   container fica contido na viewport e o flex layout do ChatPane
+   (header + messages overflow + input fixo) funciona corretamente.
+   ============================================================ */
+html, body {
+  height: 100%;
+}
+body[data-embed="1"] {
+  background: var(--bg) !important;
+  height: 100vh !important;
+  margin: 0;
+  overflow: hidden;
+}
+body[data-embed="1"] #root {
+  height: 100vh;
+  max-height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+body[data-embed="1"] #root > * {
+  flex: 1;
+  min-height: 0;
+}

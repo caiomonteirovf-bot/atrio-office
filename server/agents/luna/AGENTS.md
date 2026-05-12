@@ -6,8 +6,8 @@ department: atendimento
 status: online
 reports_to: null
 model:
-  provider: openrouter
-  model: x-ai/grok-4-fast
+  provider: grok
+  model: grok-4-1-fast
   temperature: 0.5
   max_tokens: 1024
 budget_monthly_usd: 30

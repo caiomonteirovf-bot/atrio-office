@@ -81,7 +81,7 @@ export default function EnsinarLunaModal({ open, onClose, conversation: conv, se
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
           <div style={{
             width: 32, height: 32, borderRadius: 8,
-            background: 'linear-gradient(135deg, #BA7517, #A67B52)',
+            background: 'linear-gradient(135deg, #6366F1, #A67B52)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
           }}>
             <Sparkles size={16} color="#fff" />
@@ -127,7 +127,7 @@ export default function EnsinarLunaModal({ open, onClose, conversation: conv, se
                 style={{
                   padding: '5px 10px', fontSize: 11, fontWeight: 600,
                   borderRadius: 6, border: '1px solid var(--ao-border)',
-                  background: scope === opt.id ? 'var(--ao-accent, #c4956a)' : 'transparent',
+                  background: scope === opt.id ? 'var(--ao-accent, #6366F1)' : 'transparent',
                   color: scope === opt.id ? '#fff' : 'var(--ao-text-secondary)',
                   cursor: opt.disabled ? 'not-allowed' : 'pointer',
                   opacity: opt.disabled ? 0.4 : 1,
@@ -250,7 +250,7 @@ export default function EnsinarLunaModal({ open, onClose, conversation: conv, se
             style={{
               padding: '7px 14px', fontSize: 12, fontWeight: 700, borderRadius: 6,
               border: 'none',
-              background: canSave ? 'linear-gradient(135deg, #BA7517, #A67B52)' : 'var(--ao-surface)',
+              background: canSave ? 'linear-gradient(135deg, #6366F1, #A67B52)' : 'var(--ao-surface)',
               color: canSave ? '#fff' : 'var(--ao-text-dim)',
               cursor: canSave ? 'pointer' : 'not-allowed',
               display: 'inline-flex', alignItems: 'center', gap: 5,

@@ -156,6 +156,59 @@ function getAgentConfig(agentNameOrObj) {
   return AGENT_CONFIG[name] || FALLBACK_CONFIG;
 }
 
+// ============================================
+// FALLBACK CHAIN — define ordem de tentativa por provider primário.
+// Substitui SDK direto (uma única chance) por cadeia tolerante a 402/429/timeout.
+// Default: ATIVO. Desligar via env LLM_FALLBACK_DISABLE=true.
+// Por agente, suprimir via DB: agent.config.no_fallback === true (Campelo crítico).
+// ============================================
+function defaultChain(config, agent) {
+  const primary = { provider: config.provider, model: config.model };
+  if (agent?.config?.no_fallback === true || process.env.LLM_FALLBACK_DISABLE === 'true') {
+    return [primary];
+  }
+  const chain = [primary];
+  const m = String(config.model || '').toLowerCase();
+
+  if (config.provider === 'anthropic') {
+    chain.push({ provider: 'openrouter', model: m.includes('/') ? m : `anthropic/${m}` });
+    chain.push({ provider: 'openrouter', model: 'anthropic/claude-haiku-4.5' });
+  } else if (config.provider === 'openrouter') {
+    if (m.startsWith('anthropic/')) {
+      chain.push({ provider: 'openrouter', model: 'anthropic/claude-haiku-4.5' });
+      chain.push({ provider: 'openrouter', model: 'deepseek/deepseek-chat' });
+    } else if (m.startsWith('x-ai/') || m.includes('grok')) {
+      chain.push({ provider: 'grok', model: 'grok-4-1-fast' });
+      chain.push({ provider: 'openrouter', model: 'deepseek/deepseek-chat' });
+    } else if (m.startsWith('deepseek/')) {
+      chain.push({ provider: 'deepseek', model: 'deepseek-chat' });
+      chain.push({ provider: 'openrouter', model: 'x-ai/grok-4-fast' });
+    } else if (m.startsWith('openai/')) {
+      chain.push({ provider: 'openrouter', model: 'deepseek/deepseek-chat' });
+      chain.push({ provider: 'openrouter', model: 'x-ai/grok-4-fast' });
+    } else {
+      chain.push({ provider: 'openrouter', model: 'deepseek/deepseek-chat' });
+    }
+  } else if (config.provider === 'grok') {
+    chain.push({ provider: 'openrouter', model: 'x-ai/grok-4-fast' });
+    chain.push({ provider: 'openrouter', model: 'deepseek/deepseek-chat' });
+  } else if (config.provider === 'deepseek') {
+    chain.push({ provider: 'openrouter', model: 'deepseek/deepseek-chat' });
+    chain.push({ provider: 'openrouter', model: 'x-ai/grok-4-fast' });
+  } else if (config.provider === 'minimax') {
+    chain.push({ provider: 'openrouter', model: 'deepseek/deepseek-chat' });
+  }
+
+  // Dedupe por (provider:model)
+  const seen = new Set();
+  return chain.filter(c => {
+    const k = `${c.provider}:${c.model}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 function getOpenAIClient(provider) {
   if (provider === 'grok' && grok) return grok;
   if (provider === 'deepseek' && deepseek) return deepseek;
@@ -465,7 +518,7 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
   // ============================================================
   if (config.use_gateway === true && !budget.blocked) {
     try {
-      const { generate } = await import('./llm-gateway.js');
+      const { generateWithFallback } = await import('./llm-gateway.js');
       // Monta tools no formato OpenAI (inclusive pra adapters compat e openrouter)
       const tools = (agent.tools || []).map(tool => ({
         type: 'function',
@@ -492,11 +545,14 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
         convo = [{ role: 'system', content: agent.system_prompt }, ...sanitized];
       }
 
+      // Monta cadeia de fallback (provider primário + alternativas via OpenRouter etc)
+      const chain = defaultChain(config, agent);
+
       let totalCost = 0, totalCached = 0;
+      let lastUsedProvider = config.provider, lastUsedModel = config.model;
       for (let round = 0; round < 10; round++) {
-        const res = await generate({
-          provider: config.provider,
-          model: config.model,
+        const res = await generateWithFallback({
+          chain,
           messages: convo,
           temperature: config.temperature,
           maxTokens: config.maxTokens,
@@ -506,15 +562,29 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
           agentId: agent.id,
         });
         if (!res.success) {
-          console.warn('[gateway] ' + agent.name + ' falhou round=' + round + ' (' + res.error + '), fallback legacy');
-          throw new Error(res.error);  // cai pro catch → legacy path
+          console.warn('[gateway] ' + agent.name + ' chain exausta round=' + round + ' (' + res.error + ')');
+          if (res.chain_exhausted) {
+            // Mensagem amigável em vez de subir 402 cru
+            return {
+              success: false,
+              error: res.error,
+              text: res.friendly || 'Estou com instabilidade técnica nos modelos de IA. Já avisei a equipe.',
+              friendly: true,
+              provider: 'fallback',
+              model: chain.map(c => c.provider+'/'+c.model).join(' → '),
+              attempts: res.attempts,
+            };
+          }
+          throw new Error(res.error);  // erro não-retryable → tenta legacy
         }
+        lastUsedProvider = res.provider;
+        lastUsedModel = res.model;
         totalCost += res.usage?.cost_usd || 0;
         totalCached += res.usage?.cached_tokens || 0;
 
         // Sem tool calls → resposta final
         if (!res.tool_calls || res.tool_calls.length === 0) {
-          console.log('[gateway] ' + agent.name + ' via ' + config.provider + '/' + config.model + ' rounds=' + (round+1) + ' cost=$' + totalCost.toFixed(6) + ' cache=' + totalCached);
+          console.log('[gateway] ' + agent.name + ' via ' + lastUsedProvider + '/' + lastUsedModel + ' rounds=' + (round+1) + ' cost=$' + totalCost.toFixed(6) + ' cache=' + totalCached + (res.attempts?.length > 1 ? ' attempts=' + res.attempts.length : ''));
           return {
             success: true,
             text: res.content || '',
@@ -524,15 +594,15 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
               total_tokens: (res.usage?.input_tokens || 0) + (res.usage?.output_tokens || 0),
               prompt_tokens_details: { cached_tokens: totalCached },
             },
-            provider: config.provider,
-            model: config.model,
+            provider: lastUsedProvider,
+            model: lastUsedModel,
           };
         }
 
         // Com tool calls → executa e continua
         if (!toolExecutor) {
           console.warn('[gateway] ' + agent.name + ' pediu tools sem executor');
-          return { success: true, text: res.content || '', usage: {}, provider: config.provider, model: config.model };
+          return { success: true, text: res.content || '', usage: {}, provider: lastUsedProvider, model: lastUsedModel };
         }
 
         // Assistant message com tool_calls
@@ -559,7 +629,7 @@ export async function chatWithAgent(agent, messages, toolExecutor = null) {
         }
       }
       console.warn('[gateway] ' + agent.name + ' excedeu 10 rounds de tool-use');
-      return { success: false, error: 'loop de ferramentas excedido', text: '[loop de ferramentas excedido]', provider: config.provider, model: config.model };
+      return { success: false, error: 'loop de ferramentas excedido', text: '[loop de ferramentas excedido]', provider: lastUsedProvider, model: lastUsedModel };
     } catch (e) {
       console.warn('[gateway] exception em ' + agent.name + ':', e.message, '— caindo pro legacy');
     }

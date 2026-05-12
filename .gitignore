@@ -17,3 +17,8 @@ docker-compose.yml.bak*
 
 # Storage local (nao versionar arquivos de cliente)
 server/storage/
+server/whatsapp-attachments/
+*.dump
+*.sql
+*.tar.gz
+.env*

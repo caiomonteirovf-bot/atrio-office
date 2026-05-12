@@ -136,7 +136,7 @@ export default function SaveContactModal({ open, onClose, conversation: conv, on
           padding: '14px 18px', borderBottom: '1px solid var(--ao-border)',
           display: 'flex', alignItems: 'center', gap: 10, position: 'sticky', top: 0, background: 'var(--ao-card)', zIndex: 1,
         }}>
-          <UserCheck size={16} style={{ color: 'var(--ao-accent, #c4956a)' }} />
+          <UserCheck size={16} style={{ color: 'var(--ao-accent, #6366F1)' }} />
           <div style={{ flex: 1 }}>
             <h3 style={{ fontSize: 14, fontWeight: 700, margin: 0 }}>Salvar contato</h3>
             <p style={{ fontSize: 11, color: 'var(--ao-text-dim)', margin: '2px 0 0' }}>

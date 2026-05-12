@@ -1,0 +1,5 @@
+server/whatsapp-attachments/
+*.dump
+*.sql
+*.tar.gz
+.env*

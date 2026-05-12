@@ -71,7 +71,7 @@ export default function CopilotPane({ conversation: conv, client }) {
         background: 'var(--ao-card)', fontSize: 11, color: 'var(--ao-text-dim)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <Sparkles size={12} style={{ color: '#BA7517' }} />
+          <Sparkles size={12} style={{ color: '#6366F1' }} />
           <span>Contexto: {conv.client_name || conv.display_phone}</span>
           {client && <span style={{ opacity: 0.7 }}>· {client.taxRegime || '--'}</span>}
         </div>
@@ -130,12 +130,12 @@ export default function CopilotPane({ conversation: conv, client }) {
             <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
               <div style={{
                 maxWidth: '92%', padding: '8px 11px', borderRadius: 8,
-                background: 'rgba(186, 117, 23, 0.08)',
-                border: '1px solid rgba(186, 117, 23, 0.25)',
+                background: 'rgba(99, 102, 241, 0.08)',
+                border: '1px solid rgba(99, 102, 241, 0.25)',
                 fontSize: 12.5, color: 'var(--ao-text-primary)',
                 whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.45,
               }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4, fontSize: 10, fontWeight: 700, color: '#BA7517', textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4, fontSize: 10, fontWeight: 700, color: '#6366F1', textTransform: 'uppercase', letterSpacing: '0.4px' }}>
                   <Sparkles size={10} /> Copilot
                 </div>
                 {it.loading ? (
@@ -201,7 +201,7 @@ export default function CopilotPane({ conversation: conv, client }) {
           disabled={!question.trim() || loading || !conv?.id}
           style={{
             padding: '8px 12px', borderRadius: 7, border: 'none',
-            background: (question.trim() && !loading && conv?.id) ? 'linear-gradient(135deg, #BA7517, #A67B52)' : 'var(--ao-surface)',
+            background: (question.trim() && !loading && conv?.id) ? 'linear-gradient(135deg, #6366F1, #A67B52)' : 'var(--ao-surface)',
             color: (question.trim() && !loading && conv?.id) ? '#fff' : 'var(--ao-text-dim)',
             fontSize: 12, fontWeight: 600,
             cursor: (question.trim() && !loading && conv?.id) ? 'pointer' : 'not-allowed',

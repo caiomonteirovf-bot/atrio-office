@@ -23,9 +23,38 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3010;
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+import { securityHeaders, rateLimitGeneral, rateLimitApi } from './services/security.js';
+
+// Headers de segurança HTTP — antes de tudo
+app.use(securityHeaders);
+// Rate limit geral (600/min por IP) — frente 7 baseline
+app.use(rateLimitGeneral);
+// Rate limit mais apertado em /api (240/min)
+app.use('/api', rateLimitApi);
+
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || '*',
+  credentials: true,
+}));
 app.use(express.json({ limit: '30mb' }));  // 30mb pra base64 de anexos (PDFs ~20mb)
 app.use(tenantMiddleware);  // multi-tenancy: X-Atrio-Tenant header ou DEFAULT_TENANT_ID
+
+// SSO compartilhado com Gesthub (cookie httpOnly + JWT mesmo SECRET)
+import { attachUser, requireAuth } from './middleware/auth.js';
+app.use(attachUser);
+
+app.get('/api/me', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Nao autenticado' });
+  try {
+    const r = await fetch('http://gesthub-app:8000/api/auth/me', {
+      headers: { Cookie: req.headers.cookie || '' },
+    });
+    const data = await r.json();
+    return res.status(r.status).json(data);
+  } catch (e) {
+    return res.status(503).json({ error: 'Gesthub auth indisponivel: ' + e.message });
+  }
+});
 
 // Serve frontend estático em produção
 // Em dev: ../../client/dist, em Docker: ../client/dist
@@ -1417,12 +1446,33 @@ app.get('/api/portal/client/:id', async (req, res) => {
 app.get('/api/stats', async (req, res) => {
   try {
     const [pending, blocked, todayConvs, sentiment] = await Promise.all([
-      // Atendimentos pendentes — conversas WhatsApp abertas (não resolvidas)
-      query(`SELECT COUNT(*) as count FROM whatsapp_conversations WHERE resolved = false`),
+      // Atendimentos pendentes — conversas COM cliente aguardando resposta humana
+      // (existe msg cliente sem resposta posterior de team/luna/bot).
+      // Antes era "WHERE resolved=false" que contava conversas antigas em fantasma.
+      query(`
+        SELECT COUNT(DISTINCT c.id) as count
+        FROM whatsapp_conversations c
+        WHERE c.resolved = false
+          AND EXISTS (
+            SELECT 1 FROM whatsapp_messages m
+            WHERE m.conversation_id = c.id AND m.sender = 'client'
+              AND NOT EXISTS (
+                SELECT 1 FROM whatsapp_messages m2
+                WHERE m2.conversation_id = c.id
+                  AND m2.sender IN ('team','luna','bot')
+                  AND m2.created_at > m.created_at
+              )
+          )
+      `),
       // Alertas — tasks bloqueadas que precisam de ação
       query(`SELECT COUNT(*) as count FROM tasks WHERE status = 'blocked'`),
-      // Conversas hoje — contatos do dia
-      query(`SELECT COUNT(*) as count FROM whatsapp_conversations WHERE DATE(started_at) = CURRENT_DATE`),
+      // Conversas hoje — distintas com mensagem hoje (cliente OU equipe).
+      // Antes era DATE(started_at)=CURRENT_DATE que ignorava recorrentes.
+      query(`
+        SELECT COUNT(DISTINCT m.conversation_id) as count
+        FROM whatsapp_messages m
+        WHERE DATE(m.created_at) = CURRENT_DATE
+      `),
       // Sentimento — média NPS das análises do dia (analysis JSONB contém nps_estimado)
       query(`SELECT
         AVG((analysis->>'nps_estimado')::numeric) as avg_nps,
@@ -1787,8 +1837,199 @@ import { startCronScheduler, registerCronHandler, executeCronJob, getCronHandler
 import { checkInadimplencia, checkContasPagar, checkSemHonorario, checkAlertasFiscais, checkDadosIncompletos } from './services/scheduler.js';
 import agentsRouter from './routes/agents.mjs';
 
-app.get('/api/whatsapp/status', (req, res) => {
-  res.json(whatsapp.getStatus());
+
+// ============================================
+// /api/atendimento/daily-summary — auditoria do dia
+// Junta atendimento + tasks + extratos (do Atrio Finance) num so payload.
+// Util pra responder: "o que foi solicitado/resolvido hoje?" e
+// "todos os extratos enviados foram encaminhados pro Finance?"
+// ============================================
+// Helper compartilhado: computa o daily-summary pra um dado date YYYY-MM-DD.
+// Usado tanto pelo GET /daily-summary quanto pelo POST /daily-summary/narrate.
+async function computeDailySummary(date) {
+    // 1) Atendimento (whatsapp_conversations)
+    const atendQ = await query(`
+      SELECT
+        COUNT(*) FILTER (WHERE started_at::date = $1::date AND COALESCE(is_group,false) = false) AS abertas_hoje,
+        COUNT(*) FILTER (WHERE resolved_at::date = $1::date AND COALESCE(is_group,false) = false) AS resolvidas_hoje,
+        COUNT(*) FILTER (WHERE COALESCE(resolved,false) = false
+                         AND COALESCE(human_replied,false) = false
+                         AND COALESCE(is_group,false) = false) AS ainda_aguardando,
+        COUNT(*) FILTER (WHERE resolved_at::date = $1::date
+                         AND COALESCE(resolution_reason,'') ILIKE '%auto%'
+                         AND COALESCE(is_group,false) = false) AS auto_resolvidas
+      FROM whatsapp_conversations
+    `, [date]);
+
+    // 2) Tasks
+    const tasksQ = await query(`
+      SELECT
+        COUNT(*) FILTER (WHERE created_at::date = $1::date) AS criadas,
+        COUNT(*) FILTER (WHERE status = 'done' AND updated_at::date = $1::date) AS concluidas,
+        COUNT(*) FILTER (WHERE status = 'blocked' AND updated_at::date = $1::date) AS bloqueadas
+      FROM tasks
+    `, [date]);
+
+    // 3) Extratos (chama Atrio Finance internamente)
+    let extratos = {
+      auto_importados: 0,
+      em_fila_aprovacao: 0,
+      total: 0,
+      lista: [],
+      error: null,
+    };
+    try {
+      const FINANCE_URL = process.env.ATRIO_FINANCE_URL || process.env.BANKING_URL || 'http://atrio-banking-system-1:3000';
+      const isToday = (iso) => typeof iso === 'string' && iso.slice(0, 10) === date;
+      const fetchJSON = async (url) => {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`Finance ${url} HTTP ${r.status}`);
+        return r.json();
+      };
+      const [uplResp, pendResp] = await Promise.all([
+        fetchJSON(`${FINANCE_URL}/api/uploads`).catch(e => ({ data: [], _err: e.message })),
+        fetchJSON(`${FINANCE_URL}/api/extratos-pending`).catch(e => ({ data: [], _err: e.message })),
+      ]);
+      const errs = [uplResp._err, pendResp._err].filter(Boolean);
+      if (errs.length) extratos.error = errs.join('; ');
+
+      const uploads = Array.isArray(uplResp.data) ? uplResp.data : [];
+      const pending = Array.isArray(pendResp.data) ? pendResp.data : [];
+
+      const todayUploads = uploads.filter(u => isToday(u.createdAt || u.created_at));
+      const todayPending = pending.filter(p => isToday(p.createdAt || p.created_at));
+
+      extratos.auto_importados = todayUploads.filter(u => (u.status || '').toLowerCase() === 'imported').length;
+      extratos.em_fila_aprovacao = todayPending.length;
+      extratos.total = todayUploads.length + todayPending.length;
+      extratos.lista = [
+        ...todayUploads.map(u => ({
+          source: 'imported',
+          id: u.id,
+          filename: u.filename,
+          status: u.status,
+          transacoes: u.transacoesCount ?? u.transacoes_count ?? null,
+          clienteId: u.clienteGesthubId ?? u.cliente_gesthub_id ?? null,
+          createdAt: u.createdAt || u.created_at,
+        })),
+        ...todayPending.map(p => ({
+          source: 'pending',
+          id: p.id,
+          filename: p.filename || p.original_filename,
+          status: 'pending_approval',
+          motivo: p.observacoes || null,
+          clienteId: p.cliente_gesthub_id_sugerido || p.cliente_gesthub_id || null,
+          recebidoVia: p.recebido_via || null,
+          recebidoNome: p.recebido_nome || null,
+          createdAt: p.createdAt || p.created_at,
+        })),
+      ].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    } catch (e) {
+      extratos.error = e.message;
+    }
+
+    return {
+      date,
+      generated_at: new Date().toISOString(),
+      atendimento: atendQ.rows[0] || {},
+      tasks: tasksQ.rows[0] || {},
+      extratos,
+    };
+}
+
+// GET /api/atendimento/daily-summary — usado pelo drawer
+app.get('/api/atendimento/daily-summary', async (req, res) => {
+  let date = (req.query.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    date = new Date().toISOString().slice(0, 10);
+  }
+  try {
+    const data = await computeDailySummary(date);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/atendimento/daily-summary/narrate — Rodrigo (LLM) gera briefing
+// executivo do dia. Latencia tipica 3-15s. Retorna { ok, text, summary }.
+app.post('/api/atendimento/daily-summary/narrate', async (req, res) => {
+  let date = (req.body?.date || req.query.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    date = new Date().toISOString().slice(0, 10);
+  }
+  try {
+    const summary = await computeDailySummary(date);
+    const a = summary.atendimento || {};
+    const t = summary.tasks || {};
+    const ex = summary.extratos || {};
+
+    const ext_problemas = (ex.lista || [])
+      .filter(it => it.source === 'pending')
+      .slice(0, 5)
+      .map(it => `  - ${it.filename || '(sem nome)'} — motivo: ${it.motivo || 'cliente/conta a confirmar'}`)
+      .join('\n');
+
+    const RODRIGO_AGENT_ID = 'a0000001-0000-0000-0000-000000000001';
+    const { rows: agents } = await query('SELECT * FROM agents WHERE id = $1', [RODRIGO_AGENT_ID]);
+    if (!agents.length) {
+      return res.status(500).json({ ok: false, error: 'Rodrigo nao encontrado no banco' });
+    }
+
+    const prompt = `Voce eh Rodrigo, Diretor de Operacoes do Atrio Office.
+O CEO (Caio) quer um briefing rapido do dia ${date}.
+
+NUMEROS:
+
+ATENDIMENTO WHATSAPP
+- Conversas abertas hoje: ${a.abertas_hoje || 0}
+- Resolvidas: ${a.resolvidas_hoje || 0}
+- Ainda aguardando resposta: ${a.ainda_aguardando || 0}
+- Auto-resolvidas (cliente sinalizou ou timeout): ${a.auto_resolvidas || 0}
+
+TASKS DA EQUIPE
+- Criadas: ${t.criadas || 0}
+- Concluidas: ${t.concluidas || 0}
+- Bloqueadas: ${t.bloqueadas || 0}
+
+EXTRATOS BANCARIOS (Atrio Finance)
+- Recebidos hoje: ${ex.total || 0}
+- Importados automaticamente: ${ex.auto_importados || 0}
+- Em fila de aprovacao (precisa humano confirmar cliente/conta): ${ex.em_fila_aprovacao || 0}
+${ext_problemas ? '\nExtratos pendentes detalhados:\n' + ext_problemas : ''}
+
+Gere um briefing executivo em portugues do Brasil:
+1. UMA frase abrindo (dia produtivo, gargalos, dia leve, etc)
+2. 3-5 bullets curtos e diretos com observacoes/insights — NAO repita numeros, interprete-os
+3. UMA acao recomendada para amanha se houver gargalo, senao omita
+
+Tom: direto, executivo. Sem markdown elaborado, sem emojis em excesso.
+Maximo 200 palavras.`;
+
+    const { chatWithAgent } = await import('./services/claude.js');
+    const response = await chatWithAgent(
+      { ...agents[0], tools: [] },
+      [{ role: 'user', content: prompt }]
+    );
+
+    if (!response?.success || !response?.text) {
+      return res.status(502).json({ ok: false, error: 'Rodrigo nao respondeu', detail: response?.error || null });
+    }
+
+    res.json({ ok: true, text: response.text, summary });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/whatsapp/status', async (req, res) => {
+  try {
+    const s = await whatsapp.getStatusLive();
+    res.json(s);
+  } catch (e) {
+    // fallback para o status estatico se a verificacao live falhar
+    res.json(whatsapp.getStatus());
+  }
 });
 
 app.get('/api/whatsapp/health', async (req, res) => {
@@ -1803,6 +2044,212 @@ app.get('/api/whatsapp/qr', (req, res) => {
   if (!qr) return res.json({ hasQR: false, message: 'Nenhum QR disponível. WhatsApp pode já estar conectado.' });
   res.json({ hasQR: true, qr });
 });
+
+/**
+ * POST /api/whatsapp/resync-chats
+ * Resgata mensagens que ficaram offline (celular tem mas Office nao tem).
+ * Itera todas as conversas ativas e busca as ultimas N msgs de cada via
+ * whatsapp-web.js. Dedupe por wa_msg_id (nao duplica).
+ *
+ * Body opcional: { limit_per_chat: 30, only_recent_hours: 48 }
+ * Resposta: stats { conversations_scanned, messages_fetched, messages_inserted, errors }
+ */
+app.post('/api/whatsapp/resync-chats', async (req, res) => {
+  try {
+    const result = await whatsapp.resyncChatHistory(req.body || {});
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/whatsapp/repair-attachments
+ * Repara msgs que vieram do resync sem anexo baixado (has_media:true mas
+ * attachment IS NULL). Itera ate 100 msgs e baixa cada attachment.
+ */
+app.post('/api/whatsapp/repair-attachments', async (_req, res) => {
+  try {
+    const result = await whatsapp.repairResyncAttachments();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
+
+/**
+ * GET /api/whatsapp/pairing-status — diagnostico do guard de pareamentos.
+ * Mostra quantos QRs foram gerados nas ultimas 24h e ultimos eventos do log.
+ */
+app.get('/api/whatsapp/pairing-status', async (req, res) => {
+  try {
+    const { rows: countRows } = await query(
+      `SELECT COUNT(*) AS attempts_24h FROM wa_pairing_log
+        WHERE event_type = 'pairing_attempt'
+          AND created_at > NOW() - INTERVAL '24 hours'`
+    );
+    const { rows: lastEvents } = await query(
+      `SELECT event_type, phone, metadata, created_at FROM wa_pairing_log
+        ORDER BY created_at DESC LIMIT 10`
+    );
+    const qrCount = parseInt(countRows[0]?.attempts_24h || 0, 10);
+    const limit = 5;
+    res.json({
+      window_hours: 24,
+      attempts_count: qrCount,
+      attempts_limit: limit,
+      remaining: Math.max(0, limit - qrCount),
+      blocked: qrCount >= limit,
+      bypass_enabled: process.env.WA_BYPASS_PAIRING_GUARD === 'true',
+      last_events: lastEvents,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/whatsapp/pairing-reset — limpa contador (apos coordenacao com user).
+ * Use APENAS quando voce confirma que NAO ha risco de ban (ex: pareou em outro
+ * numero e quer voltar pro original com contador limpo).
+ * Body: { confirm: 'I_UNDERSTAND_BAN_RISK' }
+ */
+app.post('/api/whatsapp/pairing-reset', async (req, res) => {
+  if (req.body?.confirm !== 'I_UNDERSTAND_BAN_RISK') {
+    return res.status(400).json({
+      error: 'Confirme com body: { confirm: "I_UNDERSTAND_BAN_RISK" }',
+      warning: 'Limpar contador NAO impede ban server-side se voce ja excedeu limite',
+    });
+  }
+  try {
+    await query(`DELETE FROM wa_pairing_log WHERE event_type = 'pairing_attempt' AND created_at > NOW() - INTERVAL '24 hours'`);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+/**
+ * GET /qr — pagina HTML standalone com o QR Code em tela cheia.
+ * Ignora bundle React/Service Worker/cache. Para emergencias de pareamento.
+ * Auto-refresh a cada 3s.
+ */
+app.get('/qr', (req, res) => {
+  const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<title>WhatsApp QR — Atrio Office</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f8faff;
+    color: #0f172a;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  h1 { font-size: 24px; font-weight: 800; margin-bottom: 8px; }
+  .sub { font-size: 14px; color: #475569; margin-bottom: 24px; text-align: center; max-width: 480px; }
+  .card {
+    background: white;
+    padding: 24px;
+    border-radius: 16px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+    border: 1px solid #e2e8f0;
+  }
+  #qr-img { width: 320px; height: 320px; display: block; }
+  .status {
+    margin-top: 20px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .status.waiting { background: #fffbeb; color: #d97706; border: 1px solid #fde68a; }
+  .status.ok { background: #ecfdf5; color: #059669; border: 1px solid #a7f3d0; }
+  .status.err { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+  .help {
+    margin-top: 24px;
+    font-size: 12px;
+    color: #64748b;
+    text-align: center;
+    line-height: 1.6;
+    max-width: 360px;
+  }
+  .help b { color: #0f172a; }
+  .pulse {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #f59e0b;
+    margin-right: 6px;
+    animation: pulse 1s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+</style>
+</head>
+<body>
+  <h1>WhatsApp Atrio Office</h1>
+  <p class="sub">Escaneie o QR Code abaixo com o WhatsApp do escritorio</p>
+  <div class="card">
+    <img id="qr-img" alt="QR Code" />
+  </div>
+  <div id="status" class="status waiting"><span class="pulse"></span><span id="status-text">Carregando QR...</span></div>
+  <div class="help">
+    No celular: <b>WhatsApp</b> &rarr; menu (3 pontos) &rarr; <b>Aparelhos conectados</b> &rarr; <b>Conectar aparelho</b><br><br>
+    Esta pagina recarrega o QR a cada 3 segundos automaticamente.
+  </div>
+<script>
+let connected = false;
+async function refresh() {
+  if (connected) return;
+  try {
+    const s = await fetch('/api/whatsapp/status', { cache: 'no-store' }).then(r => r.json());
+    if (s.connected) {
+      connected = true;
+      document.getElementById('qr-img').style.display = 'none';
+      const st = document.getElementById('status');
+      st.className = 'status ok';
+      document.getElementById('status-text').textContent = '✓ Conectado: +' + s.phone;
+      return;
+    }
+    if (s.hasQR) {
+      const q = await fetch('/api/whatsapp/qr', { cache: 'no-store' }).then(r => r.json());
+      if (q.hasQR) {
+        document.getElementById('qr-img').src = q.qr;
+        document.getElementById('status-text').textContent = 'Aguardando voce escanear...';
+      }
+    } else {
+      document.getElementById('status-text').textContent = 'Inicializando WhatsApp...';
+    }
+  } catch (e) {
+    const st = document.getElementById('status');
+    st.className = 'status err';
+    document.getElementById('status-text').textContent = 'Erro: ' + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>`;
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(html);
+});
+// qr-fullscreen marker
+
 
 // Gerar relatório executivo sob demanda
 app.post('/api/daily-report', async (req, res) => {
@@ -1823,10 +2270,11 @@ app.get('/api/whatsapp/pending', (req, res) => {
 });
 
 app.post('/api/whatsapp/send', async (req, res) => {
-  const { phone, message } = req.body;
+  const { phone, message, from_name } = req.body;
   try {
-    // manual=true bypassa o kill-switch agente→cliente (este endpoint e disparado por humano via painel).
-    await whatsapp.sendMessage(phone, message, { manual: true });
+    // manual=true bypassa o kill-switch agente→cliente (humano via painel).
+    // from_name: nome do colaborador logado no Gesthub (vai gravado em metadata).
+    await whatsapp.sendMessage(phone, message, { manual: true, fromName: from_name || null });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1841,16 +2289,206 @@ app.get('/api/whatsapp/conversations', async (req, res) => {
       const { rows } = await query(`
         SELECT c.*,
           (SELECT COUNT(*) FROM whatsapp_messages WHERE conversation_id = c.id) as message_count,
-          (SELECT body FROM whatsapp_messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message
+          (SELECT body FROM whatsapp_messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message,
+          (SELECT sender FROM whatsapp_messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message_sender,
+          (SELECT MAX(created_at) FROM whatsapp_messages WHERE conversation_id = c.id AND sender = 'client') as last_client_at,
+          link.gesthub_client_id as linked_client_id,
+          link.relacao as linked_relacao,
+          link.contato_funcao as linked_contato_funcao,
+          (
+            SELECT m.created_at
+              FROM whatsapp_messages m
+             WHERE m.conversation_id = c.id AND m.sender = 'client'
+               AND NOT EXISTS (
+                 SELECT 1 FROM whatsapp_messages m2
+                  WHERE m2.conversation_id = c.id
+                    AND m2.sender IN ('team','luna','bot')
+                    AND m2.created_at > m.created_at
+               )
+             ORDER BY m.created_at DESC LIMIT 1
+          ) as waiting_since
         FROM whatsapp_conversations c
-        ORDER BY started_at DESC LIMIT 50
+        LEFT JOIN LATERAL (
+          SELECT gesthub_client_id, relacao, contato_funcao
+            FROM whatsapp_conversation_clients wcc
+           WHERE wcc.conversation_id = c.id
+           ORDER BY wcc.is_primary DESC, wcc.created_at ASC
+           LIMIT 1
+        ) link ON true
+        ORDER BY COALESCE(c.last_message_at, c.started_at) DESC
+        LIMIT 200
       `);
-      return res.json(rows);
+
+      // Resolve nome do cliente vinculado (Gesthub) em batch
+      const linkedIds = [...new Set(rows.map(r => r.linked_client_id).filter(Boolean).map(Number))];
+      let clientsMap = {};
+      if (linkedIds.length) {
+        try {
+          const { getClients } = await import('./services/gesthub.js');
+          const all = await getClients();
+          clientsMap = Object.fromEntries(
+            (all || [])
+              .filter(c => linkedIds.includes(Number(c.id)))
+              .map(c => [Number(c.id), c])
+          );
+        } catch (e) { /* sem nome — front exibe id */ }
+      }
+      const enriched = rows.map(r => {
+        if (!r.linked_client_id) return r;
+        const client = clientsMap[Number(r.linked_client_id)];
+        return {
+          ...r,
+          linked_client_name: client?.legalName || client?.tradeName || null,
+        };
+      });
+      return res.json(enriched);
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
   }
   res.json(whatsapp.getPendingMessages());
+});
+
+
+
+/**
+ * POST /api/admin/recover-attachments/:conversation_id
+ * Tenta re-baixar anexos perdidos via WhatsApp Web (re-fetch). So funciona pra
+ * msgs ainda no cache do whatsapp-web.js (algumas semanas).
+ *
+ * Retorna: { tried, recovered, failed, errors[] }
+ */
+app.post('/api/admin/recover-attachments/:conversation_id', async (req, res) => {
+  try {
+    const { conversation_id } = req.params;
+    const fs = await import('fs');
+
+    const { rows } = await query(`
+      SELECT id, metadata
+        FROM whatsapp_messages
+       WHERE conversation_id = $1
+         AND metadata->'attachment'->>'storage_path' IS NOT NULL
+    `, [conversation_id]);
+
+    const targets = [];
+    for (const r of rows) {
+      const meta = typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata;
+      const storage = meta?.attachment?.storage_path;
+      const waId = meta?.wa_msg_id;
+      if (!storage || !waId) continue;
+      if (fs.existsSync(storage)) continue;
+      targets.push({ message_id: r.id, wa_msg_id: waId, storage_path: storage });
+    }
+
+    if (targets.length === 0) {
+      return res.json({ ok: true, tried: 0, recovered: 0, failed: 0, message: 'nada perdido nesta conversa' });
+    }
+
+    const wa = await import('./services/whatsapp.js');
+    let recovered = 0;
+    let failed = 0;
+    const errors = [];
+
+    for (const t of targets) {
+      try {
+        const r = await wa.recoverAttachmentByWaId(t.wa_msg_id, t.storage_path);
+        if (r.ok) recovered++;
+        else { failed++; errors.push({ wa_msg_id: t.wa_msg_id.slice(0, 40), error: r.error }); }
+      } catch (e) {
+        failed++;
+        errors.push({ wa_msg_id: t.wa_msg_id.slice(0, 40), error: e.message });
+      }
+      await new Promise(r => setTimeout(r, 250));
+    }
+
+    res.json({ ok: true, tried: targets.length, recovered, failed, errors: errors.slice(0, 10) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/whatsapp/conversations/:id/snooze
+ * Body: { until: ISO datetime } OU { preset: '1h'|'4h'|'tomorrow'|'friday'|'7d' }
+ *       optional: { reason: string }
+ */
+app.post('/api/whatsapp/conversations/:id/snooze', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { until, preset, reason } = req.body || {};
+    let target;
+    if (preset) {
+      const now = new Date();
+      switch (String(preset).toLowerCase()) {
+        case '1h':       target = new Date(now.getTime() + 60 * 60 * 1000); break;
+        case '4h':       target = new Date(now.getTime() + 4 * 60 * 60 * 1000); break;
+        case 'tomorrow': {
+          // amanha as 9h (horario de Recife)
+          const t = new Date(now);
+          t.setDate(t.getDate() + 1);
+          t.setHours(12, 0, 0, 0); // 12 UTC = 9h BRT
+          target = t;
+          break;
+        }
+        case 'friday': {
+          // proxima sexta as 9h BRT
+          const t = new Date(now);
+          const day = t.getDay(); // 0=dom, 5=sex
+          const daysUntilFriday = (5 - day + 7) % 7 || 7;
+          t.setDate(t.getDate() + daysUntilFriday);
+          t.setHours(12, 0, 0, 0);
+          target = t;
+          break;
+        }
+        case '7d':       target = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); break;
+        default: return res.status(400).json({ error: 'preset invalido (use 1h|4h|tomorrow|friday|7d)' });
+      }
+    } else if (until) {
+      target = new Date(until);
+      if (isNaN(target.getTime())) return res.status(400).json({ error: 'until invalido (ISO datetime)' });
+    } else {
+      return res.status(400).json({ error: 'fornecer preset ou until' });
+    }
+    if (target <= new Date()) {
+      return res.status(400).json({ error: 'data deve ser futura' });
+    }
+
+    const { rows } = await query(
+      `UPDATE whatsapp_conversations
+          SET snoozed_until = $2, snoozed_at = NOW(), snoozed_reason = $3
+        WHERE id = $1
+        RETURNING id, snoozed_until, snoozed_at, snoozed_reason`,
+      [id, target.toISOString(), (reason || '').slice(0, 120) || null]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
+
+    broadcast({ type: 'conversation_snoozed', conversation_id: id, snoozed_until: target.toISOString() });
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/whatsapp/conversations/:id/unsnooze
+ * Cancela snooze ativo (volta a conversa pra fila normal).
+ */
+app.post('/api/whatsapp/conversations/:id/unsnooze', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await query(
+      `UPDATE whatsapp_conversations
+          SET snoozed_until = NULL, snoozed_at = NULL, snoozed_reason = NULL
+        WHERE id = $1
+        RETURNING id`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
+    broadcast({ type: 'conversation_unsnoozed', conversation_id: id });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Histórico de mensagens de uma conversa específica
@@ -1943,7 +2581,7 @@ app.get('/api/atendimento/conversation/:id/client-context', async (req, res) => 
 
     // 2) Busca TODOS os clientes vinculados (N:M via whatsapp_conversation_clients)
     const { rows: links } = await query(
-      `SELECT gesthub_client_id, is_primary FROM whatsapp_conversation_clients WHERE conversation_id = $1 ORDER BY is_primary DESC, created_at ASC`,
+      `SELECT gesthub_client_id, is_primary, relacao, contato_funcao FROM whatsapp_conversation_clients WHERE conversation_id = $1 ORDER BY is_primary DESC, created_at ASC`,
       [id]
     );
 
@@ -1963,7 +2601,31 @@ app.get('/api/atendimento/conversation/:id/client-context', async (req, res) => 
       return res.json({ linked: false, conversation: conv, warning: 'client_ids invalidos', clients: [] });
     }
 
+    // Anexa info do vinculo (relacao + contato_funcao) em cada cliente
+    const linkInfoById = {};
+    for (const l of links) {
+      linkInfoById[Number(l.gesthub_client_id)] = {
+        relacao: l.relacao || null,
+        contato_funcao: l.contato_funcao || null,
+        is_primary: !!l.is_primary,
+      };
+    }
+    for (const c of linkedClients) {
+      const info = linkInfoById[Number(c.id)];
+      if (info) {
+        c.relacao = info.relacao;
+        c.contato_funcao = info.contato_funcao;
+        c.is_primary = info.is_primary;
+      }
+    }
     const primary = linkedClients[0]; // primeiro = primary
+    // Vinculo principal (pode ser satelite)
+    const primaryLink = links[0] ? {
+      client_id: Number(links[0].gesthub_client_id),
+      is_primary: !!links[0].is_primary,
+      relacao: links[0].relacao || null,
+      contato_funcao: links[0].contato_funcao || null,
+    } : null;
 
     // 3) Badges + legalizacoes + onboardings somente do primary (compat retro)
     let badges = null;
@@ -1980,17 +2642,107 @@ app.get('/api/atendimento/conversation/:id/client-context', async (req, res) => 
     const legalizacoes = (bs?.legalizations || []).filter(l => docs.includes(String(l.document || '').replace(/\D/g, '')));
     const onboardings = (bs?.onboardings || []).filter(o => linkedIds.includes(Number(o.clienteId)));
 
+    // 4) Observacoes/notas importantes do primary (Gesthub /clients/:id/360)
+    let observacoes = [];
+    try {
+      const GESTHUB_URL = process.env.GESTHUB_URL || 'http://gesthub-app:8000';
+      const r360 = await fetch(`${GESTHUB_URL}/api/clients/${primary.id}/360`);
+      if (r360.ok) {
+        const d = await r360.json();
+        // Filtra apenas obs com texto util e ordena por data desc
+        observacoes = (d?.data?.observacoes || [])
+          .filter(o => o && (o.descricao || o.texto) && String(o.descricao || o.texto).trim().length >= 8)
+          .slice(0, 8); // top 8 mais recentes
+      }
+    } catch (e) {
+      console.warn('[client-context] obs Gesthub falhou:', e.message);
+    }
+
     res.json({
       linked: true,
       conversation: conv,
       client: primary,           // compat retro: primeiro cliente como client
-      clients: linkedClients,    // NOVO: array de todos os vinculados
+      clients: linkedClients,    // NOVO: array de todos os vinculados (com relacao/contato_funcao)
+      primaryLink,               // NOVO: vinculo principal (pode ser satelite)
       badges,
       legalizacoes,
       onboardings,
+      observacoes,               // NOVO: notas/observacoes do Gesthub 360
     });
   } catch (err) {
     console.error('[client-context] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+/**
+ * POST /api/atendimento/conversation/:id/add-observation
+ * Cria uma observacao no Gesthub para o cliente vinculado a esta conversa.
+ * Body: { descricao, tipo?, autor? }
+ *  - descricao: obrigatorio
+ *  - tipo: 'nota' | 'alerta' (default: 'nota')
+ *  - autor: nome de quem registrou (default: 'Atendimento WhatsApp')
+ *
+ * Funciona tanto pra vinculo direto (cliente Atrio) quanto satelite (tomador, socio, etc).
+ * Em vinculo satelite, a observacao vai pro cliente Atrio relacionado, com prefixo no autor.
+ */
+app.post('/api/atendimento/conversation/:id/add-observation', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { descricao, tipo, autor } = req.body || {};
+    if (!descricao || !String(descricao).trim()) {
+      return res.status(400).json({ error: 'descricao obrigatoria' });
+    }
+    // Busca cliente vinculado (prioriza primary, senao primeiro da junction)
+    const { rows: links } = await query(
+      `SELECT gesthub_client_id, is_primary, relacao, contato_funcao
+         FROM whatsapp_conversation_clients
+        WHERE conversation_id = $1
+        ORDER BY is_primary DESC, created_at ASC
+        LIMIT 1`,
+      [id]
+    );
+    let clientId = links[0]?.gesthub_client_id;
+    let satelite = null;
+    if (links[0]?.relacao) {
+      satelite = { relacao: links[0].relacao, contato_funcao: links[0].contato_funcao };
+    }
+    // Fallback retro: gesthub_client_id direto na conversa
+    if (!clientId) {
+      const { rows: convRows } = await query(
+        `SELECT gesthub_client_id FROM whatsapp_conversations WHERE id = $1`, [id]
+      );
+      clientId = convRows[0]?.gesthub_client_id;
+    }
+    if (!clientId) {
+      return res.status(400).json({ error: 'conversa nao tem cliente vinculado — vincule antes de registrar observacao' });
+    }
+    // Monta autor: se satelite, anota a relacao no autor (auditoria)
+    let finalAutor = (autor || '').trim() || 'Atendimento WhatsApp';
+    if (satelite) {
+      finalAutor = finalAutor + ` (via conversa com ${satelite.relacao}${satelite.contato_funcao ? ': ' + satelite.contato_funcao : ''})`;
+    }
+    const GH = process.env.GESTHUB_API_URL || process.env.GESTHUB_URL || 'http://31.97.175.200';
+    const r = await fetch(`${GH}/api/clients/${clientId}/observacoes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        descricao: String(descricao).trim(),
+        tipo: tipo || 'nota',
+        autor: finalAutor,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      return res.status(r.status).json({
+        error: data?.detail || data?.error || `Gesthub HTTP ${r.status}`,
+      });
+    }
+    // Invalida cache pro proximo client-context puxar a nova obs
+    try { (await import('./services/gesthub.js')).invalidateCache?.(); } catch {}
+    res.json({ ok: true, data: data?.data, client_id: clientId, satelite });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -2096,7 +2848,16 @@ app.get('/api/atendimento/clientes/search', async (req, res) => {
 app.post('/api/atendimento/conversation/:id/link-client', async (req, res) => {
   try {
     const { id } = req.params;
-    const { client_id, update_phone = true, contato_nome, contato_funcao, set_primary = true } = req.body || {};
+    const {
+      client_id, update_phone = true, contato_nome, contato_funcao,
+      set_primary = true,
+      relacao, // tomador|socio|contador|financeiro|outro — define vinculo satelite
+    } = req.body || {};
+    // Se ha relacao, eh vinculo satelite (contato representa um terceiro do cliente):
+    //   - nao vira is_primary
+    //   - nao atualiza gesthub_client_id da conversa
+    const isSatelite = !!relacao;
+    const effectivePrimary = isSatelite ? false : set_primary;
     if (!client_id) return res.status(400).json({ error: 'client_id obrigatorio' });
 
     // Verifica conv existe
@@ -2106,16 +2867,21 @@ app.post('/api/atendimento/conversation/:id/link-client', async (req, res) => {
     );
     if (!convRows.length) return res.status(404).json({ error: 'conversa nao encontrada' });
 
-    // Insere no junction (idempotente)
+    // Insere no junction (idempotente). Em conflito, atualiza relacao/contato_funcao
+    // (permite mudar o tipo de vinculo sem precisar deletar antes).
     await query(
-      `INSERT INTO whatsapp_conversation_clients (conversation_id, gesthub_client_id, is_primary)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (conversation_id, gesthub_client_id) DO NOTHING`,
-      [id, Number(client_id), !!set_primary]
+      `INSERT INTO whatsapp_conversation_clients
+         (conversation_id, gesthub_client_id, is_primary, relacao, contato_funcao)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (conversation_id, gesthub_client_id) DO UPDATE
+         SET is_primary = EXCLUDED.is_primary,
+             relacao = COALESCE(EXCLUDED.relacao, whatsapp_conversation_clients.relacao),
+             contato_funcao = COALESCE(EXCLUDED.contato_funcao, whatsapp_conversation_clients.contato_funcao)`,
+      [id, Number(client_id), !!effectivePrimary, relacao || null, contato_funcao || null]
     );
 
-    // Se eh primary, ajusta o flag e atualiza gesthub_client_id (compat retro)
-    if (set_primary) {
+    // Se eh primary (e nao satelite), ajusta flag e atualiza gesthub_client_id (compat retro)
+    if (effectivePrimary) {
       await query(
         `UPDATE whatsapp_conversation_clients SET is_primary = (gesthub_client_id = $2) WHERE conversation_id = $1`,
         [id, Number(client_id)]
@@ -2135,10 +2901,18 @@ app.post('/api/atendimento/conversation/:id/link-client', async (req, res) => {
     // Invalida cache do bootstrap pra proximo lookup puxar dados atualizados
     try { (await import('./services/gesthub.js')).invalidateCache(); } catch {}
 
-    // Adiciona o telefone como contato do cliente no Gesthub (se ainda nao existir)
+    // Adiciona o telefone como contato do cliente no Gesthub (se ainda nao existir).
+    // EXCETO em vinculo satelite — telefone do tomador/financeiro NAO deve virar
+    // contato direto do nosso cliente na Carteira (eh um terceiro relacionado).
     let contatoCriado = null
     let contatoSkipReason = null
-    if (update_phone !== false) {
+    // Relacoes "internas" (sao contatos diretos do cliente): socio, financeiro.
+    // "Externas" (terceiros, NAO cadastrar como contato): tomador, contador, outro.
+    const relacoesInternas = ['socio', 'financeiro']
+    const isExternal = isSatelite && !relacoesInternas.includes(relacao)
+    if (isExternal) {
+      contatoSkipReason = 'vinculo externo (' + relacao + ') — terceiro relacionado, nao vira contato direto do cliente'
+    } else if (update_phone !== false) {
       const phoneClean = String(conv.real_phone || conv.phone || '').replace(/\D/g, '')
       if (phoneClean.length >= 10) {
         try {
@@ -2161,7 +2935,8 @@ app.post('/api/atendimento/conversation/:id/link-client', async (req, res) => {
             contatoSkipReason = `Ja existe contato com este telefone (id=${dup.id}, ${dup.nome})`
           } else {
             const nome = contato_nome || conv.client_name || `Contato WhatsApp`
-            const funcao = contato_funcao || 'WHATSAPP'
+            const isGroupConv = !!conv.is_group || String(conv.chat_id || '').endsWith('@g.us')
+            const funcao = contato_funcao || (relacao ? relacao.toUpperCase() : (isGroupConv ? 'GRUPO_WHATSAPP' : 'WHATSAPP'))
             const r = await fetch(`${GH}/api/clients/${client_id}/contatos`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -2330,6 +3105,167 @@ app.post('/api/atendimento/conversation/:id/unlink-client', async (req, res) => 
     res.status(500).json({ error: err.message });
   }
 });
+
+/**
+ * POST /api/atendimento/unlink-by-phone
+ * Chamado pelo Gesthub quando um contato eh DELETADO da Carteira do cliente.
+ * Body: { phone, client_id }
+ *   - phone: telefone do contato deletado (so digitos)
+ *   - client_id: id do cliente do Gesthub
+ * Acha a conversation com esse telefone e remove o vinculo com client_id.
+ */
+/**
+ * POST /api/atendimento/clients/:clientId/contatos-from-vcard
+ * Adiciona um contato no Gesthub a partir de um vCard recebido no chat.
+ * Body: { nome, telefone }
+ * Faz proxy pro endpoint do Gesthub (/api/clients/:id/contatos).
+ */
+app.post('/api/atendimento/clients/:clientId/contatos-from-vcard', async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    const { nome, telefone } = req.body || {};
+    if (!nome || !telefone) {
+      return res.status(400).json({ error: 'nome e telefone obrigatorios' });
+    }
+    const phoneClean = String(telefone).replace(/\D/g, '');
+    if (phoneClean.length < 10) {
+      return res.status(400).json({ error: 'telefone invalido' });
+    }
+    const GH = process.env.GESTHUB_API_URL || 'http://31.97.175.200';
+
+    // Verifica duplicata (mesmo numero ja cadastrado)
+    try {
+      const existing = await fetch(`${GH}/api/clients/${clientId}/contatos`).then(r => r.json()).catch(() => ({}));
+      const list = existing?.data || [];
+      const norm = (x) => String(x || '').replace(/\D/g, '').slice(-9);
+      const dup = list.find(c => norm(c.telefone) === norm(phoneClean));
+      if (dup) {
+        return res.json({ ok: true, data: dup, duplicate: true });
+      }
+    } catch {}
+
+    const r = await fetch(`${GH}/api/clients/${clientId}/contatos`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nome, telefone: phoneClean, funcao: 'WHATSAPP', email: '', cpf: '' }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j?.data) {
+      return res.status(r.status || 500).json({ error: j?.error || j?.detail || `HTTP ${r.status}` });
+    }
+    res.json({ ok: true, data: j.data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/whatsapp/group/:chatId/participants
+ * Lista participantes de um grupo WhatsApp (so existe se chatId termina em @g.us).
+ * Resp: { ok, total, participants: [{id, phone, name, isAdmin}] }
+ */
+app.get('/api/whatsapp/group/:chatId/participants', async (req, res) => {
+  try {
+    let chatId = req.params.chatId;
+    // Aceita chatId completo (xxxxx@g.us) ou so o numero (xxxxx)
+    if (!chatId.includes('@')) chatId = `${chatId}@g.us`;
+    if (!chatId.endsWith('@g.us')) {
+      return res.status(400).json({ error: 'chatId nao e de grupo' });
+    }
+    const wapp = whatsapp.getClient?.();
+    if (!wapp) return res.status(503).json({ error: 'WhatsApp nao conectado' });
+
+    const chat = await wapp.getChatById(chatId);
+    if (!chat || !chat.isGroup) {
+      return res.status(404).json({ error: 'Grupo nao encontrado' });
+    }
+    const participants = chat.participants || [];
+    const out = [];
+    for (const p of participants) {
+      const phoneId = p.id?._serialized || p.id || '';
+      const phone = String(phoneId).split('@')[0].replace(/\D/g, '');
+      // Tenta resolver nome via contact (se possivel)
+      let name = null;
+      try {
+        const contact = await wapp.getContactById(phoneId);
+        name = contact?.pushname || contact?.name || contact?.shortName || null;
+      } catch {}
+      out.push({
+        id: phoneId,
+        phone,
+        name: name || phone,
+        isAdmin: !!p.isAdmin,
+        isSuperAdmin: !!p.isSuperAdmin,
+      });
+    }
+    res.json({ ok: true, total: out.length, group_name: chat.name, participants: out });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/atendimento/unlink-by-phone', async (req, res) => {
+  try {
+    const { phone, client_id } = req.body || {};
+    if (!phone || !client_id) {
+      return res.status(400).json({ error: 'phone e client_id obrigatorios' });
+    }
+    const phoneClean = String(phone).replace(/\D/g, '');
+    if (phoneClean.length < 10) {
+      return res.status(400).json({ error: 'phone invalido (<10 digitos)' });
+    }
+
+    // Acha conversation por phone OR real_phone OR chat_id contendo o numero
+    const { rows: convs } = await query(
+      `SELECT id FROM whatsapp_conversations
+        WHERE phone = $1 OR real_phone = $1 OR chat_id LIKE $2`,
+      [phoneClean, `%${phoneClean}%`]
+    );
+
+    let removidos = 0;
+    for (const c of convs) {
+      const r = await query(
+        `DELETE FROM whatsapp_conversation_clients
+          WHERE conversation_id = $1 AND gesthub_client_id = $2`,
+        [c.id, Number(client_id)]
+      );
+      removidos += r.rowCount || 0;
+
+      // Se removeu o primary, eleger outro
+      const { rows: rest } = await query(
+        `SELECT gesthub_client_id FROM whatsapp_conversation_clients
+          WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 1`,
+        [c.id]
+      );
+      if (rest.length) {
+        await query(
+          `UPDATE whatsapp_conversation_clients SET is_primary = TRUE
+            WHERE conversation_id = $1 AND gesthub_client_id = $2`,
+          [c.id, rest[0].gesthub_client_id]
+        );
+        await query(
+          `UPDATE whatsapp_conversations SET gesthub_client_id = $1 WHERE id = $2`,
+          [rest[0].gesthub_client_id, c.id]
+        );
+      } else {
+        await query(
+          `UPDATE whatsapp_conversations SET gesthub_client_id = NULL WHERE id = $1 AND gesthub_client_id = $2`,
+          [c.id, Number(client_id)]
+        );
+      }
+
+      broadcast({ type: 'conversation_unlinked', conversation_id: c.id });
+    }
+
+    // Invalida cache do bootstrap
+    try { (await import('./services/gesthub.js')).invalidateCache(); } catch {}
+
+    res.json({ ok: true, conversations_affected: convs.length, links_removed: removidos });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ============================================
 // Copilot IA — assistente interno dos operadores durante atendimento WhatsApp
@@ -2578,6 +3514,30 @@ Se NENHUM compromisso detectado, responda: {"commitments":[]}`;
 });
 
 // ============================================
+// ADMIN: Backfill de historico WhatsApp
+// Recupera msgs antigas via chat.fetchMessages e insere as faltantes.
+// ============================================
+app.post('/api/admin/whatsapp/backfill', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.body?.limit ?? req.query?.limit ?? 200, 10) || 200, 1000);
+    const dryRun = String(req.body?.dryRun ?? req.query?.dryRun ?? '').toLowerCase() === 'true';
+    const onlyConversationId = req.body?.conversation_id || req.query?.conversation_id || null;
+    const maxConversations = parseInt(req.body?.max_conversations ?? req.query?.max_conversations ?? 0, 10) || null;
+    const whatsappSvc = await import('./services/whatsapp.js');
+    if (typeof whatsappSvc.backfillHistory !== 'function') {
+      return res.status(500).json({ error: 'backfillHistory nao exportado' });
+    }
+    const t0 = Date.now();
+    const stats = await whatsappSvc.backfillHistory({ limit, dryRun, onlyConversationId, maxConversations });
+    stats.elapsed_ms = Date.now() - t0;
+    res.json({ ok: true, stats });
+  } catch (err) {
+    console.error('[backfill] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // Download de anexo de mensagem WhatsApp
 // ============================================
 /**
@@ -2623,6 +3583,150 @@ app.get('/api/whatsapp/messages/:id/attachment', async (req, res) => {
     console.error('[attachment] erro:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ============================================
+// Extratos: status por cliente (proxy Finance) + enviar anexo de mensagem pra fila pending
+// ============================================
+const FINANCE_URL_DEFAULT = process.env.ATRIO_FINANCE_URL || process.env.FINANCE_URL || 'http://atrio-banking-system-1:3000';
+
+// Pattern de filename de extrato bancário — usado pra decidir se mostra botão "Enviar pro Finance"
+// Sem \b no fim porque _ é word-char e quebrava NU_\d+_.
+const EXTRATO_FILENAME_RE = /^NU_\d+_|^extrato|^statement|^conta_corrente|nubank|inter|bradesco|itau|santander|caixa|sicoob|sicredi|btg|safra|c6 ?bank/i;
+
+/**
+ * GET /api/atendimento/extratos-status/:cliente_id?ano=2026
+ * Proxy fino pro Finance /api/controle?cliente_id=X&ano=Y. Retorna grid de meses.
+ */
+app.get('/api/atendimento/extratos-status/:cliente_id', async (req, res) => {
+  try {
+    const cid = parseInt(req.params.cliente_id, 10);
+    if (!cid) return res.status(400).json({ error: 'cliente_id inválido' });
+    const ano = parseInt(req.query.ano, 10) || new Date().getFullYear();
+    const url = `${FINANCE_URL_DEFAULT}/api/controle?ano=${ano}&cliente_id=${cid}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      return res.status(r.status).json({ error: `Finance retornou ${r.status}`, body: txt.slice(0, 200) });
+    }
+    const data = await r.json();
+    const grid = (data?.data || []).find(g => g.clienteGesthubId === cid) || { clienteGesthubId: cid, totalContas: 0, meses: {} };
+    res.json({ ok: true, ano, data: grid });
+  } catch (err) {
+    console.error('[extratos-status] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/atendimento/messages/:msg_id/enviar-extrato-pending
+ * Pega o anexo da mensagem WhatsApp e envia pra fila /api/extratos-pending do Finance.
+ * Body: { cliente_id_sugerido?, cliente_nome_sugerido? } — opcionais
+ */
+app.post('/api/atendimento/messages/:msg_id/enviar-extrato-pending', async (req, res) => {
+  try {
+    const { msg_id } = req.params;
+    const { rows } = await query(
+      `SELECT m.id, m.body, m.metadata, m.conversation_id,
+              c.gesthub_client_id, c.phone, c.client_name
+         FROM whatsapp_messages m
+         LEFT JOIN whatsapp_conversations c ON c.id = m.conversation_id
+        WHERE m.id = $1`,
+      [msg_id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'mensagem nao encontrada' });
+    const r0 = rows[0];
+    const meta = typeof r0.metadata === 'string'
+      ? (() => { try { return JSON.parse(r0.metadata) } catch { return {} } })()
+      : (r0.metadata || {});
+    const att = meta.attachment;
+    if (!att?.storage_path) return res.status(400).json({ error: 'mensagem sem anexo' });
+    if (att.expired) return res.status(410).json({ error: 'anexo expirado/removido do storage' });
+
+    // Le arquivo do disco
+    const fs = await import('fs');
+    const path = await import('path');
+    const allowedBase = process.env.WHATSAPP_ATTACH_DIR || '/app/storage/whatsapp-attachments';
+    const resolvedPath = path.resolve(att.storage_path);
+    if (!resolvedPath.startsWith(path.resolve(allowedBase))) {
+      return res.status(403).json({ error: 'path fora do diretorio permitido' });
+    }
+    if (!fs.existsSync(resolvedPath)) return res.status(404).json({ error: 'arquivo nao encontrado no storage' });
+    const buf = fs.readFileSync(resolvedPath);
+
+    // Detecta banco pelo filename
+    const filename = att.filename || 'extrato.pdf';
+    let banco = '', bancoCod = '', conta = '';
+    const fname = filename.toLowerCase();
+    if (/^nu_(\d+)_/i.test(fname)) {
+      banco = 'NUBANK'; bancoCod = '260';
+      const m = filename.match(/^NU_(\d+)_/i);
+      if (m) conta = m[1];
+    } else if (fname.includes('inter')) { banco = 'INTER'; bancoCod = '077'; }
+    else if (fname.includes('bradesco')) { banco = 'BRADESCO'; bancoCod = '237'; }
+    else if (fname.includes('itau')) { banco = 'ITAU'; bancoCod = '341'; }
+    else if (fname.includes('santander')) { banco = 'SANTANDER'; bancoCod = '033'; }
+    else if (fname.includes('caixa')) { banco = 'CAIXA'; bancoCod = '104'; }
+
+    // Cliente sugerido: do body > gesthub_client_id da conversa
+    const clienteIdSugerido = req.body?.cliente_id_sugerido || r0.gesthub_client_id || null;
+    const clienteNomeSugerido = req.body?.cliente_nome_sugerido || r0.client_name || null;
+
+    // Monta multipart
+    const form = new FormData();
+    form.append('file', new Blob([buf], { type: att.mime_type || 'application/pdf' }), filename);
+    if (banco) form.append('banco_detectado', banco);
+    if (bancoCod) form.append('banco_codigo_detectado', bancoCod);
+    if (conta) form.append('conta_detectada', conta);
+    if (clienteIdSugerido) form.append('cliente_gesthub_id_sugerido', String(clienteIdSugerido));
+    if (clienteNomeSugerido) form.append('cliente_nome_sugerido', clienteNomeSugerido);
+    form.append('recebido_via', 'whatsapp_manual');
+    if (r0.phone) form.append('recebido_phone', String(r0.phone));
+    if (r0.client_name) form.append('recebido_nome', String(r0.client_name));
+    form.append('observacoes', `Enviado manualmente do Atendimento (msg_id=${msg_id}, conv_id=${r0.conversation_id})`);
+
+    const finResp = await fetch(`${FINANCE_URL_DEFAULT}/api/extratos-pending`, { method: 'POST', body: form });
+    if (!finResp.ok) {
+      const txt = await finResp.text().catch(() => '');
+      return res.status(502).json({ error: `Finance retornou ${finResp.status}`, body: txt.slice(0, 300) });
+    }
+    const data = await finResp.json();
+    const pendingId = data.data?.id || null;
+
+    // Persiste no metadata da mensagem pra outras abas que recarregarem ver o estado
+    if (pendingId) {
+      try {
+        await query(
+          `UPDATE whatsapp_messages
+              SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('finance_pending_id', $2::int, 'finance_sent_at', NOW())
+            WHERE id = $1`,
+          [msg_id, pendingId]
+        );
+      } catch (e) { console.error('[finance persist] erro:', e.message); }
+    }
+
+    // Broadcast WS pra todas as abas atualizarem em tempo real
+    try {
+      broadcast({
+        type: 'extrato_sent_to_finance',
+        msg_id,
+        pending_id: pendingId,
+        conversation_id: r0.conversation_id,
+      });
+    } catch {}
+    res.json({ ok: true, pending: data.data });
+  } catch (err) {
+    console.error('[enviar-extrato-pending] erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/atendimento/extrato-filename-pattern
+ * Frontend usa isso pra saber se deve mostrar botão "Enviar pro Finance" num anexo.
+ */
+app.get('/api/atendimento/extrato-filename-pattern', (_req, res) => {
+  res.json({ ok: true, pattern: EXTRATO_FILENAME_RE.source, flags: EXTRATO_FILENAME_RE.flags });
 });
 
 // ============================================
@@ -3076,18 +4180,90 @@ app.post('/api/memory/teach', async (req, res) => {
   try {
     const { agent_id, category = 'general', title, content, summary, tags = [] } = req.body;
     if (!content || !title) return res.status(400).json({ error: 'title e content obrigatorios' });
-    
+
+    // Governanca em 3 niveis (frente 5 mai/2026):
+    //   quarantine (injection) -> status=rejected, tag 'quarantine', confianca 0
+    //   review (fato sensivel) -> status=pending_review, tag 'needs_review', confianca 0.5
+    //   approve (trivia)       -> status=approved, confianca 1.0
+    const { classifyMemory, tagsWithLevel } = await import('./services/memory-classifier.js');
+    const decision = classifyMemory(title, content);
+    const finalTags = tagsWithLevel(tags, decision.level);
+    const confidence = decision.level === 'quarantine' ? 0.0
+                     : decision.level === 'review'    ? 0.5
+                     : 1.0;
+
     const result = await query(
       `INSERT INTO memories (agent_id, scope_type, category, title, content, summary, source_type, status, tags, confidence_score)
-       VALUES ($1, CASE WHEN $1 IS NULL THEN 'team' ELSE 'agent' END, $2::memory_category, $3, $4, $5, 'manual', 'approved', $6, 1.0) RETURNING *`,
-      [agent_id || null, category, title, content, summary || '', tags]
+       VALUES ($1, (CASE WHEN $1::uuid IS NULL THEN 'team' ELSE 'agent' END)::memory_scope, $2::memory_category, $3, $4, $5, 'manual', $7::memory_status, $6, $8) RETURNING *`,
+      [agent_id || null, category, title, content, summary || '', finalTags, decision.status, confidence]
     );
-    
-    res.status(201).json({ memory: result.rows[0] });
+
+    res.status(201).json({
+      memory: result.rows[0],
+      governance: {
+        level: decision.level,
+        status: decision.status,
+        reasons: decision.reasons,
+      },
+    });
   } catch (error) {
     console.error('[Memory] Erro ao ensinar:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// GET /api/memory/governance - Lista pendentes de revisao + quarentena pra triagem humana
+app.get('/api/memory/governance', async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT id, title, content, summary, status, tags, confidence_score, created_at, agent_id, scope_type
+      FROM memories
+      WHERE status IN ('pending_review','rejected')
+        AND (tags && ARRAY['needs_review','quarantine'])
+      ORDER BY
+        CASE WHEN 'quarantine' = ANY(tags) THEN 0 ELSE 1 END,
+        created_at DESC
+      LIMIT 200
+    `);
+    const stats = {
+      pending_review: rows.filter(r => r.tags?.includes('needs_review')).length,
+      quarantine: rows.filter(r => r.tags?.includes('quarantine')).length,
+      total: rows.length,
+    };
+    res.json({ ok: true, stats, items: rows });
+  } catch (error) {
+    console.error('[Memory] governance erro:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/memory/:id/governance/approve - Aprova item de pending_review/quarantine
+app.post('/api/memory/:id/governance/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await query(
+      `UPDATE memories SET status='approved'::memory_status, confidence_score=1.0,
+         tags = array_remove(array_remove(tags, 'needs_review'), 'quarantine'),
+         approved_at = NOW(), updated_at = NOW()
+       WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'memoria nao encontrada' });
+    res.json({ ok: true, memory: rows[0] });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/memory/:id/governance/discard - Descarta definitivamente (archived)
+app.post('/api/memory/:id/governance/discard', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await query(
+      `UPDATE memories SET status='archived'::memory_status, updated_at = NOW() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'memoria nao encontrada' });
+    res.json({ ok: true, memory: rows[0] });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 // PUT /api/memory/:id - Update a memory
@@ -4688,6 +5864,22 @@ server.listen(PORT, async () => {
       }
     }).catch(() => {});
   }, 10 * 60 * 1000);
+
+  // Auto-unsnooze: conversas com snoozed_until <= NOW() voltam pra fila
+  setInterval(async () => {
+    try {
+      const { rows } = await query(
+        `UPDATE whatsapp_conversations
+            SET snoozed_until = NULL
+          WHERE snoozed_until IS NOT NULL AND snoozed_until <= NOW()
+          RETURNING id, phone, client_name`
+      );
+      for (const r of rows) {
+        broadcast({ type: 'conversation_unsnoozed', conversation_id: r.id });
+        console.log(`[Snooze] desnooze automatico: ${r.client_name || r.phone}`);
+      }
+    } catch (e) { console.error('[Snooze] erro auto-unsnooze:', e.message); }
+  }, 60 * 1000);
 
   // Auto-resolve de conversas WhatsApp silenciosas
   setInterval(async () => {

@@ -4,8 +4,8 @@
   --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
   --font-heading: 'Outfit', system-ui, sans-serif;
   --font-mono: 'Space Grotesk', monospace;
-  --color-gold: #C4956A;
-  --color-gold-dim: #C4956A66;
+  --color-gold: #6366F1;
+  --color-gold-dim: #6366F166;
   --color-void: #08080A;
   --color-surface: #0f1117;
   --color-card: #131620;
@@ -40,8 +40,8 @@
   --ao-hover-bg: rgba(255, 255, 255, 0.02);
   --ao-separator: rgba(255, 255, 255, 0.025);
   --ao-shadow: rgba(0, 0, 0, 0.3);
-  --ao-scrollbar: rgba(196, 149, 106, 0.15);
-  --ao-scrollbar-hover: rgba(196, 149, 106, 0.3);
+  --ao-scrollbar: rgba(99, 102, 241, 0.15);
+  --ao-scrollbar-hover: rgba(99, 102, 241, 0.3);
   --ao-popup-bg: #1a1b1f;
 }
 
@@ -71,8 +71,8 @@
   --ao-hover-bg: rgba(0, 0, 0, 0.04);
   --ao-separator: rgba(0, 0, 0, 0.08);
   --ao-shadow: rgba(0, 0, 0, 0.1);
-  --ao-scrollbar: rgba(196, 149, 106, 0.25);
-  --ao-scrollbar-hover: rgba(196, 149, 106, 0.45);
+  --ao-scrollbar: rgba(99, 102, 241, 0.25);
+  --ao-scrollbar-hover: rgba(99, 102, 241, 0.45);
   --ao-popup-bg: #F5F2ED;
 }
 
@@ -94,7 +94,7 @@
 
 [data-theme="light"] .stat-gradient-amber { background: linear-gradient(135deg, rgba(245, 158, 11, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
 [data-theme="light"] .stat-gradient-red { background: linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
-[data-theme="light"] .stat-gradient-gold { background: linear-gradient(135deg, rgba(196, 149, 106, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
+[data-theme="light"] .stat-gradient-gold { background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
 [data-theme="light"] .stat-gradient-emerald { background: linear-gradient(135deg, rgba(34, 197, 94, 0.1) 0%, rgba(248, 246, 242, 0.9) 100%); }
 
 [data-theme="light"] .text-gradient-gold {
@@ -108,9 +108,9 @@
 [data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: var(--ao-scrollbar-hover); }
 [data-theme="light"] .chat-scroll::-webkit-scrollbar-thumb { background: var(--ao-scrollbar); }
 
-[data-theme="light"] .vista-bar { background: rgba(196, 149, 106, 0.12); }
+[data-theme="light"] .vista-bar { background: rgba(99, 102, 241, 0.12); }
 [data-theme="light"] .vista-bar::after {
-  background: linear-gradient(90deg, transparent, rgba(196, 149, 106, 0.6), rgba(196, 149, 106, 0.8), rgba(196, 149, 106, 0.6), transparent);
+  background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.6), rgba(99, 102, 241, 0.8), rgba(99, 102, 241, 0.6), transparent);
 }
 
 body {
@@ -131,8 +131,8 @@ body {
    ============================================ */
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(196, 149, 106, 0.15); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(196, 149, 106, 0.3); }
+::-webkit-scrollbar-thumb { background: rgba(99, 102, 241, 0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.3); }
 
 /* ============================================
    TYPING DOTS
@@ -157,7 +157,7 @@ body {
   position: relative;
   overflow: hidden;
   height: 2px;
-  background: rgba(196, 149, 106, 0.06);
+  background: rgba(99, 102, 241, 0.06);
   border-radius: 2px;
 }
 
@@ -168,7 +168,7 @@ body {
   left: 0;
   width: 30%;
   height: 100%;
-  background: linear-gradient(90deg, transparent, rgba(196, 149, 106, 0.5), rgba(196, 149, 106, 0.7), rgba(196, 149, 106, 0.5), transparent);
+  background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.5), rgba(99, 102, 241, 0.7), rgba(99, 102, 241, 0.5), transparent);
   border-radius: 2px;
   animation: vista-sweep 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }
@@ -189,7 +189,7 @@ body {
   left: 0;
   width: 25%;
   height: 100%;
-  background: linear-gradient(90deg, transparent, var(--agent-color, #C4956A), transparent);
+  background: linear-gradient(90deg, transparent, var(--agent-color, #6366F1), transparent);
   border-radius: 2px;
   animation: vista-sweep 2.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
   opacity: 0.5;
@@ -207,9 +207,9 @@ body {
   background: linear-gradient(
     90deg,
     transparent 0%,
-    rgba(196, 149, 106, 0.03) 40%,
-    rgba(196, 149, 106, 0.06) 50%,
-    rgba(196, 149, 106, 0.03) 60%,
+    rgba(99, 102, 241, 0.03) 40%,
+    rgba(99, 102, 241, 0.06) 50%,
+    rgba(99, 102, 241, 0.03) 60%,
     transparent 100%
   );
   background-size: 200% 100%;
@@ -288,10 +288,10 @@ body {
    ============================================ */
 @keyframes pulse-glow {
   0%, 100% {
-    box-shadow: 0 0 0 0 var(--glow-color, rgba(196, 149, 106, 0.3));
+    box-shadow: 0 0 0 0 var(--glow-color, rgba(99, 102, 241, 0.3));
   }
   50% {
-    box-shadow: 0 0 16px 4px var(--glow-color, rgba(196, 149, 106, 0.15));
+    box-shadow: 0 0 16px 4px var(--glow-color, rgba(99, 102, 241, 0.15));
   }
 }
 
@@ -304,8 +304,8 @@ body {
    ============================================ */
 @keyframes message-glow {
   0% {
-    background-color: rgba(196, 149, 106, 0.08);
-    box-shadow: 0 0 20px rgba(196, 149, 106, 0.1);
+    background-color: rgba(99, 102, 241, 0.08);
+    box-shadow: 0 0 20px rgba(99, 102, 241, 0.1);
   }
   100% {
     background-color: transparent;
@@ -342,7 +342,7 @@ body {
    GRADIENT TEXT — premium heading effect
    ============================================ */
 .text-gradient-gold {
-  background: linear-gradient(135deg, #C4956A 0%, #E8C9A8 50%, #C4956A 100%);
+  background: linear-gradient(135deg, #6366F1 0%, #E8C9A8 50%, #6366F1 100%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -376,7 +376,7 @@ body {
 }
 
 .stat-gradient-gold {
-  background: linear-gradient(135deg, rgba(196, 149, 106, 0.06) 0%, rgba(19, 22, 32, 0.8) 100%);
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.06) 0%, rgba(19, 22, 32, 0.8) 100%);
 }
 
 .stat-gradient-emerald {
@@ -413,8 +413,8 @@ body {
    ============================================ */
 .chat-scroll::-webkit-scrollbar { width: 3px; }
 .chat-scroll::-webkit-scrollbar-track { background: transparent; }
-.chat-scroll::-webkit-scrollbar-thumb { background: rgba(196, 149, 106, 0.1); border-radius: 3px; }
-.chat-scroll::-webkit-scrollbar-thumb:hover { background: rgba(196, 149, 106, 0.2); }
+.chat-scroll::-webkit-scrollbar-thumb { background: rgba(99, 102, 241, 0.1); border-radius: 3px; }
+.chat-scroll::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.2); }
 
 /* ============================================
    ENTRANCE STAGGER — for list items
@@ -443,7 +443,7 @@ select, input, textarea {
 select {
   appearance: none;
   -webkit-appearance: none;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%23C4956A' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M3 4.5l3 3 3-3'/></svg>");
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%236366F1' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M3 4.5l3 3 3-3'/></svg>");
   background-repeat: no-repeat;
   background-position: right 10px center;
   padding-right: 30px !important;
@@ -458,8 +458,8 @@ input::placeholder, textarea::placeholder { color: var(--ao-text-dim); }
 /* Focus ring consistente (accent gold) */
 select:focus, input:focus, textarea:focus, button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgba(196, 149, 106, 0.35);
-  border-color: rgba(196, 149, 106, 0.6) !important;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.35);
+  border-color: rgba(99, 102, 241, 0.6) !important;
 }
 
 /* ============================================
@@ -473,7 +473,7 @@ select:focus, input:focus, textarea:focus, button:focus-visible {
 .ao-modal {
   background: var(--ao-card);
   border: 1px solid var(--ao-border);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(196, 149, 106, 0.08);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(99, 102, 241, 0.08);
 }
 
 /* ============================================
@@ -501,14 +501,14 @@ select:focus, input:focus, textarea:focus, button:focus-visible {
   border-radius: 8px;
   font-size: 12.5px;
   font-weight: 600;
-  background: linear-gradient(135deg, #C4956A 0%, #A67B52 100%);
+  background: linear-gradient(135deg, #6366F1 0%, #A67B52 100%);
   color: #fff;
   border: none;
   cursor: pointer;
   transition: all 0.2s;
-  box-shadow: 0 2px 8px rgba(196, 149, 106, 0.25);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
 }
-.ao-btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(196, 149, 106, 0.35); }
+.ao-btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35); }
 .ao-btn-ghost {
   display: inline-flex;
   align-items: center;
@@ -542,7 +542,7 @@ select:focus, input:focus, textarea:focus, button:focus-visible {
   position: absolute;
   left: 0; top: 0; bottom: 0;
   width: 3px;
-  background: var(--ao-stat-accent, #C4956A);
+  background: var(--ao-stat-accent, #6366F1);
   opacity: 0.6;
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Loader2, User, UserCheck, ExternalLink, Link2, Unlink, Building, MapPin, Phone, Mail, FileText, AlertCircle, CheckCircle2, Users } from 'lucide-react'
-import { fetchClientContext, unlinkConversationFromClient, fetchPhoneCandidates, linkConversationToClient } from './atendimento-api'
+import { Loader2, User, UserCheck, ExternalLink, Link2, Unlink, Building, MapPin, Phone, Mail, FileText, AlertCircle, CheckCircle2, Users, Banknote, Plus, Send } from 'lucide-react'
+import { fetchClientContext, unlinkConversationFromClient, fetchPhoneCandidates, linkConversationToClient, fetchExtratosStatus, addClientObservation } from './atendimento-api'
 import LinkClientModal from './LinkClientModal'
 import SaveContactModal from './SaveContactModal'
 
@@ -18,6 +18,25 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [linkOpen, setLinkOpen] = useState(false)
+  const [linkSateliteOpen, setLinkSateliteOpen] = useState(false)
+  // Observacao inline
+  const [obsOpen, setObsOpen] = useState(false)
+  const [obsText, setObsText] = useState('')
+  const [obsTipo, setObsTipo] = useState('nota')
+  const [obsSaving, setObsSaving] = useState(false)
+  const [obsError, setObsError] = useState(null)
+
+  const handleAddObs = async () => {
+    const text = obsText.trim()
+    if (!text || obsSaving) return
+    setObsSaving(true); setObsError(null)
+    try {
+      await addClientObservation(conv.id, { descricao: text, tipo: obsTipo, autor: 'Atendimento WhatsApp' })
+      setObsText(''); setObsOpen(false); setObsTipo('nota')
+      await load()
+    } catch (e) { setObsError(e.message) }
+    finally { setObsSaving(false) }
+  }
   const [candidates, setCandidates] = useState([])  // todos clientes com este telefone
   const [switching, setSwitching] = useState(false)
   const [saveContactOpen, setSaveContactOpen] = useState(false)
@@ -88,6 +107,14 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
     return (
       <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--ao-bg)' }}>
         {header}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
+          {ctx?.conversation?.is_group && ctx?.conversation?.chat_id && <GroupParticipants chatId={ctx.conversation.chat_id} />}
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.5 }}>
           <Loader2 size={16} className="animate-spin" />
         </div>
@@ -156,7 +183,7 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
                   onClick={() => setLinkOpen(true)}
                   style={{
                     padding: '6px 12px', fontSize: 11, fontWeight: 600, borderRadius: 8,
-                    border: 'none', background: 'var(--ao-accent, #c4956a)', color: '#fff',
+                    border: 'none', background: 'var(--ao-accent, #6366F1)', color: '#fff',
                     cursor: 'pointer',
                     display: 'inline-flex', alignItems: 'center', gap: 5,
                   }}
@@ -252,13 +279,28 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
               onClick={() => setLinkOpen(true)}
               style={{
                 padding: '10px 14px', fontSize: 12.5, fontWeight: 700, borderRadius: 10,
-                border: 'none', background: 'var(--ao-accent, #c4956a)', color: '#fff',
+                border: 'none', background: 'var(--ao-accent, #6366F1)', color: '#fff',
                 cursor: 'pointer',
                 display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
               }}
             >
               <Link2 size={13} />
               É cliente da Átrio
+            </button>
+            <button
+              onClick={() => setLinkSateliteOpen(true)}
+              title="Esse contato (tomador, sócio, contador, financeiro) representa um cliente que JÁ está na Carteira"
+              style={{
+                padding: '10px 14px', fontSize: 12.5, fontWeight: 700, borderRadius: 10,
+                border: '1px solid var(--ao-border)',
+                background: 'rgba(99, 102, 241, 0.08)',
+                color: 'var(--ao-text-primary)',
+                cursor: 'pointer',
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+              }}
+            >
+              <Users size={13} />
+              Tomador / contato de cliente
             </button>
             <button
               onClick={() => setSaveContactOpen(true)}
@@ -292,6 +334,13 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
           onClose={() => setLinkOpen(false)}
           conversation={ctx?.conversation || conv}
           onLinked={load}
+        />
+        <LinkClientModal
+          open={linkSateliteOpen}
+          onClose={() => setLinkSateliteOpen(false)}
+          conversation={ctx?.conversation || conv}
+          onLinked={load}
+          mode="satelite"
         />
         <SaveContactModal
           open={saveContactOpen}
@@ -353,6 +402,7 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
   // Linkada — render completo
   const cli = ctx?.client || {}
   const badges = ctx?.badges
+  const observacoes = ctx?.observacoes || []
   const legalizacoes = ctx?.legalizacoes || []
   const onboardings = ctx?.onboardings || []
   const activeOnb = onboardings.find(o => o.status === 'em_andamento') || onboardings[0]
@@ -366,9 +416,51 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
     </span>
   )
 
+  // Banner satelite — quando o vinculo eh por relacao (tomador, socio, etc), explica
+  // que a conversa nao eh com o cliente em si, eh com um terceiro RELACIONADO ao cliente.
+  const sateliteLink = ctx?.primaryLink?.relacao
+    ? {
+        relacao: ctx.primaryLink.relacao,
+        contato_funcao: ctx.primaryLink.contato_funcao,
+        clientName: cli.legalName || cli.tradeName,
+      }
+    : null
+  const RELACAO_DESC = {
+    tomador:    { label: 'Tomador',    desc: 'Solicita NFS-e desta cliente' },
+    socio:      { label: 'Sócio',      desc: 'Sócio/representante desta cliente' },
+    contador:   { label: 'Contador',   desc: 'Contador parceiro desta cliente' },
+    financeiro: { label: 'Financeiro', desc: 'Setor financeiro desta cliente' },
+    outro:      { label: 'Outro',      desc: 'Relacionado a esta cliente' },
+  }
+  const sateliteBanner = sateliteLink && (
+    <div style={{
+      padding: '10px 14px', borderBottom: '1px solid var(--ao-border)',
+      background: 'rgba(99, 102, 241, 0.08)',
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4,
+        fontSize: 10.5, fontWeight: 800, color: 'rgba(99, 102, 241, 0.95)',
+        textTransform: 'uppercase', letterSpacing: '0.4px',
+      }}>
+        <Users size={11} />
+        <span>{(RELACAO_DESC[sateliteLink.relacao] || RELACAO_DESC.outro).label} de cliente</span>
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--ao-text-secondary)', lineHeight: 1.45 }}>
+        Este contato NÃO é o cliente — é um {sateliteLink.relacao}{' '}
+        relacionado a <strong style={{ color: 'var(--ao-text-primary)' }}>{sateliteLink.clientName}</strong>.
+        {sateliteLink.contato_funcao && (
+          <span style={{ display: 'block', marginTop: 3, fontSize: 10.5, color: 'var(--ao-text-dim)', fontStyle: 'italic' }}>
+            {sateliteLink.contato_funcao}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--ao-bg)', overflowY: 'auto' }}>
       {header}
+      {sateliteBanner}
       {multiBanner}
       {ctx?.clients && ctx.clients.length > 1 && (
         <div style={{ padding: '8px 14px', borderBottom: '1px solid var(--ao-border)', background: 'rgba(99,102,241,0.06)' }}>
@@ -407,15 +499,41 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
         </div>
       )}
 
-      {/* Card identidade */}
-      <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--ao-border)' }}>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+      {/* Card identidade — hero com gradient por tipo de cliente */}
+      {(() => {
+        const TYPE_GRADIENTS = {
+          'MEDICINA':   ['#10B981', '#059669'],
+          'MEDICOS':    ['#10B981', '#059669'],
+          'ADV':        ['#7F77DD', '#5B52B6'],
+          'ADVOCACIA':  ['#7F77DD', '#5B52B6'],
+          'ENGENHARIA': ['#FB923C', '#EA580C'],
+          'CONTABIL':   ['#60A5FA', '#2563EB'],
+          'COMERCIO':   ['#FBBF24', '#D97706'],
+          'TECNOLOGIA': ['#22D3EE', '#0891B2'],
+        }
+        const inactive = cli.status !== 'ATIVO'
+        const t = (cli.type || '').toUpperCase()
+        const [c1, c2] = inactive ? ['#94A3B8', '#64748B'] : (TYPE_GRADIENTS[t] || ['#10B981', '#059669'])
+        return (
           <div style={{
-            width: 42, height: 42, borderRadius: '50%',
-            background: cli.status === 'ATIVO' ? 'linear-gradient(135deg, #10B981, #059669)' : 'linear-gradient(135deg, #64748b, #475569)',
-            color: '#fff', fontSize: 14, fontWeight: 800,
+            padding: '18px 16px 14px',
+            borderBottom: '1px solid var(--ao-border)',
+            background: `linear-gradient(135deg, ${c1}11 0%, ${c2}08 100%)`,
+            position: 'relative',
+            overflow: 'hidden',
+          }}>
+            <div style={{
+              position: 'absolute', top: 0, left: 0, right: 0, height: 3,
+              background: `linear-gradient(90deg, ${c1}, ${c2})`,
+            }} />
+        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+          <div style={{
+            width: 48, height: 48, borderRadius: '50%',
+            background: `linear-gradient(135deg, ${c1}, ${c2})`,
+            color: '#fff', fontSize: 15, fontWeight: 800,
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             flexShrink: 0,
+            boxShadow: `0 4px 12px ${c1}30`,
           }}>
             {(cli.legalName || cli.tradeName || '?').slice(0, 2).toUpperCase()}
           </div>
@@ -469,6 +587,8 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
           </button>
         </div>
       </div>
+        )
+      })()}
 
       {/* Ecossistema (badges datalake) */}
       {badges && (badges.finance || badges.nfse || badges.fornecedores) && (
@@ -506,12 +626,176 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
         </div>
       )}
 
+      {/* Observações importantes (do Gesthub Cliente 360) — sempre renderiza
+           quando ha cliente vinculado, pra permitir adicionar nova obs inline */}
+      {cli?.id && (
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--ao-border)' }}>
+          <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--ao-text-dim)', marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span>📌 Observações{observacoes.length > 0 ? ` — ${observacoes.length}` : ''}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <button
+                onClick={() => setObsOpen(v => !v)}
+                title="Adicionar observação que vai pro histórico do cliente no Gesthub"
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 3,
+                  fontSize: 10, fontWeight: 700, padding: '3px 8px', borderRadius: 4,
+                  border: `1px solid ${obsOpen ? 'rgba(99, 102, 241, 0.4)' : 'var(--ao-border)'}`,
+                  background: obsOpen ? 'rgba(99, 102, 241, 0.15)' : 'transparent',
+                  color: obsOpen ? 'rgba(99, 102, 241, 0.95)' : 'var(--ao-text-secondary)',
+                  cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '.04em',
+                }}
+              >
+                <Plus size={10} /> Nota
+              </button>
+              <a href={`http://31.97.175.200/?client=${cli.id}&tab=cliente360`} target="_blank" rel="noreferrer" style={{ color: 'var(--ao-accent, #6366F1)', fontSize: 10, fontWeight: 600 }}>Ver no 360 →</a>
+            </div>
+          </div>
+
+          {/* Form inline de adicionar observacao */}
+          {obsOpen && (
+            <div style={{
+              marginBottom: 10, padding: '8px 10px', borderRadius: 6,
+              border: '1px solid rgba(99, 102, 241, 0.3)',
+              background: 'rgba(99, 102, 241, 0.05)',
+            }}>
+              <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                {[
+                  ['nota', '📝 Nota', '#F59E0B'],
+                  ['alerta', '⚠️ Alerta', '#EF4444'],
+                ].map(([id, label, color]) => (
+                  <button
+                    key={id}
+                    onClick={() => setObsTipo(id)}
+                    type="button"
+                    style={{
+                      padding: '3px 8px', borderRadius: 4, fontSize: 10, fontWeight: 700,
+                      border: `1px solid ${obsTipo === id ? color : 'var(--ao-border)'}`,
+                      background: obsTipo === id ? `${color}22` : 'transparent',
+                      color: obsTipo === id ? color : 'var(--ao-text-dim)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                value={obsText}
+                onChange={e => setObsText(e.target.value)}
+                placeholder="Descreva o que aconteceu — ex: Cliente perdeu Simples Nacional por débitos..."
+                rows={3}
+                autoFocus
+                onKeyDown={e => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') handleAddObs()
+                  if (e.key === 'Escape') { setObsOpen(false); setObsText('') }
+                }}
+                style={{
+                  width: '100%', padding: '8px 10px', borderRadius: 6,
+                  border: '1px solid var(--ao-border)', background: 'var(--ao-bg)',
+                  color: 'var(--ao-text-primary)', fontSize: 12, resize: 'vertical',
+                  fontFamily: 'inherit', lineHeight: 1.4,
+                }}
+              />
+              {obsError && (
+                <div style={{ fontSize: 11, color: '#ef4444', marginTop: 4 }}>{obsError}</div>
+              )}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
+                <span style={{ fontSize: 9.5, color: 'var(--ao-text-dim)' }}>
+                  Vai pro histórico do cliente no Gesthub. Ctrl+Enter pra salvar.
+                </span>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button
+                    onClick={() => { setObsOpen(false); setObsText(''); setObsError(null) }}
+                    type="button"
+                    style={{
+                      padding: '5px 10px', fontSize: 11, fontWeight: 600,
+                      borderRadius: 5, border: '1px solid var(--ao-border)',
+                      background: 'transparent', color: 'var(--ao-text-secondary)', cursor: 'pointer',
+                    }}
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    onClick={handleAddObs}
+                    disabled={!obsText.trim() || obsSaving}
+                    type="button"
+                    style={{
+                      padding: '5px 12px', fontSize: 11, fontWeight: 700,
+                      borderRadius: 5, border: 'none',
+                      background: obsText.trim() && !obsSaving ? 'var(--ao-accent, #6366F1)' : 'var(--ao-card)',
+                      color: obsText.trim() && !obsSaving ? '#fff' : 'var(--ao-text-dim)',
+                      cursor: obsText.trim() && !obsSaving ? 'pointer' : 'not-allowed',
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                    }}
+                  >
+                    {obsSaving ? <Loader2 size={11} className="animate-spin" /> : <Send size={11} />}
+                    {obsSaving ? 'Salvando...' : 'Salvar'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {observacoes.length === 0 && !obsOpen && (
+            <p style={{ fontSize: 11, color: 'var(--ao-text-dim)', margin: '4px 0 0', fontStyle: 'italic' }}>
+              Nenhuma observação registrada. Clique em <strong>+ Nota</strong> pra adicionar.
+            </p>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 220, overflowY: 'auto' }}>
+            {observacoes.map((o, i) => {
+              const tipo = (o.tipo || '').toLowerCase()
+              // cor por tipo
+              const palette = {
+                nota:        { bg: 'rgba(245, 158, 11, 0.10)', border: '#f59e0b', icon: '📝' },
+                alerta:      { bg: 'rgba(239, 68, 68, 0.10)',  border: '#ef4444', icon: '⚠️' },
+                onboarding:  { bg: 'rgba(99, 102, 241, 0.10)', border: '#6366f1', icon: '🚀' },
+                irpf:        { bg: 'rgba(16, 185, 129, 0.10)', border: '#10b981', icon: '📊' },
+                legalizacao: { bg: 'rgba(59, 130, 246, 0.10)', border: '#3b82f6', icon: '📋' },
+                entrega:     { bg: 'rgba(139, 92, 246, 0.10)', border: '#8b5cf6', icon: '📦' },
+                _default:    { bg: 'var(--ao-surface)',         border: 'var(--ao-border)', icon: '•' },
+              }
+              const p = palette[tipo] || palette._default
+              const texto = o.descricao || o.texto || ''
+              const data = o.data || o.createdAt
+              const autor = o.autor || o.source || ''
+              return (
+                <div
+                  key={o.id || i}
+                  style={{
+                    fontSize: 11, padding: '7px 10px', borderRadius: 6,
+                    background: p.bg, borderLeft: `3px solid ${p.border}`,
+                    color: 'var(--ao-text-primary)',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3, gap: 6 }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', color: p.border }}>
+                      {p.icon} {tipo || 'nota'}
+                    </span>
+                    {data && (
+                      <span style={{ fontSize: 9.5, color: 'var(--ao-text-dim)' }}>
+                        {String(data).slice(0, 10).split('-').reverse().join('/')}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 11, lineHeight: 1.35, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    {texto}
+                  </div>
+                  {autor && autor !== 'Cadastro' && (
+                    <div style={{ fontSize: 9.5, color: 'var(--ao-text-dim)', marginTop: 3 }}>— {autor}</div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Legalizacoes ativas */}
       {activeLegal.length > 0 && (
         <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--ao-border)' }}>
           <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--ao-text-dim)', marginBottom: 8, display: 'flex', justifyContent: 'space-between' }}>
             <span>Legalização — {activeLegal.length} ativo(s)</span>
-            <a href={`http://31.97.175.200/?client=${cli.id}&tab=legalizacao`} target="_blank" rel="noreferrer" style={{ color: 'var(--ao-accent, #BA7517)', fontSize: 10, fontWeight: 600 }}>Ver tudo →</a>
+            <a href={`http://31.97.175.200/?client=${cli.id}&tab=legalizacao`} target="_blank" rel="noreferrer" style={{ color: 'var(--ao-accent, #6366F1)', fontSize: 10, fontWeight: 600 }}>Ver tudo →</a>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 240, overflowY: 'auto' }}>
             {activeLegal.map((l, i) => {
@@ -556,6 +840,9 @@ export default function ClientDetailPane({ conversation: conv, onClose, lastWsMe
           </div>
         </div>
       )}
+
+      {/* Extratos do cliente — status mensal (jan-dez do ano corrente) */}
+      <ExtratosSection clienteId={cli.id} />
 
       {/* Controle de vinculo */}
       <div style={{ padding: '10px 16px', marginTop: 'auto', borderTop: '1px solid var(--ao-border)', background: 'var(--ao-card)' }}>
@@ -645,7 +932,7 @@ function DetailField({ label, value, link, mono }) {
           href={link}
           target={link.startsWith('http') ? '_blank' : undefined}
           rel="noreferrer"
-          style={{ textDecoration: 'none', color: 'var(--ao-accent, #c4956a)', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+          style={{ textDecoration: 'none', color: 'var(--ao-accent, #6366F1)', display: 'inline-flex', alignItems: 'center', gap: 4 }}
         >
           {valueEl}
           <ExternalLink size={10} style={{ opacity: 0.5 }} />
@@ -654,3 +941,220 @@ function DetailField({ label, value, link, mono }) {
     </div>
   )
 }
+
+// ─── Seção "Extratos" no painel direito ──────────────────────────────────
+// Carrega status mensal via /api/atendimento/extratos-status/:cliente_id (proxy Finance).
+// Mostra grid 12 meses com cor por status.
+const MES_ABREV = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+
+function ExtratosSection({ clienteId }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [ano, setAno] = useState(new Date().getFullYear());
+  const [showFuture, setShowFuture] = useState(false);
+
+  useEffect(() => {
+    if (!clienteId) return;
+    let alive = true;
+    setLoading(true); setErr(null);
+    fetchExtratosStatus(clienteId, ano)
+      .then(d => { if (alive) setData(d.data); })
+      .catch(e => { if (alive) setErr(e.message); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [clienteId, ano]);
+
+  if (!clienteId) return null;
+
+  const STATUS_STYLE = {
+    RECEBIDO:     { label: '✓',  color: '#10B981', bg: 'rgba(16, 185, 129, 0.18)', tip: 'Recebido' },
+    PARCIAL:      { label: '½',  color: '#3B82F6', bg: 'rgba(59, 130, 246, 0.18)', tip: 'Parcial — falta conta' },
+    INCOMPLETO:   { label: '◔',  color: '#F59E0B', bg: 'rgba(245, 158, 11, 0.18)', tip: 'Incompleto — período curto' },
+    EM_FILA:      { label: '⏳', color: '#7F77DD', bg: 'rgba(127, 119, 221, 0.18)', tip: 'Em fila no Finance, aguardando aprovação' },
+    EM_ANDAMENTO: { label: '◑',  color: '#94A3B8', bg: 'rgba(148, 163, 184, 0.18)', tip: 'Mês em curso' },
+    PENDENTE:     { label: '?',  color: '#EF4444', bg: 'rgba(239, 68, 68, 0.18)',  tip: 'Pendente — atrasado' },
+    COBRADO:      { label: '!',  color: '#F59E0B', bg: 'rgba(245, 158, 11, 0.18)', tip: 'Cobrado — aguardando' },
+    DISPENSADO:   { label: '—',  color: '#94A3B8', bg: 'rgba(148, 163, 184, 0.12)', tip: 'Dispensado' },
+  };
+  const futureStyle = { label: '·', color: 'var(--ao-text-dim)', bg: 'transparent', tip: 'Mês futuro' };
+
+  return (
+    <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--ao-border)' }}>
+      <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--ao-text-dim)', marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <Banknote size={11} /> Extratos — {ano}
+          {data?.totalContas > 0 && <span style={{ color: 'var(--ao-text-dim)', fontWeight: 500, textTransform: 'none' }}>({data.totalContas} conta{data.totalContas > 1 ? 's' : ''})</span>}
+        </span>
+        <a
+          href={`http://31.97.175.200:3000/?cliente_id=${clienteId}#painel`}
+          target="_blank"
+          rel="noreferrer"
+          style={{ color: 'var(--ao-accent, #6366F1)', fontSize: 10, fontWeight: 600 }}
+        >
+          Ver no Finance →
+        </a>
+      </div>
+
+      {loading && <div style={{ fontSize: 11, color: 'var(--ao-text-dim)' }}>Carregando…</div>}
+      {err && <div style={{ fontSize: 11, color: '#EF4444' }}>{err}</div>}
+
+      {data?.meses && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(36px, 1fr))', gap: 4 }}>
+            {(() => {
+              // Mostra apenas meses passados + atual por padrão. Se showFuture, expande pra 12.
+              const anoNum = parseInt(ano);
+              const isCurrentYear = anoNum === new Date().getFullYear();
+              const lastMonth = (showFuture || !isCurrentYear) ? 12 : new Date().getMonth() + 1;
+              return Array.from({ length: lastMonth }, (_, i) => i);
+            })().map(i => {
+              const m = String(i + 1);
+              const item = data.meses[m] || {};
+              const st = STATUS_STYLE[item.status] || (item.status ? { label: item.status[0], color: '#94A3B8', bg: 'rgba(148, 163, 184, 0.18)', tip: item.status } : futureStyle);
+              return (
+                <div
+                  key={m}
+                  title={`${MES_ABREV[i]} ${ano}: ${st.tip}${item.uploads ? ` · ${item.uploads} upload(s) · ${item.transacoes || 0} trx` : ''}${item.pendingCount ? ` · ${item.pendingCount} em fila` : ''}`}
+                  style={{
+                    padding: '6px 4px', borderRadius: 5, textAlign: 'center',
+                    background: st.bg, color: st.color,
+                    border: `1px solid ${st.color}33`,
+                    fontSize: 11,
+                  }}
+                >
+                  <div style={{ fontSize: 9, fontWeight: 600, opacity: 0.75 }}>{MES_ABREV[i]}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, lineHeight: 1.1 }}>{st.label}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ marginTop: 6, fontSize: 9.5, color: 'var(--ao-text-dim)', display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span style={{ color: '#10B981' }}>✓ recebido</span>
+            <span style={{ color: '#7F77DD' }}>⏳ em fila</span>
+            <span style={{ color: '#3B82F6' }}>½ parcial</span>
+            <span style={{ color: '#F59E0B' }}>◔ incompleto</span>
+            <span style={{ color: '#EF4444' }}>? pendente</span>
+            {parseInt(ano) === new Date().getFullYear() && (
+              <button
+                onClick={() => setShowFuture(v => !v)}
+                type="button"
+                style={{
+                  marginLeft: 'auto', fontSize: 9.5, fontWeight: 600,
+                  background: 'transparent', border: 'none',
+                  color: 'var(--ao-text-dim)', cursor: 'pointer', padding: '2px 4px',
+                  textDecoration: 'underline', textUnderlineOffset: 2,
+                }}
+              >
+                {showFuture ? 'ocultar futuros' : 'ver futuros →'}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// GroupParticipants — lista membros de um grupo WhatsApp.
+// ============================================================
+function GroupParticipants({ chatId }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const load = async () => {
+    if (data || loading) return;
+    setLoading(true); setErr(null);
+    try {
+      const encoded = encodeURIComponent(chatId);
+      const r = await fetch(`/api/whatsapp/group/${encoded}/participants`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setData(j);
+    } catch (e) {
+      setErr(e.message);
+    } finally { setLoading(false); }
+  };
+
+  const handleToggle = () => {
+    if (!open) load();
+    setOpen(o => !o);
+  };
+
+  return (
+    <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--ao-border)' }}>
+      <button
+        type="button"
+        onClick={handleToggle}
+        style={{
+          width: '100%', padding: '8px 10px', fontSize: 11.5, fontWeight: 700,
+          background: 'var(--ao-card)', border: '1px solid var(--ao-border)',
+          borderRadius: 8, cursor: 'pointer',
+          color: 'var(--ao-text-primary)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          textTransform: 'uppercase', letterSpacing: '0.4px',
+        }}
+      >
+        <span>👥 Participantes do grupo {data?.total ? `(${data.total})` : ''}</span>
+        <span style={{ fontSize: 13, opacity: 0.6 }}>{open ? '−' : '+'}</span>
+      </button>
+      {open && (
+        <div style={{ marginTop: 8 }}>
+          {loading && <div style={{ fontSize: 11, color: 'var(--ao-text-dim)' }}>Carregando...</div>}
+          {err && <div style={{ fontSize: 11, color: 'var(--ao-danger, #dc2626)' }}>Erro: {err}</div>}
+          {data && (
+            <>
+              {data.group_name && (
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6, color: 'var(--ao-text-primary)' }}>
+                  {data.group_name}
+                </div>
+              )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 300, overflowY: 'auto' }}>
+                {data.participants.map(p => (
+                  <div key={p.id} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '6px 8px', borderRadius: 6,
+                    background: 'var(--ao-card)',
+                    border: '1px solid var(--ao-border)',
+                  }}>
+                    <div style={{
+                      width: 24, height: 24, borderRadius: '50%', flexShrink: 0,
+                      background: 'linear-gradient(135deg, #6366F1, #818CF8)',
+                      color: '#fff', fontWeight: 700, fontSize: 9,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                      {(p.name || '?').slice(0, 2).toUpperCase()}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--ao-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {p.name}
+                      </div>
+                      {p.phone && p.name !== p.phone && (
+                        <div style={{ fontSize: 10, color: 'var(--ao-text-muted)' }}>
+                          +{p.phone}
+                        </div>
+                      )}
+                    </div>
+                    {(p.isAdmin || p.isSuperAdmin) && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+                        background: 'rgba(99, 102, 241, 0.15)', color: 'var(--ao-accent)',
+                        textTransform: 'uppercase', letterSpacing: '0.3px',
+                      }}>
+                        {p.isSuperAdmin ? 'Dono' : 'Admin'}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+

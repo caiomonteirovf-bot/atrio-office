@@ -290,7 +290,10 @@ async function tick() {
         m.created_at AS ultima_mensagem_at
       FROM luna_v2.conversations c
       LEFT JOIN luna_v2.clients lc ON lc.id = c.client_id
-      LEFT JOIN datalake_gesthub.clients g ON g.id = lc.gesthub_id
+      -- WARNING: cast g.id::text obrigatorio. g.id eh integer, gesthub_id eh text.
+      -- Sem cast: erro 'operator does not exist: integer = text' a cada 15s.
+      -- Ver: RUNBOOK.md > "Watchdog spam de stale scan"
+      LEFT JOIN datalake_gesthub.clients g ON g.id::text = lc.gesthub_id
       LEFT JOIN LATERAL (
         SELECT content, direction, created_at
           FROM luna_v2.messages

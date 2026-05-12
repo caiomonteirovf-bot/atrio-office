@@ -73,7 +73,7 @@ export default function SecurityPage() {
     <div style={{ padding: '20px 24px', maxWidth: 1100, margin: '0 auto' }}>
       <div style={{ marginBottom: 18 }}>
         <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0, display: 'flex', alignItems: 'center', gap: 10 }}>
-          <Shield size={22} style={{ color: 'var(--ao-accent, #BA7517)' }} />
+          <Shield size={22} style={{ color: 'var(--ao-accent, #6366F1)' }} />
           Segurança
         </h1>
         <p style={{ fontSize: 12, color: 'var(--ao-text-dim)', margin: '4px 0 0' }}>

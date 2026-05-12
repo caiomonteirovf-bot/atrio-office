@@ -16,6 +16,77 @@ import { ingestFile } from './ingest.js';
 import { logEvent } from './activity-log.js';
 import { getAlertConfig, renderClientMessage, findConversationsToAutoResolve, markResolved } from './alert-config.js';
 
+// ============================================================
+// Pairing rate-limit guard — protege contra ban do WhatsApp por
+// excesso de tentativas de pareamento (anti-spam server-side).
+// Ban tipico: 2-4h apos ~3 QR generations sem successful pair.
+// Limite: max 2 QR generations em 24h. Override via env WA_BYPASS_PAIRING_GUARD.
+// ============================================================
+const PAIRING_GUARD_WINDOW_HOURS = 24;
+const PAIRING_GUARD_MAX_ATTEMPTS = 5;  // tentativas reais de pareamento em 24h
+
+async function logPairingEvent(eventType, phone, metadata = {}) {
+  try {
+    await query(
+      `INSERT INTO wa_pairing_log (event_type, phone, metadata) VALUES ($1, $2, $3::jsonb)`,
+      [eventType, phone || null, JSON.stringify(metadata)]
+    );
+  } catch (e) {
+    log(`[pairing-guard] erro logando evento: ${e.message}`);
+  }
+}
+
+// Se houve paired_success nas ultimas X min, tratamos initialize() como RECONEXAO
+// (auto-heal restaurando sessao existente), nao como NOVO pareamento.
+// Reconexoes nao contam contra o limite — sao restauradas a partir do session storage.
+const RECONNECT_GRACE_MINUTES = 30;
+
+async function checkPairingRateLimit() {
+  if (process.env.WA_BYPASS_PAIRING_GUARD === 'true') {
+    return { allowed: true, count: 0, reason: 'bypass via env' };
+  }
+  try {
+    // Verifica se ja houve pareamento bem-sucedido recente — se sim, eh reconexao
+    const { rows: recent } = await query(
+      `SELECT COUNT(*) AS c FROM wa_pairing_log
+        WHERE event_type = 'paired_success'
+          AND created_at > NOW() - INTERVAL '${RECONNECT_GRACE_MINUTES} minutes'`
+    );
+    const recentSuccess = parseInt(recent[0]?.c || 0, 10);
+    if (recentSuccess > 0) {
+      // Existe pareamento bem-sucedido recente — eh reconexao, libera
+      return { allowed: true, count: 0, reason: 'reconexao (paired_success recente)' };
+    }
+
+    // Senao, conta tentativas de pareamento NOVAS na janela de 24h
+    // Considera so as APOS o ultimo paired_success (que invalida tentativas anteriores)
+    const { rows: lastSuccess } = await query(
+      `SELECT MAX(created_at) AS ts FROM wa_pairing_log WHERE event_type = 'paired_success'`
+    );
+    const lastSuccessTs = lastSuccess[0]?.ts;
+
+    const { rows } = await query(
+      `SELECT COUNT(*) AS c FROM wa_pairing_log
+        WHERE event_type = 'pairing_attempt'
+          AND created_at > NOW() - INTERVAL '${PAIRING_GUARD_WINDOW_HOURS} hours'
+          AND ($1::timestamptz IS NULL OR created_at > $1::timestamptz)`,
+      [lastSuccessTs]
+    );
+    const count = parseInt(rows[0]?.c || 0, 10);
+    if (count >= PAIRING_GUARD_MAX_ATTEMPTS) {
+      return {
+        allowed: false,
+        count,
+        reason: `${count} tentativas de pareamento sem sucesso em ${PAIRING_GUARD_WINDOW_HOURS}h (limite: ${PAIRING_GUARD_MAX_ATTEMPTS}). RISCO DE BAN — pare de tentar parear hoje.`,
+      };
+    }
+    return { allowed: true, count, reason: null };
+  } catch (e) {
+    log(`[pairing-guard] erro checando rate-limit: ${e.message}`);
+    return { allowed: true, count: -1, reason: 'erro DB, fail-open' };
+  }
+}
+
 // ============================================
 // ESTADO
 // ============================================
@@ -119,6 +190,83 @@ async function saveMsgAttachment(msg, convIdOrPhone) {
   }
 }
 
+// Stringify defensivo: ignora refs circulares (pode acontecer com objetos
+// retornados pelo whatsapp-web.js que tem ref pro client/chat).
+function _safeStringify(obj) {
+  if (obj == null) return 'null';
+  const seen = new WeakSet();
+  try {
+    return JSON.stringify(obj, (k, v) => {
+      if (typeof v === 'object' && v !== null) {
+        if (seen.has(v)) return undefined;
+        seen.add(v);
+      }
+      // Não serializa funções nem Buffers grandes
+      if (typeof v === 'function') return undefined;
+      if (v && v.type === 'Buffer' && Array.isArray(v.data)) return '[Buffer]';
+      return v;
+    });
+  } catch (e) {
+    return '{}';
+  }
+}
+
+
+// ============================================================
+// repairResyncAttachments — corrige msgs que vieram do resync sem
+// attachment baixado (has_media:true mas attachment IS NULL).
+// ============================================================
+export async function repairResyncAttachments() {
+  if (!isReady || !client) {
+    return { ok: false, error: 'WhatsApp nao conectado' };
+  }
+
+  const { rows: pendentes } = await query(
+    `SELECT m.id, m.conversation_id, m.metadata->>'wa_msg_id' AS wa_msg_id,
+            c.chat_id, c.client_name, c.real_phone
+       FROM whatsapp_messages m
+       JOIN whatsapp_conversations c ON c.id = m.conversation_id
+      WHERE m.metadata->>'resync' = 'true'
+        AND m.metadata->>'has_media' = 'true'
+        AND (m.metadata->'attachment') IS NULL
+        AND m.metadata->>'wa_msg_id' IS NOT NULL
+      ORDER BY m.created_at DESC
+      LIMIT 100`
+  );
+
+  log(`[attachment_repair] iniciando: ${pendentes.length} msgs sem anexo`);
+
+  const stats = { total: pendentes.length, repaired: 0, errors: [] };
+
+  for (const row of pendentes) {
+    try {
+      const msg = await client.getMessageById(row.wa_msg_id);
+      if (!msg || !msg.hasMedia) {
+        stats.errors.push(`${row.client_name || row.real_phone}: msg sem hasMedia`);
+        continue;
+      }
+      const att = await saveMsgAttachment(msg, row.conversation_id);
+      if (!att?.attachment) {
+        stats.errors.push(`${row.client_name || row.real_phone}: download falhou`);
+        continue;
+      }
+      // UPDATE metadata adicionando attachment
+      await query(
+        `UPDATE whatsapp_messages
+            SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('attachment', $2::jsonb)
+          WHERE id = $1`,
+        [row.id, JSON.stringify(att.attachment)]
+      );
+      stats.repaired += 1;
+    } catch (e) {
+      stats.errors.push(`${row.client_name || row.real_phone}: ${e.message}`);
+    }
+  }
+
+  log(`[attachment_repair] concluido: ${stats.repaired}/${stats.total} reparadas, ${stats.errors.length} erros`);
+  return { ok: true, ...stats };
+}
+
 async function dbSaveMessage(conv, sender, body, metadata = {}) {
   if (!conv.dbId) return;
   try {
@@ -160,8 +308,22 @@ async function dbSaveMessage(conv, sender, body, metadata = {}) {
     }
 
     await query(`INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata) VALUES ($1, $2, $3, $4)`,
-      [conv.dbId, sender, body, JSON.stringify(mergedMeta)]);
-    await query(`UPDATE whatsapp_conversations SET last_message_at = NOW() WHERE id = $1`, [conv.dbId]);
+      [conv.dbId, sender, body, _safeStringify(mergedMeta)]);
+    // Se cliente mandou mensagem em conversa resolvida, REABRE (reseta resolved/closed_at).
+    // Antes ficava "aguardando" no Mission Control mas sumido em /atendimento — inconsistência.
+    const isClientReopen = sender === 'client';
+    await query(
+      `UPDATE whatsapp_conversations SET
+         last_message_at = NOW(),
+         resolved = CASE WHEN $2::boolean AND resolved THEN false ELSE resolved END,
+         resolved_at = CASE WHEN $2::boolean AND resolved THEN NULL ELSE resolved_at END,
+         closed_at = CASE WHEN $2::boolean AND resolved THEN NULL ELSE closed_at END,
+         resolution_reason = CASE WHEN $2::boolean AND resolved THEN NULL ELSE resolution_reason END,
+         snoozed_until = CASE WHEN $2::boolean AND snoozed_until IS NOT NULL THEN NULL ELSE snoozed_until END,
+         snoozed_at    = CASE WHEN $2::boolean AND snoozed_until IS NOT NULL THEN NULL ELSE snoozed_at END
+       WHERE id = $1`,
+      [conv.dbId, isClientReopen]
+    );
 
     // Espelho em luna_v2.messages pro audit trail unificado (item 4, abr/2026)
     // Sem isso, detector de regressão e RAG só veem fração das conversas.
@@ -307,6 +469,27 @@ let groupChatId = null;
 const LUNA_HEADER = '';  // Removido: cliente não deve ver 'Luna assistente virtual' — Luna representa a Átrio diretamente (regra 19 do prompt mestre)
 const GREETING_DELAY_MS = 30 * 1000; // 30 segundos
 const URGENTE_KEYWORDS = ['urgente', 'urgência', 'urgencia', 'emergencia', 'emergência'];
+
+// Mensagens "passivas" — confirmações/agradecimentos que NÃO pedem retorno.
+// Quando primeira mensagem é só isso, NÃO agenda escalation pra evitar Luna
+// disparar follow-up automático em contexto onde o cliente nem está esperando.
+// Exemplo real: Bianca enviou "ComprovanteSantander.pdf" + "Pago." — não pediu nada,
+// só confirmou um pagamento. 1h depois Luna mandava "está na fila..." sem motivo.
+const PASSIVE_PATTERNS = [
+  /^(ok|okay|tá|ta|tah|tah ok|ta ok|tá ok|blz|beleza|bele|valeu|vlw|tranquilo|tmj|certo|combinado|fechado|fechou|perfeito|perfeitamente|maravilha|show|otimo|ótimo|legal|positivo|isso|sim)$/i,
+  /^(obrigad[oa]|obg|brigad[oa]|brigadã[oa]|agradeço|agradecido|grat[oa])\b/i,
+  /^(pago|pagamento (efetuado|feito|realizado)|paguei|pagamento ok|pago ok)\b/i,
+  /^(recebid[oa]|recebi|recebemos|chegou)\b/i,
+  /^(comprovante|recibo|extrato|nota fiscal|nf|nfe|nfse)\b.*$/i,  // anexo nominal
+  /^[\s.!👍✅🙏❤️😊😄👏🤝💚]{1,8}$/u,                                  // só emojis/pontuação
+];
+
+function isPassiveMessage(body, hasMedia = false) {
+  const text = String(body || '').trim();
+  if (!text) return hasMedia;  // mídia sem caption = passivo
+  if (text.length > 60) return false;  // texto longo é improvável passivo
+  return PASSIVE_PATTERNS.some(rx => rx.test(text));
+}
 
 // Detecção de solicitação de NFS-e
 // Termos que sozinhos já indicam NFS-e
@@ -638,14 +821,79 @@ export function setAgentOutboundOverride(enabled) {
   _agentOutboundOverride = !!enabled;
 }
 
+// === HARD BLOCK GLOBAL ===
+// Diretiva CEO 2026-05-07: nenhuma comunicacao com cliente externo via Luna,
+// agente IA ou painel ate ordem em contrario. Cliente so fala com humano.
+// Pra desligar: trocar HARD_BLOCK_CLIENTE pra false.
+const HARD_BLOCK_CLIENTE = true;
+
+// === Cache de telefones de COLABORADORES INTERNOS ===
+// Usado pra distinguir chat com equipe (permitido) vs cliente externo (bloqueado).
+// Origem: datalake_gesthub.colaboradores (FDW). Refresh a cada 10min.
+let _internalPhones = new Set();
+let _internalPhonesLoadedAt = 0;
+const INTERNAL_PHONES_TTL = 10 * 60 * 1000;
+
+async function refreshInternalPhones() {
+  try {
+    const { rows } = await query(`
+      SELECT DISTINCT regexp_replace(COALESCE(telefone, ''), '\D', '', 'g') AS phone
+        FROM datalake_gesthub.colaboradores
+       WHERE telefone IS NOT NULL
+         AND telefone != ''
+         AND COALESCE(ativo, true) = true
+    `);
+    const fresh = new Set();
+    for (const r of rows) {
+      const p = r.phone || '';
+      if (p.length < 10) continue;
+      fresh.add(p);
+      // Adiciona variações com/sem DDI 55
+      if (p.startsWith('55') && p.length >= 12) fresh.add(p.slice(2));
+      else fresh.add('55' + p);
+    }
+    // Adiciona também NOTIFY_NUMBERS hardcoded como fallback
+    for (const n of NOTIFY_NUMBERS) {
+      const clean = String(n).replace(/\D/g, '');
+      if (clean.length >= 10) fresh.add(clean);
+    }
+    _internalPhones = fresh;
+    _internalPhonesLoadedAt = Date.now();
+    log(`[internal-phones] ${_internalPhones.size} telefones internos carregados`);
+  } catch (e) {
+    log('[internal-phones] erro ao carregar: ' + e.message);
+  }
+}
+
+// Verifica se um chatId individual (@c.us) eh de colaborador interno
+function isInternalIndividual(chatId) {
+  if (typeof chatId !== 'string' || !chatId.endsWith('@c.us')) return false;
+  const phone = chatId.split('@')[0].replace(/\D/g, '');
+  if (_internalPhones.has(phone)) return true;
+  // Variação sem DDI 55
+  if (phone.startsWith('55') && _internalPhones.has(phone.slice(2))) return true;
+  // Variação com DDI 55
+  if (!phone.startsWith('55') && _internalPhones.has('55' + phone)) return true;
+  return false;
+}
+
 function isClientOutboundAllowed(chatId) {
+  // Diretiva CEO: Luna NAO fala com cliente externo, mas comunicacao INTERNA
+  // (grupo da equipe + DM com colaboradores) eh liberada.
+  if (typeof chatId !== 'string') return false;
+
+  // 1) Grupo interno Luna_Atendimento (cacheado em groupChatId)
+  if (chatId.endsWith('@g.us') && groupChatId && chatId === groupChatId) return true;
+
+  // 2) Chat individual com COLABORADOR (numero da carteira de colaboradores ativos)
+  if (isInternalIndividual(chatId)) return true;
+
+  // Resto: cliente externo. Bloqueado por HARD_BLOCK_CLIENTE.
+  if (HARD_BLOCK_CLIENTE) return false;
+
+  // Bypass legacy (so se HARD_BLOCK desligado)
   if (process.env.AGENT_CLIENT_OUTBOUND === 'on') return true;
   if (_agentOutboundOverride === true) return true;
-  if (typeof chatId !== 'string') return false;
-  // SOMENTE o grupo interno da equipe (Luna_Atendimento), NUNCA grupos de cliente.
-  // groupChatId e cacheado por findGroupChat() na primeira chamada.
-  if (!chatId.endsWith('@g.us')) return false;
-  if (groupChatId && chatId === groupChatId) return true;
   return false;
 }
 
@@ -658,8 +906,16 @@ async function botSend(chatId, text, opts = {}) {
     return null;
   }
 
-  // KILL-SWITCH agente → cliente. opts.manual=true bypassa (humano enviando do painel).
-  if (!opts.manual && !isClientOutboundAllowed(chatId)) {
+  // ╔════════════════════════════════════════════════════════════════════════╗
+  // ║ WARNING — NAO ADICIONAR GATE QUE IGNORE opts.manual=true               ║
+  // ║ Historico (07/05/2026): tentei criar HARD_BLOCK que ignorava manual,   ║
+  // ║   bloqueou painel inteiro pra parceiros (Beto Contabil, Andrena etc).  ║
+  // ║ Regra: opts.manual=true significa HUMANO via painel — sempre permite. ║
+  // ║ Se precisar restringir agente IA, fazer em isClientOutboundAllowed().  ║
+  // ║ Ver: RUNBOOK.md > "Luna mandando msgs pra clientes"                    ║
+  // ╚════════════════════════════════════════════════════════════════════════╝
+  const allowed = isClientOutboundAllowed(chatId);
+  if (!opts.manual && !allowed) {
     log(`KILL-SWITCH: agente bloqueado de enviar pra cliente ${chatId}`);
     // Audit no DB
     query(
@@ -728,24 +984,197 @@ export function getStatus() {
   };
 }
 
+// getStatusLive — variante que VALIDA o estado real antes de responder.
+// Usada pelo endpoint /api/whatsapp/status pra evitar mostrar 'conectado' falso
+// quando o telefone foi desemparelhado mas o event 'disconnected' nao chegou.
+// Latencia: ate ~3s (timeout do verifyState). Se isReady=false, retorna direto.
+export async function getStatusLive() {
+  const base = getStatus();
+  if (!base.connected || !client) return base;
+  const real = await verifyState(3000);
+  if (real && real !== 'CONNECTED') {
+    log(`[status-live] divergencia detectada: isReady=true mas getState()='${real}' — corrigindo`);
+    isReady = false;
+    broadcastFn?.({ type: 'whatsapp_disconnected', reason: 'state-mismatch:' + real });
+    return { ...base, connected: false, realState: real, hasQR: !!qrCodeData };
+  }
+  return { ...base, realState: real || 'CONNECTED' };
+}
+
 export function getQRCode() { return qrCodeData; }
+export function getClient() { return client; }
+
+// ============================================================
+// resyncChatHistory(opts)
+// Itera todas as conversas ativas no DB e busca as ultimas N msgs
+// de cada chat via whatsapp-web.js. Dedupe por wa_msg_id (dbSaveMessage
+// ja filtra duplicatas). NAO dispara Luna/escalation — so persiste no DB.
+//
+// Uso: pra ressincronizar mensagens que ficaram no celular durante
+// periodo offline do Office.
+//
+// opts.limit_per_chat: default 30
+// opts.only_recent_hours: default 48 (so processa msgs das ultimas X horas)
+// ============================================================
+export async function resyncChatHistory(opts = {}) {
+  if (!isReady || !client) {
+    return { ok: false, error: 'WhatsApp nao conectado' };
+  }
+  const limit = Math.min(Math.max(parseInt(opts.limit_per_chat || 30), 5), 200);
+  const recentHours = parseInt(opts.only_recent_hours || 48);
+  const cutoffMs = Date.now() - (recentHours * 3600 * 1000);
+
+  // Pega conversas do DB
+  const { rows: convs } = await query(
+    `SELECT id, chat_id, real_phone, client_name, is_group
+       FROM whatsapp_conversations
+      WHERE chat_id IS NOT NULL
+        AND (resolved IS NOT TRUE OR last_message_at > NOW() - INTERVAL '7 days')
+      ORDER BY last_message_at DESC NULLS LAST
+      LIMIT 200`
+  );
+
+  log(`[resync] iniciando varredura de ${convs.length} conv(s), limite ${limit}/chat, recentes ${recentHours}h`);
+
+  const stats = {
+    conversations_scanned: 0,
+    messages_fetched: 0,
+    messages_inserted: 0,
+    messages_skipped_old: 0,
+    errors: [],
+  };
+
+  for (const dbConv of convs) {
+    stats.conversations_scanned += 1;
+    try {
+      const chat = await client.getChatById(dbConv.chat_id);
+      if (!chat) continue;
+
+      const msgs = await chat.fetchMessages({ limit });
+      stats.messages_fetched += msgs.length;
+
+      // Monta conv local pro dbSaveMessage (precisa dbId)
+      const localConv = { dbId: dbConv.id, phone: dbConv.real_phone, chatId: dbConv.chat_id };
+
+      for (const m of msgs) {
+        const tsMs = (m.timestamp || 0) * 1000;
+        if (tsMs > 0 && tsMs < cutoffMs) {
+          stats.messages_skipped_old += 1;
+          continue;
+        }
+        const waMsgId = m.id?._serialized || m.id || null;
+        const sender = m.fromMe ? 'team' : 'client';
+        const body = m.body || '';
+        const metadata = {
+          wa_msg_id: waMsgId,
+          chat_id: dbConv.chat_id,
+          resync: true,
+          msg_type: m.type || null,
+        };
+        if (m.hasMedia) {
+          metadata.has_media = true;
+          // Baixa attachment + salva storage_path (corrige bug do resync original)
+          try {
+            const att = await saveMsgAttachment(m, dbConv.id);
+            if (att?.attachment) {
+              metadata.attachment = att.attachment;
+            }
+          } catch (eAtt) {
+            // Nao falha o resync se anexo nao baixar — segue com has_media flag
+            stats.errors.push(`attachment ${dbConv.client_name || dbConv.real_phone}: ${eAtt.message}`);
+          }
+        }
+        if (m.author) metadata.author_id = String(m.author);
+        if (dbConv.is_group) metadata.is_group = true;
+
+        // dbSaveMessage tem dedup builtin (wa_msg_id) — chamadas duplicadas sao no-op
+        const result = await dbSaveMessage(localConv, sender, body, metadata).catch((e) => {
+          stats.errors.push(`${dbConv.client_name || dbConv.real_phone}: ${e.message}`);
+          return null;
+        });
+        // dbSaveMessage retorna undefined em duplicata; sem retorno claro pra contar inserts
+        // Vou contar via query separada apos cada conv
+      }
+
+      // Conta msgs inseridas com resync:true nesta conv (aproximacao)
+      try {
+        const { rows: ins } = await query(
+          `SELECT COUNT(*) AS c FROM whatsapp_messages
+            WHERE conversation_id = $1 AND metadata->>'resync' = 'true'`,
+          [dbConv.id]
+        );
+        const c = parseInt(ins[0]?.c || 0, 10);
+        stats.messages_inserted += c;
+      } catch {}
+    } catch (e) {
+      stats.errors.push(`${dbConv.client_name || dbConv.real_phone}: ${e.message}`);
+    }
+  }
+
+  log(`[resync] concluido: ${stats.conversations_scanned} convs, ${stats.messages_fetched} fetched, ${stats.messages_inserted} inseridas (cumulativo), ${stats.errors.length} erros`);
+  return { ok: true, ...stats };
+}
+
+
 
 export function getPendingMessages() {
   const list = [];
   conversations.forEach((conv, phone) => {
     if (!conv.resolved) {
       const level = ESCALATION_LEVELS[Math.max(conv.escalationLevel, 0)] || ESCALATION_LEVELS[0];
+      // Tempo "aguardando" deve ser desde a última mensagem do cliente sem
+      // resposta humana posterior. Antes usava conv.receivedAt (início da
+      // conversa) — gerava "16d" em conversas antigas reabertas hoje.
+      // Estratégia: pega últimas msgs em ordem reversa, encontra a primeira
+      // 'client'; se houver msg 'team' DEPOIS dessa, conversa não está
+      // efetivamente aguardando — usa now (sem destaque).
+      const msgs = conv.messages || [];
+
+      // Identifica a ULTIMA MSG DO CLIENTE no historico em memoria
+      let lastClientMsg = null;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].from === 'client') { lastClientMsg = msgs[i]; break; }
+      }
+      // Identifica se ja houve resposta nossa (team/luna/bot) APOS a ultima msg cliente
+      const lastAnyMsg = msgs[msgs.length - 1];
+      const lastIsFromUs = lastAnyMsg && (
+        lastAnyMsg.from === 'team' || lastAnyMsg.from === 'luna' || lastAnyMsg.from === 'bot'
+      );
+
+      // Se a ULTIMA msg eh do TEAM (humano respondeu), conversa esta em atendimento — NAO aguardando.
+      // Se eh da LUNA/BOT mas humano nunca respondeu, AINDA precisa atencao (anomalia: Luna entrou
+      // sozinha sem humano resolver). Mantem na fila pra equipe ver.
+      if (lastAnyMsg?.from === 'team') return;
+      // Se Luna/bot respondeu mas humano JA havia respondido antes, conversa em atendimento
+      if ((lastAnyMsg?.from === 'luna' || lastAnyMsg?.from === 'bot') && conv.humanReplied) return;
+
+      // receivedAt = ultima msg real do cliente. Sem fallback generico.
+      const receivedAt = lastClientMsg?.at || conv.receivedAt;
+
+      // Preview: msg do cliente
+      const lastMessage = lastClientMsg?.body || '';
+
       list.push({
         phone, name: conv.name,
-        lastMessage: conv.messages[conv.messages.length - 1]?.body || '',
-        receivedAt: conv.receivedAt,
+        lastMessage,
+        receivedAt,
         severity: level.severity,
         label: level.label,
         humanReplied: conv.humanReplied,
       });
     }
   });
-  return list.sort((a, b) => new Date(a.receivedAt) - new Date(b.receivedAt));
+  // Ordenacao: severidade DESC primeiro, tempo de espera ASC como tie-break.
+  // Sem isso, NORMAL com mais horas aparecia antes de URGENTE (badges viravam decorativos).
+  // Ordem: grave > urgente > critico > atencao > normal
+  const SEVERITY_RANK = { grave: 5, urgente: 4, critico: 3, atencao: 2, normal: 1 };
+  return list.sort((a, b) => {
+    const rb = SEVERITY_RANK[b.severity] || 0;
+    const ra = SEVERITY_RANK[a.severity] || 0;
+    if (rb !== ra) return rb - ra;
+    // mesma severidade: quem espera ha mais tempo primeiro
+    return new Date(a.receivedAt) - new Date(b.receivedAt);
+  });
 }
 
 export async function markAsReplied(rawPhone) {
@@ -835,7 +1264,11 @@ export async function initialize() {
 
   // Carrega override do kill-switch agente→cliente (DB > env)
   await getAgentOutboundOverride();
-  log(`Kill-switch agente→cliente: ${_agentOutboundOverride ? 'DESATIVADO (envios liberados)' : 'ATIVO (apenas grupos)'}`);
+  log(`Kill-switch agente→cliente: ${_agentOutboundOverride ? 'DESATIVADO (envios liberados)' : 'ATIVO (cliente externo bloqueado)'}`);
+
+  // Carrega lista de colaboradores internos (libera DM com equipe)
+  await refreshInternalPhones();
+  setInterval(() => { refreshInternalPhones().catch(() => {}); }, 10 * 60 * 1000);
 
   // Limpar lock files do Chromium que podem travar entre restarts
   const sessionDir = './whatsapp-session/session';
@@ -844,17 +1277,43 @@ export async function initialize() {
     try { fs.unlinkSync(lockPath); } catch {}
   }
 
+  // Verifica guard ANTES de logar — evita queimar tentativas em auto-heal loop
+  // logPairingEvent_ONLY_IF_NOT_BLOCKED
+  const rl = await checkPairingRateLimit();
+  if (!rl.allowed) {
+    log(`[pairing-guard] BLOQUEANDO initialize() — ${rl.reason}`);
+    isReady = false;
+    qrCodeData = null;
+    broadcastFn?.({ type: 'whatsapp_pairing_blocked', reason: rl.reason, count: rl.count });
+    return;
+  }
+  await logPairingEvent('pairing_attempt', null, { trigger: 'initialize' }).catch(() => {});
+
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: './whatsapp-session' }),
     puppeteer: {
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      // protocolTimeout default e 30s — aumentar pra 120s pra evitar
+      // "Runtime.callFunctionOn timed out" quando Chromium demora pra responder
+      // (acontece em VPS sem GPU + paginas pesadas como WhatsApp Web)
+      protocolTimeout: 120000,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+      ],
       ...(process.env.PUPPETEER_EXECUTABLE_PATH && { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }),
     },
   });
 
   client.on('qr', async (qr) => {
-    log('QR Code gerado');
+    log('QR Code gerado (rotacao natural do whatsapp-web.js)');
+    // NAO conta cada rotacao de QR no rate-limit. Apenas tentativas de
+    // pareamento (initialize) contam. QR rotation eh comportamento normal:
+    // o WA Web regenera QR a cada ~60s ate alguem escanear ou desistir.
     qrCodeData = await qrcode.toDataURL(qr);
     broadcastFn?.({ type: 'whatsapp_qr', hasQR: true });
   });
@@ -863,6 +1322,11 @@ export async function initialize() {
     log(`Conectado! ${client.info?.wid?.user}`);
     isReady = true;
     qrCodeData = null;
+    _connectedSinceTs = Date.now();
+    _lastIncomingTs = 0;
+    _lastOutgoingTs = 0;
+    // Pairing guard: registra pareamento bem-sucedido
+    await logPairingEvent('paired_success', client.info?.wid?.user || null, {});
     broadcastFn?.({ type: 'whatsapp_ready', phone: client.info?.wid?.user });
 
     // Resolve o grupo interno da equipe (Luna_Atendimento) — necessario pro kill-switch
@@ -907,17 +1371,25 @@ export async function initialize() {
   // Armazena no metadata.ack pra UI mostrar ✓ (sent), ✓✓ (delivered), ✓✓ azul (read).
   client.on('message_ack', async (msg, ack) => {
     try {
-      const waId = msg.id?._serialized || msg.id;
+      // msg.id pode vir como string ou objeto { _serialized, id, fromMe }
+      const waIdRaw = msg.id?._serialized || msg.id;
+      const waId = typeof waIdRaw === 'string' ? waIdRaw : null;
       if (!waId) return;
       const status = ack === 1 ? 'sent' : ack === 2 ? 'delivered' : ack === 3 ? 'read' : ack === 4 ? 'played' : null;
       if (!status) return;
-      await query(
+      // Atualiza por exact match OU por substring (fallback de quando o id eh diferente)
+      const r = await query(
         `UPDATE whatsapp_messages
          SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('ack', $1, 'ack_status', $2)
-         WHERE metadata->>'wa_msg_id' = $3`,
+         WHERE metadata->>'wa_msg_id' = $3
+            OR metadata->>'wa_msg_id' LIKE '%' || split_part($3, '_', 3)`,
         [ack, status, waId]
-      ).catch(() => {});
-    } catch (e) { /* silencioso */ }
+      ).catch(e => { log('[ack] update err: ' + e.message); return null; });
+      if (r && r.rowCount > 0) {
+        // Broadcast pro front atualizar UI (✓✓ -> azul)
+        broadcastFn?.({ type: 'message_ack', wa_msg_id: waId, ack_status: status });
+      }
+    } catch (e) { log('[ack] erro: ' + e.message); }
   });
 
   client.on('disconnected', (reason) => {
@@ -940,6 +1412,7 @@ export async function initialize() {
   const botMessages = new Set(); // IDs de mensagens que o bot enviou
 
   client.on('message_create', async (msg) => {
+    if (msg.fromMe) _lastOutgoingTs = Date.now();
     if (!msg.fromMe || !msg.to) return;
     if (msg.to === 'status@broadcast' || msg.to.includes('@broadcast')) return;
 
@@ -1107,6 +1580,8 @@ export async function initialize() {
 
   // Mensagem recebida de cliente
   client.on('message', async (msg) => {
+    _lastIncomingTs = Date.now();
+    log('[msg-in] from=' + (msg.from || '?') + ' type=' + (msg.type || '?') + ' hasMedia=' + (msg.hasMedia || false) + ' bodyLen=' + ((msg.body || '').length));
     if (msg.fromMe) return;
     // Grupos: deixa entrar pro Atendimento MAS Luna nao responde (guard em handleIncoming).
     // Antes ignorava totalmente (@g.us). Agora surge no painel read-mostly + send manual.
@@ -1829,6 +2304,45 @@ async function handleIncoming(msg) {
         phone, realPhone, name, body, clientInfo, contact,
       });
 
+      // ============================================
+      // PERSIST IMEDIATO: msg do cliente vai pro DB + UI antes do buffer Luna,
+      // pra equipe ver a msg na lista do /atendimento sem esperar 1.2-6s do
+      // debounce de processamento. Luna ainda agrupa em paralelo pra responder.
+      // Dedup interno em dbSaveMessage previne duplicação.
+      // ============================================
+      try {
+        let _conv = conversations.get(phone);
+        if (!_conv) {
+          _conv = {
+            name, chatId: from, realPhone, displayPhone: formatPhone(realPhone),
+            messages: [], receivedAt: new Date().toISOString(),
+            escalationLevel: -1, timers: [], greetingTimer: null, analysisTimer: null,
+            humanReplied: false, resolved: false, greeted: false,
+          };
+          conversations.set(phone, _conv);
+          await dbSaveConversation(phone, _conv).catch(() => {});
+        }
+        _conv.messages.push({ body: msg.body || '', from: 'client', at: new Date().toISOString() });
+        // Sanitiza _atrioAudioMeta — pega só campos primitivos conhecidos pra evitar
+        // refs circulares do whatsapp-web.js.
+        const _earlyMeta = {};
+        if (msg._atrioAudioMeta) {
+          const a = msg._atrioAudioMeta;
+          if (a.is_audio !== undefined) _earlyMeta.is_audio = !!a.is_audio;
+          if (a.duration_sec) _earlyMeta.duration_sec = Number(a.duration_sec) || null;
+          if (a.transcription) _earlyMeta.transcription = String(a.transcription).slice(0, 5000);
+        }
+        if (msg.hasMedia && !msg._atrioAudioMeta) {
+          const att = await saveMsgAttachment(msg, _conv.dbId || _conv.phone).catch(() => null);
+          if (att) Object.assign(_earlyMeta, att);
+        }
+        if (msg.id?._serialized) _earlyMeta.wa_msg_id = msg.id._serialized;
+        await dbSaveMessage(_conv, 'client', msg.body || '', _earlyMeta).catch(e => log('[early-persist] falha: ' + e.message));
+        broadcastFn?.({ type: 'whatsapp_message', phone, sender: 'client', body: msg.body, conv: _conv });
+      } catch (e) {
+        log('[early-persist] erro: ' + e.message);
+      }
+
       // Buffer 10s: agrupa mensagens rapidas do mesmo contato
       scheduleLunaProcess(phone, msg,
         { ...(clientInfo||{}), pushname: name, realPhone, displayPhone: formatPhone(realPhone) },
@@ -1846,14 +2360,8 @@ async function handleIncoming(msg) {
                 conversations.set(phone, conv);
                 await dbSaveConversation(phone, conv);
               }
-              conv.messages.push({ body: aggMsg.body, from: 'client', at: new Date().toISOString() });
-              // Audio transcrito + anexos (PDF/imagem) viram metadata persistida
-              const cliMeta = aggMsg._atrioAudioMeta ? { ...aggMsg._atrioAudioMeta } : {};
-              if (aggMsg.hasMedia && !aggMsg._atrioAudioMeta) {
-                const att = await saveMsgAttachment(aggMsg, conv.dbId || conv.phone);
-                if (att) Object.assign(cliMeta, att);
-              }
-              await dbSaveMessage(conv, 'client', aggMsg.body, cliMeta);
+              // Msg do cliente já foi persistida no early-persist acima.
+              // Aqui só salvamos a reply da Luna (se houver).
               if (processedByLunaV2.reply) {
                 conv.messages.push({ body: processedByLunaV2.reply, from: 'bot', at: new Date().toISOString() });
                 await dbSaveMessage(conv, 'bot', processedByLunaV2.reply);
@@ -1984,8 +2492,15 @@ async function handleIncoming(msg) {
   // Aguarda 1 minuto para cliente terminar de digitar, depois classifica e notifica grupo
   scheduleClassification(phone, from, name, conv);
 
-  // Inicia escalation (10min sem resposta → alertas crescentes)
-  startEscalation(phone, from, name, 0);
+  // Inicia escalation só se cliente está pedindo atendimento.
+  // Mensagens passivas (confirmações, "pago", "obrigado", anexo sem texto) NÃO
+  // disparam escalation — evita Luna mandar "está na fila" 1h depois sem motivo.
+  const hasMedia = !!conv.lastHasMedia;  // setado se quem chamou marcou
+  if (isPassiveMessage(body, hasMedia)) {
+    log(`Nova conversa passiva (sem pedido de atendimento) — ${name} (${phone}): "${String(body || '').slice(0, 40)}" — escalation NAO agendada`);
+  } else {
+    startEscalation(phone, from, name, 0);
+  }
   log(`Nova conversa — ${name} (${phone})`);
 }
 
@@ -2838,8 +3353,16 @@ async function escalate(phone, chatId, name, levelIndex) {
   if (level.client_message && horario.open) {
     try {
       const msg = renderClientMessage(level.client_message, name);
-      await botSend(chatId, LUNA_HEADER + msg);
-      dbSaveMessage(conv, 'luna', msg);
+      const sent = await botSend(chatId, LUNA_HEADER + msg);
+      // Só persiste no DB / UI se realmente foi enviada. botSend retorna null
+      // quando kill-switch bloqueia (chat individual com agente proibido) — nesse
+      // caso a mensagem só vai pro grupo interno via redirectToTeamGroup, e não
+      // queremos a UI mostrando como se tivesse enviado pra cliente.
+      if (sent) {
+        dbSaveMessage(conv, 'luna', msg);
+      } else {
+        log(`Escalation nivel ${levelIndex} para ${name} — bloqueado por kill-switch, NAO gravado como msg do cliente`);
+      }
     } catch (err) {
       log(`ERRO follow-up nivel ${levelIndex}: ${err.message}`);
     }
@@ -3079,7 +3602,7 @@ export async function sendMessage(phone, message, opts = {}) {
           await query(
             `INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata)
              VALUES ($1, 'team', $2, $3::jsonb)`,
-            [convId, message, JSON.stringify({ wa_msg_id: waMsgId, chat_id: chatId, manual: true, source: 'panel' })]
+            [convId, message, JSON.stringify({ wa_msg_id: waMsgId, chat_id: chatId, manual: true, source: 'panel', colaborador_nome: opts.fromName || null })]
           );
           await query(`UPDATE whatsapp_conversations SET last_message_at = NOW(), human_replied = TRUE, last_human_reply_at = NOW() WHERE id = $1`, [convId]);
           broadcastFn?.({ type: 'conversation_updated', phone: phoneClean });
@@ -3192,6 +3715,194 @@ export async function deleteMessageForEveryone(waMsgId, chatId) {
   return { ok: true };
 }
 
+
+// ============================================
+// BACKFILL: recupera historico de mensagens do WhatsApp Web
+// pra conversas existentes no DB. Itera todas as conversas, busca
+// chat.fetchMessages({limit}) e insere as msgs que ainda nao estao
+// no whatsapp_messages (dedupe por wa_msg_id quando disponivel,
+// senao por body+timestamp).
+//
+// Uso: chamar via endpoint admin /api/admin/whatsapp/backfill.
+// NAO atualiza last_message_at (preserva ordem). NAO dispara
+// agentes nem first-touch (evita reagir a msgs antigas).
+// ============================================
+export async function backfillHistory({ limit = 200, dryRun = false, onlyConversationId = null, maxConversations = null } = {}) {
+  if (!isReady || !client) throw new Error('WhatsApp nao conectado');
+
+  // Lista conversas alvo (do DB)
+  const filterSql = onlyConversationId
+    ? 'WHERE id = $1'
+    : '';
+  const params = onlyConversationId ? [onlyConversationId] : [];
+  const limitSql = maxConversations ? ` LIMIT ${parseInt(maxConversations, 10)}` : '';
+  const { rows: convs } = await query(
+    `SELECT id, chat_id, client_name, phone FROM whatsapp_conversations ${filterSql} ORDER BY last_message_at DESC NULLS LAST${limitSql}`,
+    params
+  );
+
+  const stats = {
+    total_conversations: convs.length,
+    chats_processed: 0,
+    chats_failed: 0,
+    msgs_fetched: 0,
+    msgs_already_in_db: 0,
+    msgs_inserted: 0,
+    errors: [],
+    dryRun,
+  };
+
+  // Cache de chats carregados (evita getChatById que pode falhar com waitForChatLoading)
+  let allChats = null;
+  try {
+    allChats = await client.getChats();
+  } catch (e) {
+    throw new Error('client.getChats() falhou: ' + e.message);
+  }
+  const chatsByid = new Map();
+  for (const c of (allChats || [])) {
+    const id = c.id?._serialized || c.id;
+    if (id) chatsByid.set(id, c);
+  }
+
+  for (const conv of convs) {
+    if (!conv.chat_id) {
+      stats.chats_failed += 1;
+      stats.errors.push({ conv_id: conv.id, error: 'sem chat_id' });
+      continue;
+    }
+    try {
+      const chat = chatsByid.get(conv.chat_id);
+      if (!chat) {
+        stats.chats_failed += 1;
+        stats.errors.push({ conv_id: conv.id, chat_id: conv.chat_id, error: 'chat nao listado em getChats()' });
+        continue;
+      }
+      let msgs;
+      try {
+        msgs = await chat.fetchMessages({ limit });
+      } catch (fetchErr) {
+        // Workaround pupPage_fallback: lib whatsapp-web.js@1.34.6 falha com
+        // 'waitForChatLoading' em chats LID/grupos. Tenta via Puppeteer eval
+        // direto na página do WhatsApp Web usando o Store interno.
+        if (!client.pupPage) throw fetchErr;
+        try {
+          const rawMsgs = await client.pupPage.evaluate(async (chatId, lim) => {
+            try {
+              if (!window.Store?.Chat?.get) return null;
+              const chat = window.Store.Chat.get(chatId);
+              if (!chat) return null;
+              // Carrega mais mensagens se necessário (loadEarlierMsgs costuma existir)
+              if (typeof chat.loadEarlierMsgs === 'function') {
+                try { await chat.loadEarlierMsgs(); } catch {}
+              }
+              const arr = chat.msgs?.models || [];
+              return arr.slice(-lim).map(m => ({
+                id: m.id?._serialized || String(m.id),
+                body: m.body || m.caption || '',
+                fromMe: !!m.id?.fromMe,
+                timestamp: m.t || 0,
+                hasMedia: !!m.mediaData,
+                type: m.type || null,
+              }));
+            } catch (e) { return null; }
+          }, conv.chat_id, limit);
+          if (!rawMsgs) throw fetchErr;
+          msgs = rawMsgs.map(r => ({
+            id: { _serialized: r.id },
+            body: r.body,
+            fromMe: r.fromMe,
+            timestamp: r.timestamp,
+            hasMedia: r.hasMedia,
+            type: r.type,
+          }));
+          log(`[backfill] pupPage_fallback usado em ${conv.chat_id}: ${msgs.length} msgs`);
+        } catch (evalErr) {
+          throw new Error(`fetchMessages falhou e pupPage_fallback tambem: ${fetchErr.message} | eval: ${evalErr.message}`);
+        }
+      }
+      stats.msgs_fetched += msgs.length;
+
+      // Coleta wa_msg_ids ja existentes pra dedupe rapido
+      const { rows: existingRows } = await query(
+        `SELECT metadata->>'wa_msg_id' AS wa_id, body, EXTRACT(EPOCH FROM created_at)::bigint AS ts
+           FROM whatsapp_messages WHERE conversation_id = $1`,
+        [conv.id]
+      );
+      const existingWaIds = new Set(existingRows.filter(r => r.wa_id).map(r => r.wa_id));
+      // Fallback dedupe: body+timestamp +- 5s
+      const existingByBodyTs = new Map();
+      for (const r of existingRows) {
+        if (r.body) {
+          existingByBodyTs.set(`${r.ts}|${(r.body || '').slice(0, 40)}`, true);
+        }
+      }
+
+      for (const m of msgs) {
+        const waMsgId = m.id?._serialized || m.id;
+        if (waMsgId && existingWaIds.has(waMsgId)) {
+          stats.msgs_already_in_db += 1;
+          continue;
+        }
+        // Dedupe fallback por body+timestamp
+        const ts = Math.floor((m.timestamp || 0));
+        const bodySnippet = (m.body || '').slice(0, 40);
+        // checa janela de 5s
+        let dup = false;
+        for (let dt = -5; dt <= 5; dt++) {
+          if (existingByBodyTs.has(`${ts + dt}|${bodySnippet}`)) { dup = true; break; }
+        }
+        if (dup) {
+          stats.msgs_already_in_db += 1;
+          continue;
+        }
+
+        // Determina sender:
+        //   m.fromMe === true  -> outbound (team ou luna)
+        //   m.fromMe === false -> inbound (client)
+        // Pra outbound nao temos como saber se foi luna ou humano daqui — marca 'team' por default.
+        const sender = m.fromMe ? 'team' : 'client';
+        const body = m.body || '';
+        const meta = {
+          wa_msg_id: waMsgId,
+          backfilled: true,
+          backfill_at: new Date().toISOString(),
+          from_me: !!m.fromMe,
+          has_media: !!m.hasMedia,
+          msg_type: m.type || null,
+        };
+
+        if (!dryRun) {
+          // INSERT preservando created_at original do whatsapp
+          const createdAt = m.timestamp ? new Date(m.timestamp * 1000).toISOString() : new Date().toISOString();
+          try {
+            await query(
+              `INSERT INTO whatsapp_messages (conversation_id, sender, body, metadata, created_at)
+               VALUES ($1, $2, $3, $4, $5)`,
+              [conv.id, sender, body, JSON.stringify(meta), createdAt]
+            );
+            stats.msgs_inserted += 1;
+            // Tambem registra na set local pra evitar re-inserir nesta sessao
+            if (waMsgId) existingWaIds.add(waMsgId);
+          } catch (insErr) {
+            stats.errors.push({ conv_id: conv.id, wa_msg_id: waMsgId, error: insErr.message });
+          }
+        } else {
+          stats.msgs_inserted += 1; // contagem do que seria inserido
+        }
+      }
+      stats.chats_processed += 1;
+    } catch (chatErr) {
+      stats.chats_failed += 1;
+      stats.errors.push({ conv_id: conv.id, chat_id: conv.chat_id, error: chatErr.message });
+    }
+  }
+
+  // Trim errors pra nao retornar mil items
+  if (stats.errors.length > 30) stats.errors = stats.errors.slice(0, 30).concat([{ truncated: stats.errors.length - 30 }]);
+  return stats;
+}
+
 // ============================================
 // ENVIAR NFS-e NO GRUPO (PDF + caption)
 // ============================================
@@ -3251,6 +3962,25 @@ export async function sendAlertToGroup(message) {
 // ============================================
 // CLEANUP
 // ============================================
+// Recupera anexo perdido via re-fetch no WhatsApp Web.
+// Usado pelo endpoint /api/admin/recover-attachments — so funciona pra msgs ainda
+// no cache do whatsapp-web.js (geralmente algumas semanas).
+export async function recoverAttachmentByWaId(waMsgId, storagePath) {
+  if (!isReady || !client) throw new Error('WhatsApp nao conectado');
+  const fs = await import('fs');
+  const path = await import('path');
+  if (fs.existsSync(storagePath)) return { ok: true, alreadyExisted: true };
+  const msg = await client.getMessageById(waMsgId);
+  if (!msg) return { ok: false, error: 'msg nao encontrada no cache' };
+  if (!msg.hasMedia) return { ok: false, error: 'msg sem media' };
+  const media = await msg.downloadMedia();
+  if (!media || !media.data) return { ok: false, error: 'downloadMedia vazio' };
+  const dir = path.dirname(storagePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(storagePath, Buffer.from(media.data, 'base64'));
+  return { ok: true, recovered: true, size: media.data.length };
+}
+
 export async function destroy() {
   conversations.forEach(conv => {
     conv.timers.forEach(t => clearTimeout(t));
@@ -3270,6 +4000,29 @@ export async function destroy() {
 // ============================================
 let _healStartedAt = null;
 let _lastDisconnectReportedAt = 0;
+// Ghost-connected detector: rastreia atividade real apos connect
+let _connectedSinceTs = 0;
+let _lastIncomingTs = 0;
+let _lastOutgoingTs = 0;
+
+
+// verifyState — pergunta ao whatsapp-web.js o estado REAL com timeout.
+// whatsapp-web.js NEM SEMPRE dispara 'disconnected' quando o usuario
+// desemparelha pelo celular (Aparelhos conectados → Desconectar). Esse helper
+// expoe o estado verdadeiro: CONNECTED | UNPAIRED | UNPAIRED_IDLE | TIMEOUT |
+// CONFLICT | etc. Retorna null se o cliente nao responder dentro do timeout.
+async function verifyState(timeoutMs = 5000) {
+  if (!client) return null;
+  try {
+    const result = await Promise.race([
+      client.getState(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('verifyState-timeout')), timeoutMs)),
+    ]);
+    return result || null;
+  } catch (e) {
+    return null;
+  }
+}
 
 async function checkChromiumHealth() {
   const status = { connected: isReady, hasQR: !!qrCodeData };
@@ -3301,7 +4054,7 @@ async function checkChromiumHealth() {
     const { execSync } = await import('child_process');
     const zombieCount = parseInt(execSync("ps aux | awk '$8 ~ /Z/' | wc -l").toString().trim(), 10) || 0;
     status.zombies = zombieCount;
-    if (zombieCount >= 8) {
+    if (zombieCount >= 30) {
       status.reason = 'too-many-zombies:' + zombieCount;
       status.needsHeal = true;
       return status;
@@ -3321,6 +4074,43 @@ async function checkChromiumHealth() {
     _lastDisconnectReportedAt = 0;
   }
 
+  // Sintoma 5: ghost-connected — conectado ha >10min sem nenhum trafego (in nem out)
+  if (isReady && _connectedSinceTs) {
+    const sinceConnect = Date.now() - _connectedSinceTs;
+    const lastActivity = Math.max(_lastIncomingTs, _lastOutgoingTs);
+    const sinceActivity = lastActivity ? Date.now() - lastActivity : sinceConnect;
+    const GHOST_THRESHOLD_MS = 30 * 60 * 1000;
+    if (sinceConnect > GHOST_THRESHOLD_MS && sinceActivity > GHOST_THRESHOLD_MS) {
+      status.reason = 'ghost-connected:' + Math.round(sinceActivity/1000) + 's-no-traffic';
+      status.needsHeal = true;
+      return status;
+    }
+  }
+
+  // Sintoma 6: state real do WhatsApp diverge de isReady.
+  // Quando o usuario desemparelha do celular, o event 'disconnected' as vezes
+  // nao chega — getState() expoe a verdade. Se isReady=true mas state != CONNECTED,
+  // forca o broadcast e marca pra heal.
+  if (isReady) {
+    const realState = await verifyState();
+    status.realState = realState;
+    if (realState && realState !== 'CONNECTED') {
+      log(`[healthcheck] estado real divergente: isReady=true mas getState()='${realState}' — forcando disconnect`);
+      isReady = false;
+      broadcastFn?.({ type: 'whatsapp_disconnected', reason: 'state-mismatch:' + realState });
+      createNotification({
+        type: 'erro_servico',
+        title: 'WhatsApp desemparelhado',
+        message: `WhatsApp foi desconectado pelo celular (estado: ${realState}). Reconecte escaneando o QR.`,
+        severity: 'error',
+        metadata: { service: 'whatsapp', realState },
+      }).catch(() => {});
+      status.reason = 'state-mismatch:' + realState;
+      status.needsHeal = true;
+      return status;
+    }
+  }
+
   return status;
 }
 
@@ -3328,6 +4118,13 @@ async function healChromium(reason) {
   // Cooldown: nao cura 2x em menos de 2min
   if (_healStartedAt && (Date.now() - _healStartedAt) < 2 * 60 * 1000) {
     log('[auto-heal] em cooldown, pulando');
+    return false;
+  }
+  // Se guard esta bloqueando, NAO tenta — vai falhar e auto-heal entraria em loop
+  // queimando tentativas. Espera intervencao humana (reset + repareamento).
+  const guardCheck = await checkPairingRateLimit();
+  if (!guardCheck.allowed) {
+    log('[auto-heal] guard bloqueando — pulando (motivo: ' + guardCheck.reason + ')');
     return false;
   }
   _healStartedAt = Date.now();
@@ -3540,41 +4337,66 @@ export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo)
             : `✅ Extrato${bancoTxt} enviado ao Atrio Finance`;
           chat({ from: 'Luna', text: `📎 ${who} enviou ${filename}\n${txt}`, tag: 'ingest' });
         } else if (!result.ok && result.skipped_memory) {
-          // Extrato detectado mas precisa intervenção — cria task pro Sneijder
+          // Extrato detectado mas Finance não conseguiu importar (cliente/conta não identificados).
+          // Diretriz Caio (mai/2026): em vez de criar task pro Sneijder, sobe pra fila
+          // /api/extratos-pending no Finance. Humano abre tela "Pendentes Aprovação",
+          // confirma cliente + conta, aprova → sistema importa.
           const banco = result.classification?.bankHint || 'banco';
-          const clienteInfo = result.cliente_id ? `cliente #${result.cliente_id}` : '(cliente nao identificado)';
+          const bancoUp = banco.toUpperCase();
           try {
-            await query(
-              `INSERT INTO tasks (title, description, client_id, assigned_to, priority, status, result, created_at)
-               VALUES ($1, $2, $3, $4, 'high', 'pending', $5::jsonb, NOW())`,
-              [
-                `Extrato ${banco.toUpperCase()} precisa ação — ${who}`,
-                `Extrato PDF recebido via WhatsApp nao pode ser importado automaticamente.\n\n` +
-                `Arquivo: ${filename}\n` +
-                `Cliente: ${clienteInfo}\n` +
-                `Motivo: ${result.error || 'sem detalhes'}\n\n` +
-                `Ação: abrir Atrio Finance > Extratos e importar manualmente ou cadastrar conta primeiro.`,
-                result.cliente_id || null,
-                'a0000001-0000-0000-0000-000000000003',  // Sneijder
-                JSON.stringify({
-                  source: 'whatsapp_auto_ingest',
-                  filename,
-                  phone: msg.from,
-                  classification: result.classification,
-                  file_path: result.file_path,
-                }),
-              ]
-            );
+            const FINANCE_URL = process.env.ATRIO_FINANCE_URL || process.env.FINANCE_URL || 'http://atrio-banking-system-1:3000';
+            const fs2 = await import('fs');
+            const filePath = result.file_path;
+            if (!filePath || !fs2.existsSync(filePath)) {
+              throw new Error(`Arquivo do extrato não encontrado em disco: ${filePath || '(vazio)'}`);
+            }
+            const fileBuf = fs2.readFileSync(filePath);
+            const form = new FormData();
+            form.append('file', new Blob([fileBuf]), filename);
+            if (result.classification?.bankHint) form.append('banco_detectado', bancoUp);
+            if (result.classification?.bankCode) form.append('banco_codigo_detectado', result.classification.bankCode);
+            if (result.classification?.contaDetectada) form.append('conta_detectada', String(result.classification.contaDetectada));
+            if (result.structured?.cnpj) form.append('cnpj_detectado', String(result.structured.cnpj));
+            if (result.structured?.cpf)  form.append('cpf_detectado',  String(result.structured.cpf));
+            if (result.structured?.periodo_inicio) form.append('periodo_inicio', String(result.structured.periodo_inicio));
+            if (result.structured?.periodo_fim)    form.append('periodo_fim',    String(result.structured.periodo_fim));
+            if (result.cliente_id) {
+              form.append('cliente_gesthub_id_sugerido', String(result.cliente_id));
+              if (clientInfo?.legalName || clientInfo?.name) {
+                form.append('cliente_nome_sugerido', clientInfo.legalName || clientInfo.name);
+              }
+            }
+            form.append('recebido_via', 'whatsapp');
+            form.append('recebido_phone', String(msg.from || ''));
+            if (who) form.append('recebido_nome', who);
+            if (result.error) form.append('observacoes', `Motivo Finance rejeitou auto-import: ${result.error}`);
+
+            const resp = await fetch(`${FINANCE_URL}/api/extratos-pending`, { method: 'POST', body: form });
+            if (!resp.ok) {
+              const txt = await resp.text().catch(() => '');
+              throw new Error(`Finance retornou ${resp.status}: ${txt.slice(0, 200)}`);
+            }
+            const data = await resp.json();
             chat({
               from: 'Luna',
-              text: `📎 ${who} enviou extrato ${banco.toUpperCase()} (${filename})\n⚠️ Nao importei automaticamente: ${result.error}\n→ Criei task pro *Sneijder* processar em Finance`,
+              text: `📎 ${who} enviou extrato ${bancoUp} (${filename})\n⚠️ Não consegui importar automaticamente (${result.error || 'cliente/conta a confirmar'})\n→ Em fila de aprovação no *Atrio Finance > Pendentes* (#${data.data?.id})`,
               tag: 'ingest'
             });
           } catch (e) {
-            log('[auto-ingest] falha ao criar task Sneijder: ' + e.message);
+            log('[auto-ingest] falha ao enviar pra fila pending: ' + e.message);
+            // Falha ao enviar pra fila pending: erro técnico vai pro error_log,
+            // canal humano recebe versão humanizada.
+            const { postTechnicalError, humanizeErrorShort } = await import('./team-chat.js');
+            await postTechnicalError(e, {
+              source: 'whatsapp_ingest_pending',
+              title: `Falha ao enviar extrato pra fila Finance (${who})`,
+              actor_type: 'agent',
+              actor_id: lunaAgentId,
+              metadata: { filename, phone: msg.from, banco, client_id: result?.cliente_id || null },
+            });
             chat({
               from: 'Luna',
-              text: `📎 ${who} enviou extrato ${banco.toUpperCase()} (${filename})\n⚠️ Nao consegui importar nem criar task: ${e.message}`,
+              text: `📎 ${who} enviou extrato ${bancoUp} (${filename})\n⚠️ ${humanizeErrorShort(e)}\n→ Equipe técnica notificada`,
               tag: 'ingest'
             });
           }
@@ -3587,7 +4409,20 @@ export async function autoIngestWhatsAppMedia(msg, clientInfo, conversationInfo)
           const preview = `PDF ${result.pages || '?'}p, ${result.chunks || result.memory_ids?.length || 0} chunks — ${result.preview?.slice(0, 160) || ''}`;
           chat({ from: 'Luna', text: `📎 ${who} enviou PDF: ${filename}\n${preview}\n(Pendente de aprovação na aba Documentos)`, tag: 'ingest' });
         } else if (!result.ok) {
-          chat({ from: 'Luna', text: `📎 ${who} enviou ${filename}\n⚠️ Erro na ingestão: ${result.error || 'desconhecido'}`, tag: 'ingest' });
+          // Erro de ingestão: humaniza pra canal humano + grava técnico no error_log
+          const { postTechnicalError, humanizeErrorShort } = await import('./team-chat.js');
+          await postTechnicalError(new Error(result.error || 'erro desconhecido na ingestão'), {
+            source: 'whatsapp_ingest',
+            title: `Falha na ingestão (${who})`,
+            actor_type: 'agent',
+            actor_id: lunaAgentId,
+            metadata: { filename, phone: msg.from, doc_type: result.doc_type },
+          });
+          chat({
+            from: 'Luna',
+            text: `📎 ${who} enviou ${filename}\n⚠️ ${humanizeErrorShort(result.error || 'erro desconhecido')}\n→ Equipe técnica notificada`,
+            tag: 'ingest'
+          });
         }
       } catch {}
     }

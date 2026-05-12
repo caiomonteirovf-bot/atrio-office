@@ -10,9 +10,9 @@ function formatCnpj(cnpj) {
 }
 
 // ─── Design tokens ───────────────────────────────────────────
-const gold = '#C4956A'
+const gold = '#6366F1'
 const AGENT_COLORS = {
-  Rodrigo: '#C4956A', Campelo: '#378ADD', Sneijder: '#639922', Luna: '#BA7517',
+  Rodrigo: '#6366F1', Campelo: '#378ADD', Sneijder: '#639922', Luna: '#6366F1',
   Saldanha: '#7F77DD', Natalia: '#E05A33', Maia: '#D946A8', Dara: '#8B6F5A',
   // legacy
   Sofia: '#7F77DD', Valencia: '#E05A33',
@@ -23,7 +23,7 @@ const CATEGORY_META = {
   fiscal: { label: 'Fiscal', color: '#378ADD', bg: '#378ADD15' },
   financeiro: { label: 'Financeiro', color: '#639922', bg: '#63992215' },
   societario: { label: 'Societário', color: '#7F77DD', bg: '#7F77DD15' },
-  atendimento: { label: 'Atendimento', color: '#BA7517', bg: '#BA751715' },
+  atendimento: { label: 'Atendimento', color: '#6366F1', bg: '#6366F115' },
   comercial: { label: 'Comercial', color: '#E05A33', bg: '#E05A3315' },
   marketing: { label: 'Marketing', color: '#D946A8', bg: '#D946A815' },
   tecnologia: { label: 'Tecnologia', color: '#00B4D8', bg: '#00B4D815' },
@@ -174,6 +174,9 @@ export default function HybridMemory() {
           <SidebarItem active={view === 'review'} onClick={() => setView('review')}
             icon={<IconInbox />} label="Revisar" count={pendingCount}
             badge={pendingCount > 0} />
+          <SidebarItem active={view === 'governance'} onClick={() => setView('governance')}
+            icon={<span style={{fontSize:14}}>🛡️</span>} label="Governança"
+            badge={false} />
           <SidebarItem active={view === 'history'} onClick={() => setView('history')}
             icon={<IconClock />} label="Histórico" />
         </SidebarSection>
@@ -227,7 +230,7 @@ export default function HybridMemory() {
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 16, flex: 1, minWidth: 0 }}>
             <h2 style={{ fontSize: 16, fontWeight: 700, color: 'var(--ao-text-primary)', margin: 0, flexShrink: 0 }}>
-              {view === 'knowledge' ? 'Conhecimento' : view === 'review' ? 'Sugestões' : 'Histórico'}
+              {view === 'knowledge' ? 'Conhecimento' : view === 'review' ? 'Sugestões' : view === 'governance' ? 'Governança' : 'Histórico'}
             </h2>
             <button onClick={() => setShowCreate(true)} style={{
               padding: '7px 16px', borderRadius: 8,
@@ -278,6 +281,9 @@ export default function HybridMemory() {
           )}
           {view === 'review' && (
             <ReviewView agents={agents} onAction={refreshStats} />
+          )}
+          {view === 'governance' && (
+            <GovernanceView onAction={refreshStats} />
           )}
           {view === 'history' && <HistoryView />}
         </div>
@@ -781,6 +787,174 @@ const ACTION_META = {
   consolidated: { label: 'Consolidou', color: '#60a5fa', icon: '⊙' },
   decayed: { label: 'Expirou', color: 'var(--ao-text-xs)', icon: '⌛' },
 }
+
+
+
+// ============================================
+// GovernanceView — triagem de memorias em quarentena (injection) ou
+// pending_review (fato sensivel: CNPJ, R$, regime tributario).
+// Endpoint /api/memory/governance criado em frente 5 (mai/2026).
+// ============================================
+function GovernanceView({ onAction }) {
+  const [items, setItems] = useState([])
+  const [stats, setStats] = useState({ pending_review: 0, quarantine: 0, total: 0 })
+  const [loading, setLoading] = useState(true)
+  const [filter, setFilter] = useState('all') // all | quarantine | review
+  const [actingId, setActingId] = useState(null)
+
+  const fetchItems = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await fetch('/api/memory/governance')
+      const d = await r.json()
+      setItems(d.items || [])
+      setStats(d.stats || { pending_review: 0, quarantine: 0, total: 0 })
+    } catch (e) { console.error(e) }
+    setLoading(false)
+  }, [])
+
+  useEffect(() => { fetchItems() }, [fetchItems])
+
+  const handleAction = async (id, action) => {
+    setActingId(id)
+    try {
+      await fetch(`/api/memory/${id}/governance/${action}`, { method: 'POST' })
+      await fetchItems()
+      onAction?.()
+    } catch (e) { console.error(e) }
+    setActingId(null)
+  }
+
+  const visible = items.filter(it => {
+    if (filter === 'quarantine') return it.tags?.includes('quarantine')
+    if (filter === 'review') return it.tags?.includes('needs_review')
+    return true
+  })
+
+  return (
+    <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{ margin: '0 0 4px', fontSize: 22, fontWeight: 700, color: 'var(--ao-text-primary)' }}>
+          🛡️ Governança de memória
+        </h2>
+        <p style={{ margin: 0, fontSize: 13, color: 'var(--ao-text-dim)' }}>
+          Triagem de memórias classificadas como sensíveis ou suspeitas pelo classifier automático.
+          Revisar antes de aprovar ou descartar.
+        </p>
+      </div>
+
+      {/* Stats + filtros */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        <FilterPill active={filter === 'all'} onClick={() => setFilter('all')}
+          label="Todos" count={stats.total} color="#6B7280" />
+        <FilterPill active={filter === 'quarantine'} onClick={() => setFilter('quarantine')}
+          label="🚨 Quarentena" count={stats.quarantine} color="#EF4444"
+          tooltip="Detectado padrão de prompt injection (ex: 'ignore as instruções')" />
+        <FilterPill active={filter === 'review'} onClick={() => setFilter('review')}
+          label="👀 Pendente revisão" count={stats.pending_review} color="#F59E0B"
+          tooltip="Fato sensível detectado (CNPJ, valor, regime tributário, tributos)" />
+      </div>
+
+      {loading && <div style={{ color: 'var(--ao-text-dim)', fontSize: 13 }}>Carregando…</div>}
+      {!loading && visible.length === 0 && (
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--ao-text-dim)', background: 'var(--ao-card)', borderRadius: 8 }}>
+          ✅ Nada pra revisar.
+        </div>
+      )}
+
+      {visible.map(it => {
+        const isQuarantine = it.tags?.includes('quarantine')
+        const isReview = it.tags?.includes('needs_review')
+        const accent = isQuarantine ? '#EF4444' : isReview ? '#F59E0B' : '#6B7280'
+        const acting = actingId === it.id
+        return (
+          <div key={it.id} style={{
+            background: 'var(--ao-card)', border: '1px solid var(--ao-border)',
+            borderLeft: `4px solid ${accent}`,
+            borderRadius: 8, padding: 14, marginBottom: 10,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 8 }}>
+              <span style={{
+                fontSize: 10, fontWeight: 800, padding: '3px 8px', borderRadius: 4,
+                background: accent + '22', color: accent, textTransform: 'uppercase', letterSpacing: '.05em',
+                flexShrink: 0,
+              }}>
+                {isQuarantine ? '🚨 Quarentena' : isReview ? '👀 Revisão' : it.status}
+              </span>
+              <strong style={{ flex: 1, fontSize: 14, color: 'var(--ao-text-primary)' }}>{it.title}</strong>
+              <span style={{ fontSize: 10.5, color: 'var(--ao-text-dim)' }}>
+                {new Date(it.created_at).toLocaleString('pt-BR')}
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--ao-text-primary)', marginBottom: 10, padding: '8px 10px', background: 'var(--ao-surface)', borderRadius: 5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+              {it.content}
+            </div>
+            {it.summary && (
+              <div style={{ fontSize: 11.5, color: 'var(--ao-text-dim)', marginBottom: 10 }}>
+                <em>Resumo:</em> {it.summary}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button
+                disabled={acting}
+                onClick={() => handleAction(it.id, 'approve')}
+                style={{
+                  padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600,
+                  background: '#10B981', color: '#fff', border: 'none', cursor: acting ? 'wait' : 'pointer',
+                  opacity: acting ? 0.5 : 1,
+                }}
+              >
+                ✓ Aprovar
+              </button>
+              <button
+                disabled={acting}
+                onClick={() => handleAction(it.id, 'discard')}
+                style={{
+                  padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600,
+                  background: 'transparent', color: 'var(--ao-text-dim)',
+                  border: '1px solid var(--ao-border)', cursor: acting ? 'wait' : 'pointer',
+                  opacity: acting ? 0.5 : 1,
+                }}
+              >
+                ✗ Descartar
+              </button>
+              <span style={{ flex: 1 }} />
+              <span style={{ fontSize: 10.5, color: 'var(--ao-text-dim)', alignSelf: 'center' }}>
+                Confiança: {Math.round((it.confidence_score || 0) * 100)}%
+              </span>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function FilterPill({ active, onClick, label, count, color, tooltip }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={tooltip || ''}
+      style={{
+        padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600,
+        background: active ? color + '22' : 'transparent',
+        color: active ? color : 'var(--ao-text-primary)',
+        border: `1px solid ${active ? color + '88' : 'var(--ao-border)'}`,
+        cursor: 'pointer',
+        display: 'inline-flex', alignItems: 'center', gap: 6,
+      }}
+    >
+      <span>{label}</span>
+      <span style={{
+        background: active ? color : 'var(--ao-surface)',
+        color: active ? '#fff' : 'var(--ao-text-dim)',
+        fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 3, minWidth: 18, textAlign: 'center',
+      }}>{count}</span>
+    </button>
+  )
+}
+
 
 function HistoryView() {
   const [logs, setLogs] = useState([])

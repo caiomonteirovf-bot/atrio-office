@@ -132,7 +132,7 @@ export default function TemplatePicker({ open, onClose, onPick, conversation, cu
           padding: '10px 14px', borderBottom: '1px solid var(--ao-border)',
           display: 'flex', alignItems: 'center', gap: 10,
         }}>
-          <FileText size={15} style={{ color: 'var(--ao-accent, #c4956a)' }} />
+          <FileText size={15} style={{ color: 'var(--ao-accent, #6366F1)' }} />
           <h3 style={{ fontSize: 14, fontWeight: 700, margin: 0, flex: 1 }}>Templates</h3>
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--ao-text-dim)', cursor: 'pointer', padding: 4 }}>
             <X size={16} />
@@ -260,7 +260,7 @@ export default function TemplatePicker({ open, onClose, onPick, conversation, cu
                 style={{
                   padding: '6px 10px', fontSize: 11, fontWeight: 600, borderRadius: 5,
                   border: 'none', cursor: creating ? 'wait' : 'pointer',
-                  background: newName.trim() ? 'var(--ao-accent, #c4956a)' : 'var(--ao-border)',
+                  background: newName.trim() ? 'var(--ao-accent, #6366F1)' : 'var(--ao-border)',
                   color: newName.trim() ? '#fff' : 'var(--ao-text-dim)',
                   display: 'inline-flex', alignItems: 'center', gap: 4,
                 }}

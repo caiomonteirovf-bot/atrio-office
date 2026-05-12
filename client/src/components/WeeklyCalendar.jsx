@@ -16,7 +16,7 @@ const DAY_NAMES = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb']
 
 const TYPE_COLORS = {
   prazo_fiscal: '#60A5FA',
-  task: '#C4956A',
+  task: '#6366F1',
   reuniao: '#A78BFA',
   atividade: '#34D399',
   ligacao: '#FBBF24',
@@ -57,7 +57,7 @@ export default function WeeklyCalendar() {
   const [selectedEvent, setSelectedEvent] = useState(null)
   const [showCreate, setShowCreate] = useState(false)
   const [newEvent, setNewEvent] = useState({
-    title: '', type: 'task', category: 'fiscal',
+    title: '', description: '', type: 'task', category: 'fiscal',
     start_time: '', end_time: '', all_day: false, color: '',
     cliente_id: '', contato_id: '', colaborador_id: '',
   })
@@ -65,6 +65,27 @@ export default function WeeklyCalendar() {
   const [clientes, setClientes] = useState([])
   const [colaboradores, setColaboradores] = useState([])
   const [contatosDoCliente, setContatosDoCliente] = useState([])
+  const [rescheduleOpen, setRescheduleOpen] = useState(false)
+  const [rescheduleStart, setRescheduleStart] = useState('')
+  const [rescheduleEnd, setRescheduleEnd] = useState('')
+
+  const handleReschedule = async () => {
+    if (!selectedEvent || !rescheduleStart) return
+    const motivo = prompt('Motivo da remarcacao? (opcional, vai pro audit trail)', '') || ''
+    const r = await fetch(`${GESTHUB_API}/calendar/${selectedEvent.id}/remarcar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        newStartTime: rescheduleStart,
+        newEndTime: rescheduleEnd || null,
+        motivoRemarcacao: motivo,
+      }),
+    }).then(r => r.json())
+    if (!r.ok) { alert(r.error || 'falha ao remarcar'); return }
+    setRescheduleOpen(false)
+    setSelectedEvent(null)
+    refreshEvents()
+  }
 
   // Get week start (Monday)
   const getWeekStart = (offset) => {
@@ -169,6 +190,7 @@ export default function WeeklyCalendar() {
     }
     const body = {
       title: newEvent.title,
+      description: newEvent.description || '',
       startTime: newEvent.start_time,
       endTime: newEvent.end_time || null,
       allDay: !!newEvent.all_day,
@@ -190,7 +212,7 @@ export default function WeeklyCalendar() {
     }
     setShowCreate(false)
     setNewEvent({
-      title: '', type: 'task', category: 'fiscal',
+      title: '', description: '', type: 'task', category: 'fiscal',
       start_time: '', end_time: '', all_day: false, color: '',
       cliente_id: '', contato_id: '', colaborador_id: '',
     })
@@ -223,10 +245,10 @@ export default function WeeklyCalendar() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button onClick={() => setWeekOffset(w => w - 1)} style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid var(--ao-border)', background: 'var(--ao-input-bg)', color: 'var(--ao-text-primary)', fontSize: 13, cursor: 'pointer' }}>←</button>
-          <button onClick={() => setWeekOffset(0)} style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.2)', background: 'rgba(196,149,106,0.08)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>Hoje</button>
+          <button onClick={() => setWeekOffset(0)} style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.2)', background: 'rgba(196,149,106,0.08)', color: '#6366F1', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>Hoje</button>
           <button onClick={() => setWeekOffset(w => w + 1)} style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid var(--ao-border)', background: 'var(--ao-input-bg)', color: 'var(--ao-text-primary)', fontSize: 13, cursor: 'pointer' }}>→</button>
           <span style={{ color: 'var(--ao-text)', fontSize: 13, marginLeft: 8, fontWeight: 600, fontFamily: 'Outfit' }}>{weekLabel}</span>
-          <button onClick={() => setShowCreate(true)} style={{ marginLeft: 12, padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)', background: 'rgba(196,149,106,0.12)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>+ Evento</button>
+          <button onClick={() => setShowCreate(true)} style={{ marginLeft: 12, padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)', background: 'rgba(196,149,106,0.12)', color: '#6366F1', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>+ Evento</button>
         </div>
       </div>
 
@@ -299,7 +321,7 @@ export default function WeeklyCalendar() {
                 </div>
                 <div style={{
                   fontSize: 18, fontWeight: 700, marginTop: 2, fontFamily: 'Space Grotesk',
-                  color: isToday ? '#C4956A' : (isFeriado ? '#FCA5A5' : 'var(--ao-text-primary)'),
+                  color: isToday ? '#6366F1' : (isFeriado ? '#FCA5A5' : 'var(--ao-text-primary)'),
                   ...(isToday ? { background: 'rgba(196,149,106,0.15)', borderRadius: '50%', width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '2px auto 0' } : {}),
                 }}>{day.getDate()}</div>
               </div>
@@ -385,7 +407,7 @@ export default function WeeklyCalendar() {
                   color: selectedEvent.color || TYPE_COLORS[selectedEvent.type] || TYPE_COLORS.default,
                 }}>{selectedEvent.type}</div>
               </div>
-              <button onClick={() => setSelectedEvent(null)} style={{
+              <button onClick={() => { setSelectedEvent(null); setRescheduleOpen(false); }} style={{
                 background: 'none', border: 'none', color: 'var(--ao-text-dim)', fontSize: 18, cursor: 'pointer',
               }}>×</button>
             </div>
@@ -418,13 +440,50 @@ export default function WeeklyCalendar() {
                 👥 Responsável: <strong>{selectedEvent.colaborador_nome}</strong>
               </div>
             )}
-            {/* TEMP DISABLED: <EventExtras eventId={selectedEvent.id} onChange={refreshEvents} /> */}
+            <EventExtras eventId={selectedEvent.id} onChange={refreshEvents} />
 
-            <button onClick={() => handleDelete(selectedEvent.id)} style={{
-              width: '100%', padding: '8px 0', borderRadius: 6,
-              border: '1px solid rgba(248,113,113,0.2)', background: 'rgba(248,113,113,0.08)',
-              color: '#f87171', fontSize: 12, cursor: 'pointer', marginTop: 8,
-            }}>Excluir evento</button>
+            {/* === Remarcar inline === */}
+            {rescheduleOpen ? (
+              <div style={{ marginTop: 12, padding: 10, borderRadius: 6, background: 'var(--ao-input-bg)', border: '1px solid var(--ao-border)' }}>
+                <div style={{ fontSize: 10, fontWeight: 700, marginBottom: 8, color: 'var(--ao-text-dim)', textTransform: 'uppercase', letterSpacing: 0.6 }}>Remarcar para</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+                  <input type="datetime-local" value={rescheduleStart}
+                    onChange={e => setRescheduleStart(e.target.value)}
+                    style={{ width: '100%', padding: 8, fontSize: 12, fontFamily: 'inherit', boxSizing: 'border-box', border: '1px solid var(--ao-border)', borderRadius: 6, background: 'var(--ao-card)', color: 'var(--ao-text)' }} />
+                  <input type="datetime-local" value={rescheduleEnd}
+                    onChange={e => setRescheduleEnd(e.target.value)}
+                    style={{ width: '100%', padding: 8, fontSize: 12, fontFamily: 'inherit', boxSizing: 'border-box', border: '1px solid var(--ao-border)', borderRadius: 6, background: 'var(--ao-card)', color: 'var(--ao-text)' }} />
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button onClick={() => { setRescheduleOpen(false) }} style={{ flex: 1, padding: '7px 0', borderRadius: 6, border: '1px solid var(--ao-border)', background: 'var(--ao-card)', color: 'var(--ao-text-dim)', fontSize: 11, cursor: 'pointer' }}>Cancelar</button>
+                  <button onClick={handleReschedule} disabled={!rescheduleStart} style={{ flex: 1, padding: '7px 0', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)', background: 'rgba(196,149,106,0.15)', color: '#6366F1', fontSize: 11, fontWeight: 600, cursor: rescheduleStart ? 'pointer' : 'not-allowed', opacity: rescheduleStart ? 1 : 0.5 }}>Confirmar remarcar</button>
+                </div>
+              </div>
+            ) : null}
+
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              <button onClick={() => {
+                setRescheduleOpen(true)
+                if (selectedEvent.start_time) {
+                  const fmt = (d) => {
+                    const x = new Date(d)
+                    const pad = n => String(n).padStart(2, '0')
+                    return `${x.getFullYear()}-${pad(x.getMonth()+1)}-${pad(x.getDate())}T${pad(x.getHours())}:${pad(x.getMinutes())}`
+                  }
+                  setRescheduleStart(fmt(selectedEvent.start_time))
+                  setRescheduleEnd(selectedEvent.end_time ? fmt(selectedEvent.end_time) : '')
+                }
+              }} style={{
+                flex: 1, padding: '8px 0', borderRadius: 6,
+                border: '1px solid rgba(196,149,106,0.3)', background: 'rgba(196,149,106,0.08)',
+                color: '#6366F1', fontSize: 12, cursor: 'pointer', fontWeight: 600,
+              }}>📅 Remarcar</button>
+              <button onClick={() => handleDelete(selectedEvent.id)} style={{
+                flex: 1, padding: '8px 0', borderRadius: 6,
+                border: '1px solid rgba(248,113,113,0.2)', background: 'rgba(248,113,113,0.08)',
+                color: '#f87171', fontSize: 12, cursor: 'pointer',
+              }}>Excluir</button>
+            </div>
           </div>
         </div>
       )}
@@ -532,6 +591,23 @@ export default function WeeklyCalendar() {
               </select>
             </Field>
 
+            <Field label={
+              newEvent.type === 'ligacao' ? 'Motivo da ligação' :
+              newEvent.type === 'reuniao' ? 'Pauta da reunião' :
+              newEvent.type === 'atividade' ? 'Detalhes da atividade' :
+              'Descrição / observações'
+            }>
+              <textarea value={newEvent.description}
+                onChange={e => setNewEvent(n => ({ ...n, description: e.target.value }))}
+                rows={3}
+                placeholder={
+                  newEvent.type === 'ligacao' ? 'Ex: Cobrar pendência da DCTFWeb de abril' :
+                  newEvent.type === 'reuniao' ? 'Ex: Revisar fechamento março + alinhamento Simples' :
+                  'O que precisa ser feito / discutido'
+                }
+                style={{ ...ipt(), minHeight: 60, fontFamily: 'inherit', resize: 'vertical' }} />
+            </Field>
+
             <Field label="Responsável (colaborador)">
               <select value={newEvent.colaborador_id}
                 onChange={e => setNewEvent(n => ({ ...n, colaborador_id: e.target.value }))}
@@ -553,7 +629,7 @@ export default function WeeklyCalendar() {
               }}>Cancelar</button>
               <button onClick={handleCreate} style={{
                 flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)',
-                background: 'rgba(196,149,106,0.15)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600,
+                background: 'rgba(196,149,106,0.15)', color: '#6366F1', fontSize: 12, cursor: 'pointer', fontWeight: 600,
               }}>Criar Evento</button>
             </div>
           </div>
@@ -744,7 +820,7 @@ function EventExtras({ eventId, onChange }) {
         <div>
           <label style={{
             display: 'inline-block', padding: '6px 14px', background: 'rgba(196,149,106,0.15)',
-            color: '#C4956A', border: '1px solid rgba(196,149,106,0.3)',
+            color: '#6366F1', border: '1px solid rgba(196,149,106,0.3)',
             borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer', marginBottom: 10,
           }}>
             {uploading ? 'Enviando...' : '+ Anexar arquivo'}
@@ -769,7 +845,7 @@ function EventExtras({ eventId, onChange }) {
                   </span>
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  {f.url && <a href={f.url} target="_blank" rel="noreferrer" style={{ color: '#C4956A', fontWeight: 600 }}>abrir</a>}
+                  {f.url && <a href={f.url} target="_blank" rel="noreferrer" style={{ color: '#6366F1', fontWeight: 600 }}>abrir</a>}
                   <button onClick={() => deleteFile(f.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ao-text-dim)' }}>×</button>
                 </div>
               </div>
@@ -786,8 +862,8 @@ function OfAbaBtn({ active, onClick, children }) {
     <button type="button" onClick={onClick} style={{
       padding: '6px 14px', fontSize: 12, fontWeight: 700, fontFamily: 'inherit',
       background: 'transparent', border: 'none', cursor: 'pointer',
-      borderBottom: `2px solid ${active ? '#C4956A' : 'transparent'}`,
-      color: active ? '#C4956A' : 'var(--ao-text-dim)', marginBottom: -1,
+      borderBottom: `2px solid ${active ? '#6366F1' : 'transparent'}`,
+      color: active ? '#6366F1' : 'var(--ao-text-dim)', marginBottom: -1,
     }}>{children}</button>
   )
 }

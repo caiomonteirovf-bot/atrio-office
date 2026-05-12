@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
-import { Send, Loader2, Check, ArrowLeft, Phone, Sparkles, FileText, Calendar, X, Edit2, Paperclip, Users } from 'lucide-react'
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
+import { Send, Loader2, Check, ArrowLeft, Phone, Sparkles, FileText, Calendar, X, Edit2, Paperclip, Users, ExternalLink, Clock} from 'lucide-react'
 import MessageBubble from './MessageBubble'
 import EnsinarLunaModal from './EnsinarLunaModal'
 import TemplatePicker from './TemplatePicker'
-import { fetchMessages, sendWhatsApp, markReplied, markResolved, formatPhone, detectCommitment, createCalendarEvent, sendAttachment } from './atendimento-api'
+import { fetchMessages, sendWhatsApp, markReplied, markResolved, formatPhone, detectCommitment, createCalendarEvent, sendAttachment, snoozeConversation, unsnoozeConversation} from './atendimento-api'
 
 /**
  * Pane de chat de uma conversa — header (cliente) + lista de msgs + input.
@@ -22,6 +22,30 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
   const [resolving, setResolving] = useState(false)
   const [error, setError] = useState(null)
   const [teachOpen, setTeachOpen] = useState(false)
+  // Optimistic UI ate o ConversaList re-fetch trazer estado novo
+  const [localResolved, setLocalResolved] = useState(false)
+  const [snoozeOpen, setSnoozeOpen] = useState(false)
+  const [snoozing, setSnoozing] = useState(false)
+
+  const handleSnooze = async (preset) => {
+    if (snoozing) return
+    setSnoozing(true)
+    try {
+      await snoozeConversation(conv.id, preset)
+      setSnoozeOpen(false)
+      onRefreshList?.()
+    } catch (e) { alert('Erro: ' + e.message) }
+    finally { setSnoozing(false) }
+  }
+  const handleUnsnooze = async () => {
+    if (snoozing) return
+    setSnoozing(true)
+    try {
+      await unsnoozeConversation(conv.id)
+      onRefreshList?.()
+    } catch (e) { alert('Erro: ' + e.message) }
+    finally { setSnoozing(false) }
+  }
   const [templatesOpen, setTemplatesOpen] = useState(false)
   const [commitments, setCommitments] = useState([])  // sugestoes de compromisso apos envio
   const [savingCommit, setSavingCommit] = useState(null)  // indice sendo salvo
@@ -30,6 +54,60 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
   const scrollRef = useRef(null)
   const textareaRef = useRef(null)
   const fileInputRef = useRef(null)
+  const lastConvIdRef = useRef(null)
+  const lastMsgIdRef = useRef(null)
+  const userScrolledUpRef = useRef(false)
+
+  // Detecta se usuario subiu o scroll de proposito (>150px do fim).
+  // Quando estava no fim e chega msg nova: scrolla. Quando subiu: nao interfere.
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    userScrolledUpRef.current = distFromBottom > 150
+  }, [])
+
+  // Garante que ao trocar de conversa, a lista vai pro FIM (msgs mais recentes).
+  // O setTimeout(..., 0) no load() nao bastava: as vezes disparava antes do
+  // React renderizar a lista, ai scrollHeight era pequeno e a posicao final
+  // ficava no inicio. useLayoutEffect roda apos o DOM atualizar, antes do paint.
+  // Restricao: so scrolla quando o id da conversa muda — nao interfere quando
+  // chegam novas msgs por WebSocket (esses casos tem proprios scrollTo).
+  useLayoutEffect(() => {
+    if (!conv?.id || !scrollRef.current || loading) return
+    const el = scrollRef.current
+    const lastMsg = messages[messages.length - 1]?.id || null
+    const convChanged = lastConvIdRef.current !== conv.id
+    const msgAppended = lastMsg !== null && lastMsgIdRef.current !== lastMsg
+
+    lastConvIdRef.current = conv.id
+    lastMsgIdRef.current = lastMsg
+
+    const goToBottom = () => {
+      if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+
+    if (convChanged) {
+      // Trocou de conversa: SEMPRE no fim, com multiplas tentativas
+      // (anexos/imagens carregam async e mudam scrollHeight)
+      userScrolledUpRef.current = false
+      goToBottom()
+      requestAnimationFrame(() => {
+        goToBottom()
+        requestAnimationFrame(goToBottom)
+      })
+      // Re-tentativas pra casos de imagens grandes / PDFs carregando preview
+      setTimeout(goToBottom, 200)
+      setTimeout(goToBottom, 500)
+      return
+    }
+
+    if (msgAppended && !userScrolledUpRef.current) {
+      // Mesma conversa + msg nova + usuario estava no fim: acompanha
+      goToBottom()
+      requestAnimationFrame(goToBottom)
+    }
+  }, [conv?.id, loading, messages.length])
 
   const handleFilePick = async (e) => {
     const file = e.target.files?.[0]
@@ -63,6 +141,7 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
   }
 
   useEffect(() => { load() }, [conv?.id])
+  useEffect(() => { setLocalResolved(false) }, [conv?.id])
 
   // Refresh quando chega evento WebSocket relevante pra esta conversa
   useEffect(() => {
@@ -72,7 +151,10 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
       (m.type === 'whatsapp_message' || m.type === 'conversation_updated') &&
       (m.phone === conv.phone || m.phone === conv.real_phone || m.conversationId === conv.id)
     )
-    if (relevant) load()
+    // Sincronizacao Office <-> iframe Gesthub: outra aba enviou pro Finance,
+    // recarrega msgs pra MessageBubble pegar metadata.finance_pending_id atualizada
+    const financeSync = m.type === 'extrato_sent_to_finance' && m.conversation_id === conv.id
+    if (relevant || financeSync) load()
   }, [lastWsMessage])
 
   // Usa chat_id primeiro (tem sufixo @c.us ou @g.us canonico pro WhatsApp).
@@ -156,9 +238,6 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
     } catch (e) { setError(e.message) }
     finally { setResolving(false) }
   }
-  // Optimistic UI: ate o ConversaList re-fetch trazer o estado novo, mostra como resolvida
-  const [localResolved, setLocalResolved] = useState(false)
-  useEffect(() => { setLocalResolved(false) }, [conv?.id])
   const isResolved = conv?.resolved || localResolved
 
   if (!conv) {
@@ -207,8 +286,22 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
           {conv.is_group ? <Users size={16} /> : (conv.client_name || '?').slice(0, 2).toUpperCase()}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ao-text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {conv.client_name || 'Sem nome'}
+          <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ao-text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{conv.client_name || 'Sem nome'}</span>
+            {/* Badge satelite: indica que conversa esta vinculada como tomador/socio/etc de um cliente Atrio */}
+            {conv.linked_relacao && conv.linked_client_name && (
+              <span title={`Esta conversa está vinculada como ${conv.linked_relacao.toUpperCase()} de ${conv.linked_client_name}${conv.linked_contato_funcao ? ' · ' + conv.linked_contato_funcao : ''}`}
+                style={{
+                  fontSize: 9, fontWeight: 800, padding: '2px 7px', borderRadius: 4,
+                  background: 'rgba(99, 102, 241, 0.16)',
+                  color: 'rgba(99, 102, 241, 0.95)',
+                  border: '1px solid rgba(99, 102, 241, 0.28)',
+                  textTransform: 'uppercase', letterSpacing: '0.4px',
+                  whiteSpace: 'nowrap', flexShrink: 0,
+                }}>
+                {conv.linked_relacao} · {conv.linked_client_name.split(' ').slice(0, 3).join(' ')}
+              </span>
+            )}
           </div>
           <div style={{ fontSize: 11, color: 'var(--ao-text-dim)', display: 'flex', alignItems: 'center', gap: 6 }}>
             {conv.is_group ? (
@@ -223,20 +316,72 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
                 {(conv.participants_count > 0) && <span>{conv.participants_count} participantes</span>}
               </>
             ) : (
-              <span>{conv.display_phone || formatPhone(conv.real_phone || conv.phone)}</span>
+              <>
+                <span>{conv.display_phone || formatPhone(conv.real_phone || conv.phone)}</span>
+                {conv.last_client_at && (() => {
+                  const lastMs = new Date(conv.last_client_at).getTime();
+                  const ageMin = (Date.now() - lastMs) / 60000;
+                  // 'Online' presumido apenas se cliente mandou nos ultimos 5min
+                  const isOnline = ageMin < 5;
+                  let label = '';
+                  if (isOnline) label = 'ativo agora';
+                  else if (ageMin < 60) label = `cliente ativo há ${Math.round(ageMin)}min`;
+                  else if (ageMin < 24 * 60) {
+                    const lastDate = new Date(conv.last_client_at);
+                    label = `última msg do cliente às ${lastDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
+                  } else if (ageMin < 7 * 24 * 60) {
+                    label = `cliente sem msg há ${Math.round(ageMin / 60 / 24)}d`;
+                  } else {
+                    const lastDate = new Date(conv.last_client_at);
+                    label = `última em ${lastDate.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}`;
+                  }
+                  return (
+                    <span title={new Date(conv.last_client_at).toLocaleString('pt-BR')}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 4 }}>
+                      <span aria-hidden style={{
+                        width: 6, height: 6, borderRadius: '50%',
+                        background: isOnline ? '#10B981' : ageMin < 60 ? '#F59E0B' : 'rgba(255,255,255,0.25)',
+                        boxShadow: isOnline ? '0 0 6px rgba(16,185,129,0.6)' : 'none',
+                        flexShrink: 0,
+                      }} />
+                      <span style={{ fontSize: 10.5 }}>· {label}</span>
+                    </span>
+                  );
+                })()}
+              </>
             )}
             {conv.resolved && <span style={{ marginLeft: 4, color: '#10B981' }}>· resolvida</span>}
           </div>
         </div>
         {extraHeaderButton}
+        {(conv.linked_client_id || conv.gesthub_client_id) && (
+          <a
+            href={`http://31.97.175.200/?client=${conv.linked_client_id || conv.gesthub_client_id}&tab=cliente360`}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`Abrir Cliente 360 — ${conv.linked_client_name || 'cliente vinculado'}`}
+            className="chat-header-btn-action"
+            style={{
+              padding: '7px 12px', fontSize: 12, fontWeight: 600, borderRadius: 8,
+              border: '1px solid var(--ao-border)',
+              background: 'transparent', color: 'var(--ao-text-secondary)',
+              cursor: 'pointer', textDecoration: 'none',
+              display: 'inline-flex', alignItems: 'center', gap: 5,
+              minHeight: 36, minWidth: 36, justifyContent: 'center',
+            }}
+          >
+            <ExternalLink size={13} />
+            <span className="chat-btn-label">Cliente 360</span>
+          </a>
+        )}
         <button
           onClick={() => setTeachOpen(true)}
           title="Ensinar Luna a partir desta conversa"
           className="chat-header-btn-action chat-btn-teach"
           style={{
             padding: '7px 12px', fontSize: 12, fontWeight: 600, borderRadius: 8,
-            border: '1px solid rgba(186, 117, 23, 0.4)',
-            background: 'rgba(186, 117, 23, 0.1)', color: '#BA7517',
+            border: '1px solid rgba(99, 102, 241, 0.4)',
+            background: 'rgba(99, 102, 241, 0.1)', color: '#6366F1',
             cursor: 'pointer',
             display: 'inline-flex', alignItems: 'center', gap: 5,
             minHeight: 36, minWidth: 36, justifyContent: 'center',
@@ -245,6 +390,89 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
           <Sparkles size={13} />
           <span className="chat-btn-label">Ensinar Luna</span>
         </button>
+        {/* Snooze button + dropdown */}
+        {!isResolved && (() => {
+          const isSnoozed = conv.snoozed_until && new Date(conv.snoozed_until) > new Date()
+          if (isSnoozed) {
+            const dt = new Date(conv.snoozed_until)
+            const ms = dt.getTime() - Date.now()
+            const h = Math.round(ms / 3600000)
+            const d = Math.round(ms / 86400000)
+            const label = h < 1 ? '<1h' : h < 24 ? `${h}h` : `${d}d`
+            return (
+              <button
+                onClick={handleUnsnooze}
+                disabled={snoozing}
+                title={`Snoozed até ${dt.toLocaleString('pt-BR')}. Clique para cancelar.`}
+                className="chat-header-btn-action"
+                style={{
+                  padding: '7px 12px', fontSize: 12, fontWeight: 600, borderRadius: 8,
+                  border: '1px solid rgba(127, 119, 221, 0.4)',
+                  background: 'rgba(127, 119, 221, 0.1)', color: '#7F77DD',
+                  cursor: snoozing ? 'wait' : 'pointer',
+                  display: 'inline-flex', alignItems: 'center', gap: 5,
+                  minHeight: 36, minWidth: 36, justifyContent: 'center',
+                }}
+              >
+                💤 <span className="chat-btn-label">{label}</span>
+              </button>
+            )
+          }
+          return (
+            <div style={{ position: 'relative' }}>
+              <button
+                onClick={() => setSnoozeOpen(v => !v)}
+                disabled={snoozing}
+                title="Adiar conversa (volta automaticamente)"
+                className="chat-header-btn-action"
+                style={{
+                  padding: '7px 12px', fontSize: 12, fontWeight: 600, borderRadius: 8,
+                  border: '1px solid var(--ao-border)',
+                  background: snoozeOpen ? 'rgba(127, 119, 221, 0.12)' : 'transparent',
+                  color: 'var(--ao-text-secondary)',
+                  cursor: snoozing ? 'wait' : 'pointer',
+                  display: 'inline-flex', alignItems: 'center', gap: 5,
+                  minHeight: 36, minWidth: 36, justifyContent: 'center',
+                }}
+              >
+                <Clock size={13} />
+                <span className="chat-btn-label">Snooze</span>
+              </button>
+              {snoozeOpen && (
+                <div style={{
+                  position: 'absolute', top: '100%', right: 0, marginTop: 4,
+                  background: 'var(--ao-card)', border: '1px solid var(--ao-border)',
+                  borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+                  zIndex: 100, minWidth: 180, padding: 4,
+                }}>
+                  {[
+                    ['1h', 'Em 1 hora'],
+                    ['4h', 'Em 4 horas'],
+                    ['tomorrow', 'Amanhã 9h'],
+                    ['friday', 'Sexta 9h'],
+                    ['7d', 'Em 7 dias'],
+                  ].map(([preset, label]) => (
+                    <button
+                      key={preset}
+                      onClick={() => handleSnooze(preset)}
+                      disabled={snoozing}
+                      style={{
+                        width: '100%', textAlign: 'left', padding: '8px 12px',
+                        fontSize: 12, border: 'none', background: 'transparent',
+                        color: 'var(--ao-text-primary)', cursor: 'pointer',
+                        borderRadius: 5, display: 'block',
+                      }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(127, 119, 221, 0.1)'}
+                      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )
+        })()}
         {!isResolved && (
           <button
             onClick={handleResolve}
@@ -281,8 +509,7 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
       />
 
       {/* Lista de mensagens */}
-      <div
-        ref={scrollRef}
+      <div ref={scrollRef} onScroll={handleScroll}
         style={{
           flex: 1, overflowY: 'auto', padding: '12px 14px',
           background: 'var(--ao-bg)',
@@ -301,7 +528,7 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
         {messages.map((m, i) => (
           <MessageBubble
             key={m.id || i}
-            msg={m}
+            msg={{ ...m, conversationGesthubClientId: conv?.gesthub_client_id || conv?.linked_client_id || null }}
             onDeleted={(deletedId) => {
               // Otimistic: marca como apagada na UI imediatamente; re-fetch confirma
               setMessages(prev => prev.map(x =>
@@ -328,7 +555,7 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
       {commitments.length > 0 && (
         <div style={{
           padding: '8px 12px', borderTop: '1px solid var(--ao-border)',
-          background: 'rgba(196, 149, 106, 0.06)',
+          background: 'rgba(99, 102, 241, 0.06)',
           display: 'flex', flexDirection: 'column', gap: 6,
         }}>
           {commitments.map((c, idx) => {
@@ -342,12 +569,12 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
               <div key={idx} style={{
                 padding: '8px 10px', borderRadius: 10,
                 background: 'var(--ao-card)',
-                border: '1px solid rgba(196, 149, 106, 0.35)',
+                border: '1px solid rgba(99, 102, 241, 0.35)',
                 display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
               }}>
                 <div style={{
                   width: 28, height: 28, borderRadius: 8,
-                  background: 'rgba(196, 149, 106, 0.18)', color: '#C4956A',
+                  background: 'rgba(99, 102, 241, 0.18)', color: '#6366F1',
                   display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
                 }}>
                   <Calendar size={14} />
@@ -420,7 +647,7 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
                         title="Adicionar ao calendário"
                         style={{
                           padding: '5px 10px', fontSize: 11, fontWeight: 700, borderRadius: 6,
-                          border: 'none', background: 'linear-gradient(135deg, #C4956A, #A67B52)',
+                          border: 'none', background: 'linear-gradient(135deg, #6366F1, #A67B52)',
                           color: '#fff', cursor: isSaving ? 'wait' : 'pointer',
                           display: 'inline-flex', alignItems: 'center', gap: 4,
                         }}
@@ -489,7 +716,7 @@ export default function ChatPane({ conversation: conv, onBack, lastWsMessage, on
           style={{
             width: 40, height: 40, borderRadius: 10,
             border: '1px solid var(--ao-border)', background: 'var(--ao-bg)',
-            color: uploadingFile ? 'var(--ao-accent, #c4956a)' : 'var(--ao-text-secondary)',
+            color: uploadingFile ? 'var(--ao-accent, #6366F1)' : 'var(--ao-text-secondary)',
             cursor: uploadingFile ? 'wait' : 'pointer',
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
             flexShrink: 0, padding: 0,

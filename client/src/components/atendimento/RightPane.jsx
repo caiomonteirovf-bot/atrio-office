@@ -36,7 +36,7 @@ export default function RightPane({ conversation: conv, onClose, lastWsMessage }
           onClick={() => setTab('copilot')}
           icon={<Sparkles size={13} />}
           label="Copilot"
-          color="#BA7517"
+          color="#6366F1"
         />
         {onClose && (
           <button

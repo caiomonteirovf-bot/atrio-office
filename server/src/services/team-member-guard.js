@@ -12,6 +12,7 @@
  *                      first-touch nem escalation
  */
 import * as gesthub from './gesthub.js';
+import { query } from '../db/pool.js';
 
 let _cache = null;
 let _cachedAt = 0;
@@ -58,4 +59,50 @@ export async function detectTeamMember(phone) {
 export function invalidateTeamCache() {
   _cache = null;
   _cachedAt = 0;
+}
+
+// ============================================
+// AGENT (agents.id) → TEAM_MEMBER (team_members.id) mapping
+// ============================================
+// FK tasks.assigned_to/delegated_by → team_members(id), NÃO agents(id).
+// Código costumava passar UUID de agents direto e quebrar com FK violation.
+// Esta função resolve agent UUID → team_member UUID (cacheado).
+let _agentTmCache = null;
+let _agentTmCachedAt = 0;
+const AGENT_TM_TTL_MS = 10 * 60 * 1000; // 10min
+
+async function _loadAgentTeamMemberMap() {
+  const now = Date.now();
+  if (_agentTmCache && (now - _agentTmCachedAt) < AGENT_TM_TTL_MS) return _agentTmCache;
+  try {
+    const { rows } = await query(
+      `SELECT agent_id::text AS agent_id, id::text AS tm_id
+         FROM team_members
+        WHERE agent_id IS NOT NULL AND type = 'ai'`
+    );
+    _agentTmCache = new Map(rows.map(r => [r.agent_id, r.tm_id]));
+    _agentTmCachedAt = now;
+  } catch (e) {
+    console.error('[team-guard] loadAgentTeamMemberMap falhou:', e.message);
+    if (!_agentTmCache) _agentTmCache = new Map();
+  }
+  return _agentTmCache;
+}
+
+/**
+ * Resolve UUID de agents → UUID de team_members.
+ * Usado em INSERT INTO tasks (assigned_to, delegated_by) — FKs apontam pra team_members.
+ *
+ * @param {string} agentId - UUID em agents.id (ex: 'a0000001-0000-0000-0000-000000000003')
+ * @returns {Promise<string|null>} UUID em team_members.id ou null se não houver mapeamento
+ */
+export async function getTeamMemberIdForAgent(agentId) {
+  if (!agentId) return null;
+  const map = await _loadAgentTeamMemberMap();
+  return map.get(String(agentId)) || null;
+}
+
+export function invalidateAgentTeamMemberCache() {
+  _agentTmCache = null;
+  _agentTmCachedAt = 0;
 }

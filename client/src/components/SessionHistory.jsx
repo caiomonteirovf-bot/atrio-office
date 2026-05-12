@@ -63,7 +63,7 @@ export default function SessionHistory() {
     whatsapp: '#22c55e',
     chat: '#60a5fa',
     email: '#a78bfa',
-    internal: '#C4956A',
+    internal: '#6366F1',
   }
 
   const statusColors = {
@@ -173,7 +173,7 @@ export default function SessionHistory() {
                   width: 36, height: 36, borderRadius: 8,
                   background: 'rgba(196,149,106,0.15)',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 14, fontWeight: 700, color: '#C4956A', flexShrink: 0,
+                  fontSize: 14, fontWeight: 700, color: '#6366F1', flexShrink: 0,
                 }}>
                   {(s.agent_name || '?')[0]}
                 </div>

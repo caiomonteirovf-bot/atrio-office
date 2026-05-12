@@ -41,7 +41,7 @@ export default function BottomNav({ currentPage, onNavigate, onOpenMenu }) {
               display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
               gap: 3, padding: '8px 4px', minHeight: 56,
               background: 'transparent', border: 'none', cursor: 'pointer',
-              color: active ? '#C4956A' : 'var(--ao-text-dim)',
+              color: active ? '#6366F1' : 'var(--ao-text-dim)',
               fontSize: 10, fontWeight: active ? 700 : 500,
               transition: 'color 0.12s',
               position: 'relative',
@@ -50,7 +50,7 @@ export default function BottomNav({ currentPage, onNavigate, onOpenMenu }) {
             {active && (
               <span style={{
                 position: 'absolute', top: 0, left: '25%', right: '25%', height: 2,
-                background: '#C4956A', borderRadius: '0 0 2px 2px',
+                background: '#6366F1', borderRadius: '0 0 2px 2px',
               }} />
             )}
             <Icon size={19} strokeWidth={active ? 2.4 : 2} />

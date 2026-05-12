@@ -62,7 +62,7 @@ export default function GlobalSearch({ isOpen, onClose, onSelect }) {
   if (!isOpen) return null
 
   const ICONS = { agent: '\u{1F916}', task: '\u{1F4CB}', client: '\u{1F3E2}' }
-  const COLORS = { agent: '#C4956A', task: '#60a5fa', client: '#22c55e' }
+  const COLORS = { agent: '#6366F1', task: '#60a5fa', client: '#22c55e' }
 
   return (
     <div className="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh]"
@@ -78,7 +78,7 @@ export default function GlobalSearch({ isOpen, onClose, onSelect }) {
 
         {/* Search input */}
         <div className="flex items-center gap-3 px-5 h-14" style={{ borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C4956A" strokeWidth="2" strokeLinecap="round">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#6366F1" strokeWidth="2" strokeLinecap="round">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
           </svg>
           <input
@@ -135,7 +135,7 @@ export default function GlobalSearch({ isOpen, onClose, onSelect }) {
                       className="w-full flex items-center gap-3 px-5 py-2.5 text-left transition-all duration-150 cursor-pointer"
                       style={{
                         background: isActive ? 'rgba(196,149,106,0.1)' : 'transparent',
-                        borderLeft: isActive ? '2px solid #C4956A' : '2px solid transparent',
+                        borderLeft: isActive ? '2px solid #6366F1' : '2px solid transparent',
                       }}
                       onClick={() => { onSelect?.(catType, item); onClose() }}
                       onMouseEnter={() => setSelected(flatIdx)}

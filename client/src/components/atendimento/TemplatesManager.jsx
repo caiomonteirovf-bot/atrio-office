@@ -165,7 +165,7 @@ export default function TemplatesManager() {
             onClick={openNew}
             style={{
               padding: '8px 14px', borderRadius: 8, border: 'none',
-              background: 'linear-gradient(135deg, #C4956A, #A67B52)',
+              background: 'linear-gradient(135deg, #6366F1, #A67B52)',
               color: '#fff', cursor: 'pointer', fontWeight: 600,
               display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13,
             }}
@@ -434,7 +434,7 @@ export default function TemplatesManager() {
                 style={{
                   padding: '8px 16px', fontSize: 12, fontWeight: 700, borderRadius: 7,
                   border: 'none',
-                  background: 'linear-gradient(135deg, #C4956A, #A67B52)',
+                  background: 'linear-gradient(135deg, #6366F1, #A67B52)',
                   color: '#fff', cursor: saving ? 'wait' : 'pointer',
                   display: 'inline-flex', alignItems: 'center', gap: 5,
                 }}

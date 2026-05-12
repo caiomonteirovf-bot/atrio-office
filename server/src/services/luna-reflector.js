@@ -51,31 +51,28 @@ function mapCategory(tipo, area) {
   return CATEGORY_MAP[t] || 'general';
 }
 
+// Chama LLM via gateway com fallback chain (resistente a 402/429/timeout).
+// Antes chamava OpenRouter direto e morria quando saldo zerava.
 async function callLLM(prompt) {
-  const key = process.env.OPENROUTER_API_KEY;
-  if (!key) throw new Error('OPENROUTER_API_KEY ausente');
-  const r = await fetch(OPENROUTER_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${key}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://atrio-office.local',
-      'X-Title': 'Atrio Luna Reflector',
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: SYSTEM },
-        { role: 'user', content: prompt },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.2,
-      max_tokens: 1200,
-    }),
+  const { generateWithFallback } = await import('./llm-gateway.js');
+  const res = await generateWithFallback({
+    chain: [
+      { provider: 'openrouter', model: MODEL },                      // primário
+      { provider: 'grok',       model: 'grok-4-1-fast' },             // fallback 1: xAI direto
+      { provider: 'deepseek',   model: 'deepseek-chat' },             // fallback 2: DeepSeek direto
+      { provider: 'openrouter', model: 'deepseek/deepseek-chat' },    // fallback 3
+    ],
+    messages: [
+      { role: 'system', content: SYSTEM },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.2,
+    maxTokens: 1200,
   });
-  if (!r.ok) throw new Error(`OpenRouter ${r.status}: ${await r.text()}`);
-  const data = await r.json();
-  const content = data.choices?.[0]?.message?.content || '{}';
+  if (!res.success) {
+    throw new Error(res.error || 'todos provedores LLM falharam');
+  }
+  const content = res.content || '{}';
   try { return JSON.parse(content); }
   catch { return { resumo: 'parse fail', aprendizados: [], melhorias_luna: [], acoes_pendentes: [] }; }
 }

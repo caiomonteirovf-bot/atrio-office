@@ -216,7 +216,7 @@ export default function TaskDetailModal({ taskId, onClose, ws }) {
             </button>
             <button onClick={send} disabled={!input.trim() || sending} style={{
               padding: '8px 14px', borderRadius: 6, border: 'none',
-              background: sending ? '#94a3b8' : 'var(--ao-accent, #c4956a)', color: 'white', cursor: sending ? 'wait' : 'pointer',
+              background: sending ? '#94a3b8' : 'var(--ao-accent, #6366F1)', color: 'white', cursor: sending ? 'wait' : 'pointer',
               fontSize: 12, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4,
               opacity: (!input.trim() || sending) ? 0.5 : 1,
             }}>
@@ -445,7 +445,7 @@ function TaskDetails({ task, onReload }) {
           {showEnrichBtn && (
             <button onClick={handleEnrich} disabled={enriching} title="Consulta Receita Federal p/ preencher dados cadastrais (razao social, CNAE, endereco, socios, situacao...)" style={{
               padding: '6px 12px', fontSize: 11, fontWeight: 600, borderRadius: 6,
-              border: 'none', background: 'var(--ao-accent, #c4956a)', color: 'white',
+              border: 'none', background: 'var(--ao-accent, #6366F1)', color: 'white',
               cursor: enriching ? 'wait' : 'pointer', opacity: enriching ? 0.6 : 1,
             }}>{enriching ? '⏳ Enriquecendo...' : '⚡ Enriquecer via Receita Federal'}</button>
           )}

@@ -22,10 +22,10 @@ const PRIORITY_CONFIG = {
 }
 
 const AGENT_COLORS = {
-  'Rodrigo':  '#C4956A',
+  'Rodrigo':  '#6366F1',
   'Campelo':  '#378ADD',
   'Sneijder': '#639922',
-  'Luna':     '#BA7517',
+  'Luna':     '#6366F1',
   'Sofia':    '#7F77DD',
   'Valencia': '#E05A33',
   'Maia':     '#D946A8',
@@ -59,7 +59,7 @@ function timeSince(dateStr) {
 function getAgentColor(name) {
   if (!name) return '#6b7280'
   const firstName = name.split(' ')[0]
-  return AGENT_COLORS[firstName] || '#C4956A'
+  return AGENT_COLORS[firstName] || '#6366F1'
 }
 
 // ============================================
@@ -122,9 +122,9 @@ function FilterTabs({ active, counts, onChange }) {
             onClick={() => onChange(tab.key)}
             className="text-[10px] font-medium px-2.5 py-1 rounded-lg whitespace-nowrap transition-all"
             style={{
-              background: isActive ? 'rgba(196, 149, 106, 0.1)' : 'transparent',
-              color: isActive ? '#C4956A' : 'var(--ao-text-dim)',
-              border: `1px solid ${isActive ? 'rgba(196, 149, 106, 0.15)' : 'transparent'}`,
+              background: isActive ? 'rgba(99, 102, 241, 0.1)' : 'transparent',
+              color: isActive ? '#6366F1' : 'var(--ao-text-dim)',
+              border: `1px solid ${isActive ? 'rgba(99, 102, 241, 0.15)' : 'transparent'}`,
             }}
           >
             {tab.label}
@@ -157,9 +157,9 @@ function EmptyState({ filter }) {
     <div className="glass-card rounded-xl p-6 text-center">
       <div
         className="w-10 h-10 rounded-xl mx-auto mb-2.5 flex items-center justify-center"
-        style={{ background: 'rgba(196, 149, 106, 0.06)', border: '1px solid rgba(196, 149, 106, 0.06)' }}
+        style={{ background: 'rgba(99, 102, 241, 0.06)', border: '1px solid rgba(99, 102, 241, 0.06)' }}
       >
-        <ClipboardList size={18} color="rgba(196, 149, 106, 0.4)" />
+        <ClipboardList size={18} color="rgba(99, 102, 241, 0.4)" />
       </div>
       <p className="text-[12px] font-medium" style={{ color: 'var(--ao-text-dim)' }}>{msg.title}</p>
       <p className="text-[10px] mt-1" style={{ color: 'var(--ao-text-xs)' }}>{msg.sub}</p>

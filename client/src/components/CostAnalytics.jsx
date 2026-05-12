@@ -55,7 +55,7 @@ export default function CostAnalytics() {
                 borderRadius: 6,
                 border: `1px solid ${days === d ? 'rgba(196,149,106,0.3)' : 'var(--ao-border)'}`,
                 background: days === d ? 'rgba(196,149,106,0.12)' : 'var(--ao-input-bg)',
-                color: days === d ? '#C4956A' : 'var(--ao-text-muted)',
+                color: days === d ? '#6366F1' : 'var(--ao-text-muted)',
                 fontSize: 12,
                 cursor: 'pointer',
                 transition: 'all 0.15s',
@@ -70,7 +70,7 @@ export default function CostAnalytics() {
       {/* KPI Cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
         {[
-          { label: 'Custo Hoje', value: formatUSD(t.cost_today), color: '#C4956A' },
+          { label: 'Custo Hoje', value: formatUSD(t.cost_today), color: '#6366F1' },
           { label: 'Custo Mês', value: formatUSD(t.cost_month), color: '#60a5fa' },
           { label: 'Projeção mês', value: formatUSD(projectedMonth), color: parseFloat(projectedMonth) > budget ? '#f87171' : '#22c55e' },
           { label: 'Tokens', value: formatTokens(t.total_tokens), color: '#a78bfa' },
@@ -112,7 +112,7 @@ export default function CostAnalytics() {
             height: '100%',
             width: `${budgetPct}%`,
             borderRadius: 4,
-            background: budgetPct > 80 ? '#f87171' : budgetPct > 50 ? '#fbbf24' : '#C4956A',
+            background: budgetPct > 80 ? '#f87171' : budgetPct > 50 ? '#fbbf24' : '#6366F1',
             transition: 'width 0.5s ease',
           }} />
         </div>
@@ -146,7 +146,7 @@ export default function CostAnalytics() {
                         width: '100%',
                         maxWidth: 20,
                         height: h,
-                        background: 'linear-gradient(180deg, #C4956A, rgba(196,149,106,0.4))',
+                        background: 'linear-gradient(180deg, #6366F1, rgba(196,149,106,0.4))',
                         borderRadius: '3px 3px 0 0',
                         cursor: 'pointer',
                         transition: 'all 0.15s',
@@ -178,7 +178,7 @@ export default function CostAnalytics() {
             <div key={i} style={{ marginBottom: 12 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                 <span style={{ fontSize: 12, color: 'var(--ao-text-primary)' }}>{agent.name}</span>
-                <span style={{ fontSize: 11, color: '#C4956A', fontFamily: 'monospace' }}>
+                <span style={{ fontSize: 11, color: '#6366F1', fontFamily: 'monospace' }}>
                   {formatUSD(agent.cost)}
                 </span>
               </div>
@@ -187,7 +187,7 @@ export default function CostAnalytics() {
                   height: '100%',
                   width: `${(agent.cost / maxAgentCost) * 100}%`,
                   borderRadius: 3,
-                  background: '#C4956A',
+                  background: '#6366F1',
                   transition: 'width 0.3s ease',
                 }} />
               </div>

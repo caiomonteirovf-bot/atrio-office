@@ -3,6 +3,7 @@ import { User } from 'lucide-react'
 import ConversaList from './ConversaList'
 import ChatPane from './ChatPane'
 import RightPane from './RightPane'
+import TodaySummary from './TodaySummary'
 
 /**
  * Rota /atendimento — ve e responde conversas WhatsApp.
@@ -16,6 +17,7 @@ export default function ConversasPage({ lastWsMessage }) {
   const [selected, setSelected] = useState(null)
   const [refreshToken, setRefreshToken] = useState(0)
   const [clientPaneOpen, setClientPaneOpen] = useState(true) // toggle pra tela media
+  const [todayOpen, setTodayOpen] = useState(false)
   const [isMobile, setIsMobile] = useState(() =>
     typeof window !== 'undefined' && window.innerWidth < 768
   )
@@ -54,6 +56,7 @@ export default function ConversasPage({ lastWsMessage }) {
             onSelect={setSelected}
             lastWsMessage={lastWsMessage}
             refreshToken={refreshToken}
+            onOpenToday={() => setTodayOpen(true)}
           />
         ) : (
           <>
@@ -138,7 +141,7 @@ export default function ConversasPage({ lastWsMessage }) {
   return (
     <div style={{
       display: 'flex', height: '100%',
-      paddingBottom: 28, /* reserva espaco pra StatusBar fixa (z-40) nao cobrir o input */
+      paddingBottom: (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('embed') === '1') ? 0 : 28, /* StatusBar so existe fora do embed */
       background: 'var(--ao-bg)',
       boxSizing: 'border-box',
     }}>
@@ -148,6 +151,7 @@ export default function ConversasPage({ lastWsMessage }) {
           onSelect={setSelected}
           lastWsMessage={lastWsMessage}
           refreshToken={refreshToken}
+          onOpenToday={() => setTodayOpen(true)}
         />
       </div>
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
@@ -186,6 +190,7 @@ export default function ConversasPage({ lastWsMessage }) {
           />
         </div>
       )}
+      <TodaySummary open={todayOpen} onClose={() => setTodayOpen(false)} />
       {/* Tela media (768-1199px): painel sobreposto quando toggle aberto */}
       {!isWide && !isMobile && selected && clientPaneOpen && (
         <div

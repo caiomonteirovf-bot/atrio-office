@@ -67,14 +67,14 @@ export default function NotificationDropdown() {
         style={{
           background: open ? 'rgba(196,149,106,0.15)' : 'var(--ao-input-bg)',
           border: `1px solid ${open ? 'rgba(196,149,106,0.3)' : 'var(--ao-border)'}`,
-          color: open ? '#C4956A' : 'var(--ao-text-muted)',
+          color: open ? '#6366F1' : 'var(--ao-text-muted)',
         }}>
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
           <path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0"/>
         </svg>
         {unreadCount > 0 && (
           <span className="absolute -top-1 -right-1 min-w-[16px] h-4 flex items-center justify-center rounded-full text-[9px] font-bold text-white px-1"
-            style={{ background: '#C4956A', boxShadow: '0 0 8px rgba(196,149,106,0.4)', fontFamily: 'Space Grotesk' }}>
+            style={{ background: '#6366F1', boxShadow: '0 0 8px rgba(196,149,106,0.4)', fontFamily: 'Space Grotesk' }}>
             {unreadCount > 99 ? '99+' : unreadCount}
           </span>
         )}
@@ -98,7 +98,7 @@ export default function NotificationDropdown() {
             <div className="flex gap-2">
               {unreadCount > 0 && (
                 <button onClick={markAllRead} className="text-[10px] font-medium px-2 py-1 rounded-md transition-colors cursor-pointer"
-                  style={{ color: '#C4956A', background: 'rgba(196,149,106,0.12)', border: '1px solid rgba(196,149,106,0.2)' }}>
+                  style={{ color: '#6366F1', background: 'rgba(196,149,106,0.12)', border: '1px solid rgba(196,149,106,0.2)' }}>
                   Marcar todas lidas
                 </button>
               )}
@@ -134,7 +134,7 @@ export default function NotificationDropdown() {
                       <span className="text-[12px] font-semibold truncate" style={{ color: n.read ? 'var(--ao-text-muted)' : 'var(--ao-text-primary)' }}>
                         {n.title}
                       </span>
-                      {!n.read && <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: '#C4956A' }} />}
+                      {!n.read && <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: '#6366F1' }} />}
                     </div>
                     {n.message && (
                       <div className="text-[11px] mt-0.5 line-clamp-2" style={{ color: 'var(--ao-text-dim)' }}>

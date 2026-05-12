@@ -13,7 +13,7 @@ export default class ErrorBoundary extends Component {
           {this.state.info?.componentStack && (
             <pre style={{ whiteSpace: 'pre-wrap', color: '#f59e0b', marginTop: 12 }}>{this.state.info.componentStack}</pre>
           )}
-          <button onClick={()=>this.setState({err:null,info:null})} style={{ marginTop: 16, padding: '6px 12px', background: '#C4956A', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer' }}>Recarregar</button>
+          <button onClick={()=>this.setState({err:null,info:null})} style={{ marginTop: 16, padding: '6px 12px', background: '#6366F1', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer' }}>Recarregar</button>
         </div>
       )
     }

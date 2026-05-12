@@ -26,7 +26,7 @@ function getDateLabel(date) {
 
 const statusConfig = {
   blocked: { icon: 'blocked', color: '#ef4444', label: 'Bloqueada' },
-  in_progress: { icon: 'progress', color: '#C4956A', label: 'Em andamento' },
+  in_progress: { icon: 'progress', color: '#6366F1', label: 'Em andamento' },
   pending: { icon: 'pending', color: '#f59e0b', label: 'Aguardando' },
   done: { icon: 'done', color: '#22c55e', label: 'Concluida' },
   cancelled: { icon: 'cancelled', color: 'var(--ao-text-xs)', label: 'Cancelada' },
@@ -155,7 +155,7 @@ export default function ActivityFeed() {
                     const priorityColor = task.status === 'blocked' ? '#EF4444'
                       : task.priority === 'urgent' ? '#EF4444'
                       : task.priority === 'high' ? '#F59E0B'
-                      : '#C4956A'
+                      : '#6366F1'
 
                     return (
                       <div
@@ -176,7 +176,7 @@ export default function ActivityFeed() {
                           <div className="flex items-center gap-2">
                             {isNfse && (
                               <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-md uppercase tracking-wider"
-                                style={{ background: '#C4956A10', color: '#C4956A80', border: '1px solid #C4956A10' }}>
+                                style={{ background: '#6366F110', color: '#6366F180', border: '1px solid #6366F110' }}>
                                 NFS-e
                               </span>
                             )}

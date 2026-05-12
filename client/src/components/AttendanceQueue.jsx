@@ -27,7 +27,7 @@ function ClientAvatar({ name }) {
   const initials = name ? name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() : '?'
   return (
     <div className="w-9 h-9 rounded-xl flex items-center justify-center text-[11px] font-bold shrink-0"
-      style={{ background: 'rgba(196, 149, 106, 0.08)', color: 'rgba(196, 149, 106, 0.5)', border: '1px solid rgba(196, 149, 106, 0.08)' }}>
+      style={{ background: 'rgba(99, 102, 241, 0.08)', color: 'rgba(99, 102, 241, 0.5)', border: '1px solid rgba(99, 102, 241, 0.08)' }}>
       {initials}
     </div>
   )
@@ -379,7 +379,7 @@ export default function AttendanceQueue() {
                         onClick={() => handleResolve(item.phone)}
                         disabled={isLoading}
                         className="text-[10px] font-medium px-2.5 py-1 rounded-lg transition-colors"
-                        style={{ background: 'rgba(196, 149, 106, 0.08)', color: 'rgba(196, 149, 106, 0.6)', border: '1px solid rgba(196, 149, 106, 0.1)' }}
+                        style={{ background: 'rgba(99, 102, 241, 0.08)', color: 'rgba(99, 102, 241, 0.6)', border: '1px solid rgba(99, 102, 241, 0.1)' }}
                       >
                         {isLoading ? '...' : 'Resolver'}
                       </button>

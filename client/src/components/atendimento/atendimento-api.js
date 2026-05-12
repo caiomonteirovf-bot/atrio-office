@@ -128,11 +128,21 @@ export async function searchGesthubClients(q) {
   return Array.isArray(j?.data) ? j.data : [];
 }
 
-export async function linkConversationToClient(conversationId, clientId) {
+export async function linkConversationToClient(conversationId, clientId, opts = {}) {
+  // opts:
+  //  - relacao: 'tomador' | 'socio' | 'contador' | 'financeiro' | 'outro' (vínculo satélite)
+  //  - contato_funcao: nome/função do contato (ex: "Andrena — Faturamento")
+  //  - update_phone: bool (default true; satélite ignora isso)
+  //  - set_primary: bool (default true para vínculo direto, ignorado em satélite)
+  const body = { client_id: clientId };
+  if (opts.relacao) body.relacao = opts.relacao;
+  if (opts.contato_funcao) body.contato_funcao = opts.contato_funcao;
+  if (opts.update_phone === false) body.update_phone = false;
+  if (opts.set_primary === false) body.set_primary = false;
   const r = await fetch(`/api/atendimento/conversation/${conversationId}/link-client`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ client_id: clientId }),
+    body: JSON.stringify(body),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data?.error || `Falha ao vincular (${r.status})`);
@@ -275,4 +285,91 @@ export function classifySender(msg) {
   if (s === 'client' || s === 'inbound') return 'client';
   if (s === 'luna' || s === 'bot') return 'bot';
   return 'team'; // team/outbound/default
+}
+
+/**
+ * Envia o anexo de uma mensagem pra fila /api/extratos-pending no Atrio Finance.
+ * Usado pelo botão "Enviar pro Atrio Finance" em PDFs/OFX classificados como extrato.
+ */
+export async function enviarExtratoPraFinance(msgId, opts = {}) {
+  const r = await fetch(`/api/atendimento/messages/${msgId}/enviar-extrato-pending`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      cliente_id_sugerido: opts.clienteIdSugerido || null,
+      cliente_nome_sugerido: opts.clienteNomeSugerido || null,
+    }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) {
+    throw new Error(data.error || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+/**
+ * Carrega status mensal de extratos do cliente (via Finance /api/controle).
+ * Retorna { ok, ano, data: { clienteGesthubId, totalContas, meses: { '1': {...}, ... } } }
+ */
+export async function fetchExtratosStatus(clienteId, ano) {
+  const url = `/api/atendimento/extratos-status/${clienteId}?ano=${ano}`;
+  const r = await fetch(url);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) {
+    throw new Error(data.error || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+
+
+/**
+ * Cria observacao no Gesthub para o cliente vinculado a esta conversa.
+ * descricao obrigatorio. tipo opcional ('nota' default), autor opcional.
+ */
+export async function addClientObservation(conversationId, { descricao, tipo, autor } = {}) {
+  const r = await fetch(`/api/atendimento/conversation/${conversationId}/add-observation`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ descricao, tipo, autor }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) {
+    throw new Error(data.error || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+/**
+ * Adia uma conversa por um período (some da fila e volta automaticamente).
+ * presetOrUntil: '1h' | '4h' | 'tomorrow' | 'friday' | '7d' OU ISO datetime
+ */
+export async function snoozeConversation(conversationId, presetOrUntil, reason) {
+  const body = { reason };
+  // Se string curta, é preset; senão, é ISO datetime
+  if (['1h', '4h', 'tomorrow', 'friday', '7d'].includes(presetOrUntil)) {
+    body.preset = presetOrUntil;
+  } else {
+    body.until = presetOrUntil;
+  }
+  const r = await fetch(`/api/whatsapp/conversations/${conversationId}/snooze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
+}
+
+/**
+ * Cancela um snooze ativo (volta a conversa pra fila imediatamente).
+ */
+export async function unsnoozeConversation(conversationId) {
+  const r = await fetch(`/api/whatsapp/conversations/${conversationId}/unsnooze`, {
+    method: 'POST',
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
 }

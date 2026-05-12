@@ -16,12 +16,24 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      # WARNING: NAO REMOVER nenhuma das 3 redes abaixo.
+      # 'default': server <-> db (rede privada do compose)
+      # 'gesthub' / 'atrio_finance': FDWs (gesthub_srv, banking_srv) precisam
+      #   resolver os hostnames gesthub-db e atrio-db-1 dos sistemas vizinhos.
+      # Historico (07/05/2026): sem essas redes, telas Datalake/Ecossistema/Growth
+      #   ficam pretas após recriar o container do db. Aconteceu 3x no mesmo dia.
+      # Ver: RUNBOOK.md > "Tela preta em Datalake / Ecossistema / Growth"
+      - default
+      - atrio_finance
+      - gesthub
 
   server:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    init: true  # Docker tini PID 1 — reapeia zumbis do Chromium automaticamente
     depends_on:
       db:
         condition: service_healthy
@@ -32,6 +44,7 @@ services:
       MINIMAX_API_KEY: ${MINIMAX_API_KEY}
       MINIMAX_MODEL: ${MINIMAX_MODEL:-MiniMax-M2.5}
       GESTHUB_API_URL: ${GESTHUB_API_URL:-http://31.97.175.200}
+      GESTHUB_JWT_SECRET: ${GESTHUB_JWT_SECRET}
       PORT: 3010
       OPENCLAW_GATEWAY: http://172.18.0.1:18789
       NFSE_SYSTEM_URL: ${NFSE_SYSTEM_URL:-http://31.97.175.200:3020}
@@ -53,6 +66,12 @@ services:
       - ./server/agents:/app/agents:ro
       - ./server/skills:/app/skills:ro
       - ingest_storage:/app/storage/ingest
+      # WARNING: NAO REMOVER. Sem este bind-mount, anexos somem em todo rebuild.
+      # Historico (08/05/2026): perdemos 70+ PDFs porque storage estava no FS efemero
+      # do container. Cada 'docker compose build' apagava tudo.
+      # Ver: RUNBOOK.md > "Anexos sumindo apos rebuild"
+      - ./server/whatsapp-attachments:/app/storage/whatsapp-attachments
+      - ./server/whatsapp-session:/app/whatsapp-session
     networks:
       - default
       - atrio_finance

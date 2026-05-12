@@ -92,7 +92,7 @@ export default function MemoryBrowser() {
         </div>
         <button onClick={() => setShowCreate(true)} style={{
           padding: '8px 16px', borderRadius: 8, border: '1px solid rgba(196,149,106,0.3)',
-          background: 'rgba(196,149,106,0.12)', color: '#C4956A', fontSize: 13, cursor: 'pointer', fontWeight: 600,
+          background: 'rgba(196,149,106,0.12)', color: '#6366F1', fontSize: 13, cursor: 'pointer', fontWeight: 600,
         }}>
           + Nova Memória
         </button>
@@ -125,12 +125,12 @@ export default function MemoryBrowser() {
                   background: selectedAgent?.id === a.id ? 'rgba(196,149,106,0.2)' : 'var(--ao-input-bg)',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                   fontSize: 13, fontWeight: 700,
-                  color: selectedAgent?.id === a.id ? '#C4956A' : 'var(--ao-text-muted)',
+                  color: selectedAgent?.id === a.id ? '#6366F1' : 'var(--ao-text-muted)',
                 }}>
                   {a.name[0]}
                 </div>
                 <div>
-                  <div style={{ fontSize: 13, color: selectedAgent?.id === a.id ? '#C4956A' : 'var(--ao-text-secondary)', fontWeight: 600 }}>
+                  <div style={{ fontSize: 13, color: selectedAgent?.id === a.id ? '#6366F1' : 'var(--ao-text-secondary)', fontWeight: 600 }}>
                     {a.name}
                   </div>
                   <div style={{ fontSize: 10, color: 'var(--ao-text-dim)' }}>{a.role}</div>
@@ -152,7 +152,7 @@ export default function MemoryBrowser() {
               onClick={() => setCategoryFilter('')}
               style={{
                 padding: '8px 10px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
-                color: !categoryFilter ? '#C4956A' : 'var(--ao-text-secondary)',
+                color: !categoryFilter ? '#6366F1' : 'var(--ao-text-secondary)',
                 background: !categoryFilter ? 'rgba(196,149,106,0.1)' : 'transparent',
                 marginBottom: 2,
               }}
@@ -165,7 +165,7 @@ export default function MemoryBrowser() {
                 onClick={() => setCategoryFilter(c.id)}
                 style={{
                   padding: '8px 10px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
-                  color: categoryFilter === c.id ? '#C4956A' : 'var(--ao-text-secondary)',
+                  color: categoryFilter === c.id ? '#6366F1' : 'var(--ao-text-secondary)',
                   background: categoryFilter === c.id ? 'rgba(196,149,106,0.1)' : 'transparent',
                   marginBottom: 2,
                 }}
@@ -225,7 +225,7 @@ export default function MemoryBrowser() {
                       <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
                         <button onClick={() => handleUpdate(mem)} style={{
                           padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)',
-                          background: 'rgba(196,149,106,0.15)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600,
+                          background: 'rgba(196,149,106,0.15)', color: '#6366F1', fontSize: 12, cursor: 'pointer', fontWeight: 600,
                         }}>Salvar</button>
                         <button onClick={() => { setEditing(null); fetchMemories(selectedAgent.id, categoryFilter) }} style={{
                           padding: '6px 14px', borderRadius: 6, border: '1px solid var(--ao-border-hover)',
@@ -245,7 +245,7 @@ export default function MemoryBrowser() {
                           <span style={{
                             padding: '2px 6px', borderRadius: 4, fontSize: 9, fontWeight: 600,
                             textTransform: 'uppercase',
-                            background: 'rgba(196,149,106,0.1)', color: '#C4956A',
+                            background: 'rgba(196,149,106,0.1)', color: '#6366F1',
                           }}>
                             {mem.category}
                           </span>
@@ -253,7 +253,7 @@ export default function MemoryBrowser() {
                         <div style={{ display: 'flex', gap: 4 }}>
                           <button onClick={() => handleTogglePin(mem)} title={mem.pinned ? 'Desafixar' : 'Fixar'} style={{
                             padding: '4px 8px', borderRadius: 4, border: 'none',
-                            background: 'var(--ao-input-bg)', color: mem.pinned ? '#C4956A' : 'var(--ao-text-dim)',
+                            background: 'var(--ao-input-bg)', color: mem.pinned ? '#6366F1' : 'var(--ao-text-dim)',
                             fontSize: 12, cursor: 'pointer',
                           }}>📌</button>
                           <button onClick={() => setEditing(mem.id)} style={{
@@ -338,7 +338,7 @@ export default function MemoryBrowser() {
               }}>Cancelar</button>
               <button onClick={handleCreate} style={{
                 flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid rgba(196,149,106,0.3)',
-                background: 'rgba(196,149,106,0.15)', color: '#C4956A', fontSize: 12, cursor: 'pointer', fontWeight: 600,
+                background: 'rgba(196,149,106,0.15)', color: '#6366F1', fontSize: 12, cursor: 'pointer', fontWeight: 600,
               }}>Criar Memória</button>
             </div>
           </div>

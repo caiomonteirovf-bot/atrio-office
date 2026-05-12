@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 
 const AGENT_COLORS = {
-  'Caio': '#C4956A',
-  'Rodrigo': '#C4956A',
+  'Caio': '#6366F1',
+  'Rodrigo': '#6366F1',
   'Campelo': '#378ADD',
   'Sneijder': '#639922',
-  'Luna': '#BA7517',
+  'Luna': '#6366F1',
   'Sofia': '#7F77DD',
   'Valência': '#E05A33',
   'Maia': '#D946A8',
@@ -408,8 +408,8 @@ export default function AgentChat({ lastMessage }) {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-xl flex items-center justify-center"
-              style={{ background: 'linear-gradient(135deg, #C4956A20 0%, #C4956A08 100%)', border: '1px solid #C4956A15' }}>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#C4956A" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              style={{ background: 'linear-gradient(135deg, #6366F120 0%, #6366F108 100%)', border: '1px solid #6366F115' }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6366F1" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
               </svg>
             </div>
@@ -440,9 +440,9 @@ export default function AgentChat({ lastMessage }) {
         {loading && (
           <div className="flex flex-col items-center justify-center h-full gap-3">
             <div className="flex gap-1.5">
-              <span className="typing-wave-dot w-2 h-2 rounded-full bg-[#C4956A]" />
-              <span className="typing-wave-dot w-2 h-2 rounded-full bg-[#C4956A]" />
-              <span className="typing-wave-dot w-2 h-2 rounded-full bg-[#C4956A]" />
+              <span className="typing-wave-dot w-2 h-2 rounded-full bg-[#6366F1]" />
+              <span className="typing-wave-dot w-2 h-2 rounded-full bg-[#6366F1]" />
+              <span className="typing-wave-dot w-2 h-2 rounded-full bg-[#6366F1]" />
             </div>
             <span className="text-[11px]" style={{ color: 'var(--ao-text-xs)' }}>Carregando conversas...</span>
           </div>
@@ -451,8 +451,8 @@ export default function AgentChat({ lastMessage }) {
         {!loading && messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center gap-3 py-12">
             <div className="w-14 h-14 rounded-2xl flex items-center justify-center"
-              style={{ background: 'linear-gradient(135deg, #C4956A10 0%, #C4956A05 100%)', border: '1px solid #C4956A10' }}>
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#C4956A" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="opacity-50">
+              style={{ background: 'linear-gradient(135deg, #6366F110 0%, #6366F105 100%)', border: '1px solid #6366F110' }}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366F1" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="opacity-50">
                 <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
               </svg>
             </div>
@@ -493,7 +493,7 @@ export default function AgentChat({ lastMessage }) {
       {!isAtBottom && messages.length > 5 && (
         <button
           onClick={() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' })}
-          className="absolute bottom-16 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full text-[10px] font-medium bg-[#C4956A]/20 text-[#C4956A] border border-[#C4956A]/20 backdrop-blur-sm hover:bg-[#C4956A]/30 transition-all cursor-pointer z-10"
+          className="absolute bottom-16 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full text-[10px] font-medium bg-[#6366F1]/20 text-[#6366F1] border border-[#6366F1]/20 backdrop-blur-sm hover:bg-[#6366F1]/30 transition-all cursor-pointer z-10"
         >
           Novas mensagens
         </button>
@@ -544,12 +544,12 @@ export default function AgentChat({ lastMessage }) {
               disabled={!inputText.trim() || sending}
               className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center transition-all duration-200 disabled:opacity-20"
               style={{
-                background: inputText.trim() ? '#C4956A20' : 'transparent',
-                color: '#C4956A',
+                background: inputText.trim() ? '#6366F120' : 'transparent',
+                color: '#6366F1',
               }}
             >
               {sending ? (
-                <span className="w-3 h-3 border border-[#C4956A] border-t-transparent rounded-full animate-spin" />
+                <span className="w-3 h-3 border border-[#6366F1] border-t-transparent rounded-full animate-spin" />
               ) : (
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <line x1="22" y1="2" x2="11" y2="13" />

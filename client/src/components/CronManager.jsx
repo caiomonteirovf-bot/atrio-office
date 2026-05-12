@@ -110,7 +110,7 @@ export default function CronManager() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 24 }}>
         {[
           { label: 'Rotinas ligadas', sub: 'de ' + crons.length + ' cadastradas', value: activeCount, color: '#22c55e' },
-          { label: 'Execucoes totais', sub: 'desde o inicio', value: totalRuns, color: '#C4956A' },
+          { label: 'Execucoes totais', sub: 'desde o inicio', value: totalRuns, color: '#6366F1' },
           { label: 'Rotinas pausadas', sub: crons.length - activeCount ? 'nao estao rodando' : 'todas ativas', value: crons.length - activeCount, color: '#fbbf24' },
         ].map((kpi, i) => (
           <div key={i} style={{
@@ -166,7 +166,7 @@ export default function CronManager() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 14 }}>
               <div>
                 <div style={{ fontSize: 10, color: 'var(--ao-text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>Quando roda</div>
-                <div style={{ fontSize: 12, color: '#C4956A', fontWeight: 500 }} title={cron.schedule}>
+                <div style={{ fontSize: 12, color: '#6366F1', fontWeight: 500 }} title={cron.schedule}>
                   {SCHEDULE_LABELS[cron.schedule] || cron.schedule}
                 </div>
               </div>
@@ -213,7 +213,7 @@ export default function CronManager() {
                   borderRadius: 6,
                   border: '1px solid rgba(196,149,106,0.2)',
                   background: triggering === cron.id ? 'rgba(196,149,106,0.2)' : 'rgba(196,149,106,0.08)',
-                  color: '#C4956A',
+                  color: '#6366F1',
                   fontSize: 12,
                   cursor: triggering === cron.id ? 'default' : 'pointer',
                   transition: 'all 0.15s',
@@ -228,7 +228,7 @@ export default function CronManager() {
                   borderRadius: 6,
                   border: '1px solid rgba(255,255,255,0.08)',
                   background: expandedId === cron.id ? 'rgba(196,149,106,0.1)' : 'rgba(255,255,255,0.04)',
-                  color: expandedId === cron.id ? '#C4956A' : 'rgba(255,255,255,0.5)',
+                  color: expandedId === cron.id ? '#6366F1' : 'rgba(255,255,255,0.5)',
                   fontSize: 12,
                   cursor: 'pointer',
                   transition: 'all 0.15s',

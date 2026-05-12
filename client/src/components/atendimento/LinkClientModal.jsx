@@ -11,12 +11,15 @@ import { searchGesthubClients, linkConversationToClient } from './atendimento-ap
  *  - conversation: {id, phone, client_name, display_phone}
  *  - onLinked(): callback apos sucesso
  */
-export default function LinkClientModal({ open, onClose, conversation, onLinked }) {
+export default function LinkClientModal({ open, onClose, conversation, onLinked, mode = null }) {
   const [q, setQ] = useState('')
   const [results, setResults] = useState([])
   const [loading, setLoading] = useState(false)
   const [linking, setLinking] = useState(null) // client_id em progresso
   const [error, setError] = useState(null)
+  // Satellite mode (mode='satelite'): vincular contato como tomador/socio/financeiro de cliente já cadastrado
+  const [relacao, setRelacao] = useState('tomador')
+  const [contatoFuncao, setContatoFuncao] = useState('')
   const inputRef = useRef(null)
 
   useEffect(() => {
@@ -45,7 +48,15 @@ export default function LinkClientModal({ open, onClose, conversation, onLinked 
   const handleLink = async (client) => {
     setLinking(client.id); setError(null)
     try {
-      await linkConversationToClient(conversation.id, client.id)
+      const opts = {}
+      if (mode === 'satelite') {
+        opts.relacao = relacao
+        if (contatoFuncao.trim()) opts.contato_funcao = contatoFuncao.trim()
+        // Em modo satélite: NÃO substitui phone primário do cliente, NÃO marca como primary
+        opts.update_phone = false
+        opts.set_primary = false
+      }
+      await linkConversationToClient(conversation.id, client.id, opts)
       onLinked?.(client)
       onClose?.()
     } catch (e) { setError(e.message) }
@@ -80,7 +91,7 @@ export default function LinkClientModal({ open, onClose, conversation, onLinked 
           padding: '12px 16px', borderBottom: '1px solid var(--ao-border)',
           display: 'flex', alignItems: 'center', gap: 10,
         }}>
-          <Link2 size={16} style={{ color: 'var(--ao-accent, #c4956a)' }} />
+          <Link2 size={16} style={{ color: 'var(--ao-accent, #6366F1)' }} />
           <div style={{ flex: 1 }}>
             <h3 style={{ fontSize: 14, fontWeight: 700, margin: 0 }}>Vincular contato</h3>
             <p style={{ fontSize: 11, margin: '2px 0 0', color: 'var(--ao-text-dim)' }}>
@@ -114,6 +125,55 @@ export default function LinkClientModal({ open, onClose, conversation, onLinked 
             Digite ao menos 2 caracteres. Busca nome legal, fantasia ou CNPJ.
           </p>
         </div>
+
+        {/* Tipo de relação — apenas em mode=satelite */}
+        {mode === 'satelite' && (
+          <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--ao-border)' }}>
+            <label style={{ display: 'block', fontSize: 10.5, fontWeight: 700, color: 'var(--ao-text-dim)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '.04em' }}>
+              Tipo de relação
+            </label>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 6, marginBottom: 10 }}>
+              {[
+                ['tomador', 'Tomador', 'solicita NFS-e'],
+                ['socio', 'Sócio', 'sócio/representante'],
+                ['contador', 'Contador', 'contador parceiro'],
+                ['financeiro', 'Financeiro', 'financeiro do cliente'],
+                ['outro', 'Outro', 'relação livre'],
+              ].map(([id, label, desc]) => (
+                <button
+                  key={id}
+                  onClick={() => setRelacao(id)}
+                  type="button"
+                  style={{
+                    padding: '8px 10px', borderRadius: 6, cursor: 'pointer',
+                    border: `1px solid ${relacao === id ? 'var(--ao-accent, #6366F1)' : 'var(--ao-border)'}`,
+                    background: relacao === id ? 'rgba(99, 102, 241, 0.12)' : 'var(--ao-bg)',
+                    color: relacao === id ? 'var(--ao-text-primary)' : 'var(--ao-text-secondary)',
+                    fontSize: 11, fontWeight: 600, textAlign: 'left',
+                    display: 'flex', flexDirection: 'column', gap: 1,
+                  }}
+                >
+                  <span>{label}</span>
+                  <span style={{ fontSize: 9, color: 'var(--ao-text-dim)', fontWeight: 400 }}>{desc}</span>
+                </button>
+              ))}
+            </div>
+            <label style={{ display: 'block', fontSize: 10.5, fontWeight: 700, color: 'var(--ao-text-dim)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.04em' }}>
+              Nome / função do contato (opcional)
+            </label>
+            <input
+              type="text"
+              value={contatoFuncao}
+              onChange={(e) => setContatoFuncao(e.target.value)}
+              placeholder="ex: Andrena — Faturamento Grupo Gera"
+              style={{
+                width: '100%', padding: '7px 10px', borderRadius: 6,
+                border: '1px solid var(--ao-border)', background: 'var(--ao-bg)',
+                color: 'var(--ao-text-primary)', fontSize: 12,
+              }}
+            />
+          </div>
+        )}
 
         {/* Resultados */}
         <div style={{ flex: 1, overflowY: 'auto', padding: 8 }}>
@@ -181,7 +241,7 @@ export default function LinkClientModal({ open, onClose, conversation, onLinked 
             rel="noopener noreferrer"
             style={{
               padding: '6px 10px', fontSize: 11, fontWeight: 600, borderRadius: 5,
-              background: 'var(--ao-accent, #c4956a)', color: '#fff',
+              background: 'var(--ao-accent, #6366F1)', color: '#fff',
               textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 4,
             }}
           >

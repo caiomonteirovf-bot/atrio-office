@@ -5,7 +5,7 @@
  * NÃO cacheia /api/* nem /ws.
  */
 
-const CACHE_VERSION = 'atrio-office-v1777516173';
+const CACHE_VERSION = 'atrio-office-v1778594919324';
 const STATIC_ASSETS = [
   '/favicon.svg',
   '/pwa-icon-192.png',

@@ -125,7 +125,7 @@ export default function StatsBar() {
       gradient: 'stat-gradient-gold',
       value: conversas,
       color: 'var(--ao-text-primary)',
-      iconColor: '#C4956A',
+      iconColor: '#6366F1',
       alert: false,
     },
     {
